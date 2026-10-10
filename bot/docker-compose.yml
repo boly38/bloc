@@ -1,0 +1,58 @@
+name: bloc
+
+services:
+  opencode:
+    image: ghcr.io/anomalyco/opencode:latest
+    command: serve --hostname 0.0.0.0 --port 4096
+    environment:
+      # Do not inherit a proxy configured in the image or on the host.
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      ALL_PROXY: ""
+      all_proxy: ""
+      NO_PROXY: "localhost,127.0.0.1,::1"
+      no_proxy: "localhost,127.0.0.1,::1"
+      OPPER_API_KEY: ${OPPER_API_KEY:?OPPER_API_KEY is required}
+      OPENCODE_MODEL: opper/${OPPER_MODEL:?OPPER_MODEL is required}#${OPPER_VARIANT:-medium}
+    volumes:
+      - opencode-data:/root/.local/share/opencode
+      - workspace:/workspace
+      - ./opencode.json:/workspace/opencode.json:ro
+    working_dir: /workspace
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4096/global/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  telegram:
+    profiles: ["telegram"]
+    build: ./telegram
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      ALL_PROXY: ""
+      all_proxy: ""
+      NO_PROXY: "localhost,127.0.0.1,::1,telegram,opencode"
+      no_proxy: "localhost,127.0.0.1,::1,telegram,opencode"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      OPENCODE_URL: http://opencode:4096
+      OPENCODE_MODEL: opper/${OPPER_MODEL:?OPPER_MODEL is required}#${OPPER_VARIANT:-medium}
+    depends_on:
+      opencode:
+        condition: service_healthy
+    volumes:
+      - telegram-data:/data
+    restart: unless-stopped
+
+volumes:
+  opencode-data:
+  workspace:
+  telegram-data:

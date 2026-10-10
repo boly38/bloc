@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "{env:OPENCODE_MODEL}",
+  "enabled_providers": ["opper"],
+  "provider": {
+    "opper": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Opper AI",
+      "options": {
+        "baseURL": "https://api.opper.ai/v3/compat",
+        "apiKey": "{env:OPPER_API_KEY}"
+      }
+    }
+  },
+  "server": {
+    "hostname": "0.0.0.0",
+    "port": 4096
+  }
+}

@@ -1,0 +1,23 @@
+name: bloc-repair
+
+# This Compose stack is intentionally independent so a diagnostic shell can be opened
+# even if the main Compose stack fails to start.
+services:
+  repair:
+    image: ghcr.io/anomalyco/opencode:latest
+    entrypoint: ["/bin/sh"]
+    stdin_open: true
+    tty: true
+    volumes:
+      - opencode-data:/root/.local/share/opencode
+      - workspace:/workspace
+      - ../bot/opencode.json:/workspace/opencode.json:ro
+    working_dir: /workspace
+
+volumes:
+  opencode-data:
+    external: true
+    name: bloc_opencode-data
+  workspace:
+    external: true
+    name: bloc_workspace
