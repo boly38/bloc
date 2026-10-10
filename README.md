@@ -1,7 +1,9 @@
-# bloc
+# BLOC
 
-A minimal MVP: OpenCode runs as an HTTP server and can be queried through Telegram.
-The bridge keeps one OpenCode session per chat in a Docker volume.
+**BLOC** stands for **BLOC Layer for OpenCode**—a deliberately recursive, GNU-style
+name for a minimal Docker Compose setup that runs OpenCode alone or connects it to
+Telegram. In Telegram mode, the bridge keeps one OpenCode session per chat in a Docker
+volume.
 
 ## Requirements
 
