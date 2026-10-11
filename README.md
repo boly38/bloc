@@ -126,7 +126,24 @@ these settings:
 - **Docker Compose Location:** `/docker-compose.yml` (relative to the base directory)
 - Add the variables from [`.env.coolify.template`](.env.coolify.template) to the
   Coolify resource environment, replacing the example credentials and chat ID. The
-  `COMPOSE_PROFILES=telegram` setting enables the Telegram service.
+  `COMPOSE_PROFILES=telegram` setting enables the Telegram service. `GH_TOKEN` is
+  optional; set it only if the agent needs GitHub CLI access.
+
+## GitHub CLI access (optional)
+
+The OpenCode image includes GitHub CLI (`gh`), so the executable remains available
+after a container rebuild or redeploy. To authenticate it, set `GH_TOKEN` in `.env` or
+as a Coolify resource environment variable. GitHub CLI reads this variable directly;
+there is no need to run an interactive `gh auth login`. The token is passed only to the
+OpenCode service, not to the Telegram bridge. Leave it unset to run without GitHub
+authentication.
+
+Treat this as a powerful credential: the agent can use the permissions granted to the
+token and may expose it through commands or content it processes. Use a dedicated
+GitHub account or fine-grained token with access limited to the repositories and
+permissions it needs, keep the deployment restricted to trusted users, and never put a
+real token in the image, repository, or logs. For Coolify, store it as a secret
+environment variable. See GitHub CLI's [environment variable reference](https://cli.github.com/manual/gh_help_environment).
 
 ## Repair
 

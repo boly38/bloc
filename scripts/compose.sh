@@ -105,6 +105,8 @@ case "$COMMAND" in
 		check_mode_and_telegram
 		if [ "$mode" = true ]; then
 			compose_mode build
+		else
+			compose_mode build opencode
 		fi
 		;;
 	start)
