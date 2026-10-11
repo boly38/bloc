@@ -136,6 +136,14 @@ case "$COMMAND" in
 		fi
 		[ "$status" -eq 0 ] || [ "$status" -eq 130 ]
 		;;
+	diagnostics)
+		check_mode_and_telegram
+		if [ "$mode" != true ]; then
+			printf 'Error: enable Telegram mode before reading diagnostics.\n' >&2
+			exit 1
+		fi
+		compose_mode exec -T telegram cat /data/cost-diagnostics.jsonl
+		;;
 	status)
 		check_env_file
 		compose_all ps
@@ -153,7 +161,7 @@ case "$COMMAND" in
 		compose_all down --volumes
 		;;
 	*)
-		printf 'Usage: %s {check-env|config|build|start|stop|down|logs|status|health|repair|clean}\n' "$0" >&2
+		printf 'Usage: %s {check-env|config|build|start|stop|down|logs|diagnostics|status|health|repair|clean}\n' "$0" >&2
 		exit 2
 		;;
 esac
