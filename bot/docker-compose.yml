@@ -44,6 +44,7 @@ services:
       no_proxy: "localhost,127.0.0.1,::1,telegram,opencode"
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      TELEGRAM_COST_DIAGNOSTICS: ${TELEGRAM_COST_DIAGNOSTICS:-false}
       OPENCODE_URL: http://opencode:4096
       OPENCODE_MODEL: opper/${OPPER_MODEL:?OPPER_MODEL is required}#${OPPER_VARIANT:-medium}
     depends_on:

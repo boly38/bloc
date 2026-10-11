@@ -80,6 +80,19 @@ Only one process can poll a bot token at a time. Bridge instances sharing the
 still needs to be stopped manually. Telegram 409 conflicts are logged without exposing
 the bot token and retried with backoff.
 
+Each authorized OpenCode reply includes a short USD cost line. `/cost` reports the
+current chat's OpenCode session total and the total for the current fixed UTC hour;
+agent subtotals are shown when OpenCode identifies them. These are not Opper account
+or cross-chat totals. Cost reporting reads OpenCode message history, including child
+sessions, and does not send additional LLM prompts.
+
+For a temporary cost/usage investigation, set `TELEGRAM_COST_DIAGNOSTICS=true` in
+`.env` and restart with `make start`. Retrieve the sanitized metadata with
+`make diagnostics`. The file is stored in the Telegram data volume; it includes
+message and step cost/token fields, but excludes message text and chat/session IDs.
+Turn diagnostics off again after the test and do not publish the generated file
+without reviewing it.
+
 ## First startup
 
 1. Create an API key in your Opper AI project and set `OPPER_API_KEY`.
