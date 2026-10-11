@@ -80,11 +80,23 @@ Only one process can poll a bot token at a time. Bridge instances sharing the
 still needs to be stopped manually. Telegram 409 conflicts are logged without exposing
 the bot token and retried with backoff.
 
-Each authorized OpenCode reply includes a short USD cost line. `/cost` reports the
-current chat's OpenCode session total and the total for the current fixed UTC hour;
-agent subtotals are shown when OpenCode identifies them. These are not Opper account
-or cross-chat totals. Cost reporting reads OpenCode message history, including child
-sessions, and does not send additional LLM prompts.
+## Telegram cost reporting
+
+Every authorized OpenCode answer ends with a compact USD cost line; agent subtotals
+are included when OpenCode provides them. Send `/cost` to see the current chat's
+session total and its total for the current fixed UTC hour, along with available token
+counts. These are not Opper account-wide or cross-chat totals. The bridge aggregates
+all assistant messages across the session and its child sessions, so tool-using
+exchanges are counted without estimating from model prices. `/cost` reads OpenCode
+history and does not send an LLM prompt.
+
+```text
+Cost: $0.001971
+
+/cost
+Session: $0.008800
+UTC hour (18:00–19:00): $0.002100
+```
 
 For a temporary cost/usage investigation, set `TELEGRAM_COST_DIAGNOSTICS=true` in
 `.env` and restart with `make start`. Retrieve the sanitized metadata with
