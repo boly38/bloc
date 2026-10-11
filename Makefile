@@ -17,7 +17,7 @@ check-env: ## Check that the environment file exists
 config: ## Validate the Compose configuration for the current mode
 	@$(COMPOSE_SCRIPT) config
 
-build: ## Build the Telegram bridge if enabled
+build: ## Build the OpenCode image and enabled services
 	@$(COMPOSE_SCRIPT) build
 
 start: ## Start OpenCode alone or with Telegram according to TELEGRAM_ENABLED
