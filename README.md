@@ -117,24 +117,16 @@ make down
 make start
 ```
 
-## Coolify deployment — not validated
+## Coolify deployment
 
-Coolify deployment has **not been tested**. Treat these as integration details to
-verify, not as a validated deployment procedure. Keep the Coolify check in `TODO.md`
-open until a deployment and redeploy have been tested.
+The Docker Compose deployment has been tested with Coolify, including redeploys. Use
+these settings:
 
-- Coolify deploys Compose directly; it does not run the Makefile or `scripts/compose.sh`.
-  Therefore `TELEGRAM_ENABLED=true` alone does not activate the `telegram` Compose
-  profile. Compose needs the profile enabled (for example, through
-  `COMPOSE_PROFILES=telegram` or `--profile telegram`), but it is not yet verified how
-  this must be configured in Coolify. The Makefile's Telegram-variable checks do not
-  run there; the token and allowlist must be supplied.
-- Compose declares `workspace`, `opencode-data`, and `telegram-data` volumes. Standard
-  local Docker names are `bloc_workspace`, `bloc_opencode-data`, and
-  `bloc_telegram-data`. Verify Coolify's actual names in **Persistent Storage** and that
-  a redeploy of the same resource reuses them; Coolify may rename managed volumes.
-  Volumes are not backups. The repair Compose file expects `bloc_workspace` and
-  `bloc_opencode-data`, so it may need matching volume names to access Coolify data.
+- **Base Directory:** `/bot`
+- **Docker Compose Location:** `/docker-compose.yml` (relative to the base directory)
+- Add the variables from [`.env.coolify.template`](.env.coolify.template) to the
+  Coolify resource environment, replacing the example credentials and chat ID. The
+  `COMPOSE_PROFILES=telegram` setting enables the Telegram service.
 
 ## Repair
 

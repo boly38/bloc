@@ -19,7 +19,7 @@ formalizes the work on branch `bloc-v0`.
 - [x] `TELEGRAM_ENABLED` selects OpenCode-only or OpenCode-plus-Telegram mode; the Makefile delegates Compose profile selection and checks to `scripts/compose.sh`.
 - [x] The Opper AI provider, its environment-based API key, and the default model `opper/gpt-5.6-luna#medium` are configured.
 - [x] The main and repair Compose stacks are separate; the repair stack mounts the data/workspace volumes and read-only `opencode.json`.
-- [x] Common operations are available in the root Makefile; the README documents local startup and Coolify caveats.
+- [x] Common operations are available in the root Makefile; the README documents local startup and Coolify deployment.
 - [x] `.env` is ignored by Git and `.env.template` documents the expected variables.
 - [x] The bridge injects an anti-hallucination instruction into OpenCode sessions.
 
@@ -46,17 +46,18 @@ Complete these items before considering the implementation fully accepted:
 3. [x] **[QA OK]** `make health` confirmed that the OpenCode API is healthy.
 4. [ ] Verify the complete Telegram flow: `/start`, a regular request from an authorized chat, and an Opper response.
 5. [ ] Verify that an unauthorized chat receives no response and its ID is logged without exposing secrets.
-6. [ ] Restart the services and verify that the Telegram session is restored and OpenCode/workspace volumes persist.
+6. [x] **[QA OK]** User redeployed on Coolify: the workspace file persisted and the Telegram chat retained the same OpenCode session ID.
 7. [ ] Complete the repair test with the main service stopped. **[QA OK]** User confirms that `make repair` opens and works.
 8. [ ] Repeat local setup on a clean developer configuration using the README; the **[QA OK]** test above already confirms startup and Telegram interaction on the configuration tested.
-9. [ ] Validate Docker Compose deployment on Coolify: Telegram profile activation, volume reuse on redeploy, volume-name alignment, and no publicly exposed OpenCode port.
-10. [x] `.env` is ignored and not tracked by Git; verified again before publication.
-11. [ ] Once these criteria are met, update and close [issue #3](https://github.com/boly38/bloc/issues/3) if all its acceptance criteria are satisfied.
+9. [x] **[QA OK]** User deployed the Compose stack on Coolify with `COMPOSE_PROFILES=telegram`; `/workspace` content and the Telegram-to-OpenCode session mapping persisted across redeploys, including a redeploy without cache.
+10. [ ] Confirm the OpenCode API is not publicly exposed in Coolify; verify Coolify volume-name alignment if the independent repair stack will be used with its data.
+11. [x] `.env` is ignored and not tracked by Git; verified again before publication.
+12. [ ] Once these criteria are met, update and close [issue #3](https://github.com/boly38/bloc/issues/3) if all its acceptance criteria are satisfied.
 
 ## Remaining MVP work
 
 - [ ] Resolve the allowlist bootstrap issue (item 1) and keep the README, Compose file, and `.env.template` aligned.
-- [ ] Complete and record end-to-end tests for items 2–10. Local commands and the basic flow are reported **[QA OK]**, but the other Telegram scenarios, restart persistence, and Coolify remain to be validated.
+- [ ] Complete and record end-to-end tests for items 2–10. Local commands and the basic flow are reported **[QA OK]**; unauthorized-chat behavior and the remaining Coolify checks are still open.
 - [ ] Fix any issues found; check items only after actual verification.
 - [ ] Confirm that the MVP scope of [issue #3](https://github.com/boly38/bloc/issues/3) is met before considering the MVP complete.
 
