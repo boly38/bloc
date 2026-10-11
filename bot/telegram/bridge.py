@@ -1,6 +1,7 @@
 """Minimal Telegram long-polling bridge to the official OpenCode HTTP API."""
 
 import base64
+import fcntl
 import json
 import os
 import sys
@@ -17,10 +18,33 @@ OC = os.getenv("OPENCODE_URL", "http://opencode:4096").rstrip("/")
 PASSWORD = os.getenv("OPENCODE_SERVER_PASSWORD", "")
 MODEL = os.getenv("OPENCODE_MODEL", "")
 STATE = "/data/sessions.json"
+POLLING_LOCK = "/data/telegram-polling.lock"
 SYSTEM = (
     "Reply in English. Never guess: rely on a test with an official binary, "
     "verified official documentation, or ask the human for clarification. Be concise."
 )
+
+
+class TelegramConflict(RuntimeError):
+    """Raised when another client is already polling this bot's updates."""
+
+
+class TelegramRateLimit(RuntimeError):
+    """Raised when Telegram asks the client to wait before retrying."""
+
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__(f"Telegram rate limit; retry after {retry_after}s")
+
+
+def acquire_polling_lock():
+    lock = open(POLLING_LOCK, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another Telegram bridge shares this data volume; waiting for its polling lock.", file=sys.stderr, flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
 
 
 def http(url, payload=None, timeout=70):
@@ -34,11 +58,35 @@ def http(url, payload=None, timeout=70):
             return json.loads(response.read()) if response.status != 204 else None
     except urllib.error.HTTPError as error:
         details = error.read().decode("utf-8", errors="replace")
+        error.close()
+        if url.startswith(TG):
+            method = url[len(TG) :]
+            if method == "getUpdates" and error.code == 409:
+                raise TelegramConflict(
+                    "Telegram returned HTTP 409: another getUpdates request is active for this bot. "
+                    "Ensure no other host or deployment is polling with the same token."
+                ) from None
+            if error.code == 429:
+                try:
+                    parameters = json.loads(details).get("parameters", {})
+                    retry_after = int(parameters.get("retry_after", 1))
+                    if retry_after < 1:
+                        retry_after = 1
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    retry_after = 1
+                raise TelegramRateLimit(retry_after) from None
+            # The Telegram API URL contains the bot token; never include it in logs.
+            raise RuntimeError(f"Telegram API HTTP {error.code} ({method})") from None
         raise RuntimeError(f"HTTP {error.code} {url}: {details[:1000]}") from error
 
 
 def telegram(method, payload):
-    return http(TG + method, payload, 70).get("result")
+    while True:
+        try:
+            return http(TG + method, payload, 70).get("result")
+        except TelegramRateLimit as error:
+            print(f"Telegram rate limited ({method}); retrying in {error.retry_after}s.", file=sys.stderr, flush=True)
+            time.sleep(error.retry_after)
 
 
 def load_sessions():
@@ -99,11 +147,14 @@ def send(chat_id, text):
 
 
 def main():
+    polling_lock = acquire_polling_lock()
     sessions = load_sessions()
     offset = 0
+    conflict_backoff = 5
     while True:
         try:
             updates = telegram("getUpdates", {"offset": offset, "timeout": 50, "allowed_updates": ["message"]}) or []
+            conflict_backoff = 5
             for update in updates:
                 offset = update["update_id"] + 1
                 message = update.get("message", {})
@@ -123,8 +174,12 @@ def main():
                 except Exception as error:
                     print(f"OpenCode error: {error}", file=sys.stderr, flush=True)
                     send(chat_id, "Temporary OpenCode error. Check the service logs.")
+        except TelegramConflict as error:
+            print(f"Telegram polling conflict: {error}; retrying in {conflict_backoff}s.", file=sys.stderr, flush=True)
+            time.sleep(conflict_backoff)
+            conflict_backoff = min(conflict_backoff * 2, 60)
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
-            print(f"Network error: {error}", file=sys.stderr, flush=True)
+            print(f"Telegram network error ({type(error).__name__}); retrying in 5s.", file=sys.stderr, flush=True)
             time.sleep(5)
 
 

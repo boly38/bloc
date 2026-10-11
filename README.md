@@ -75,6 +75,11 @@ logs; add it to `TELEGRAM_ALLOWED_CHAT_IDS` and restart the service. The allowli
 be populated before the first Telegram startup; the bootstrap procedure for an
 unknown initial chat ID is still to be defined.
 
+Only one process can poll a bot token at a time. Bridge instances sharing the
+`telegram-data` volume coordinate with a local lock; a poller running on another host
+still needs to be stopped manually. Telegram 409 conflicts are logged without exposing
+the bot token and retried with backoff.
+
 ## First startup
 
 1. Create an API key in your Opper AI project and set `OPPER_API_KEY`.
