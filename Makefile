@@ -6,10 +6,13 @@ export ENV_FILE
 
 COMPOSE_SCRIPT := ./scripts/compose.sh
 
-.PHONY: help check-env config build start stop down restart logs status health repair clean
+.PHONY: help test check-env config build start stop down restart logs status health repair clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "%-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+test: ## Run dependency-free unit tests
+	@python3 -m unittest discover -s tests -v
 
 check-env: ## Check that the environment file exists
 	@$(COMPOSE_SCRIPT) check-env
