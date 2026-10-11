@@ -3,6 +3,17 @@
 Run local operations through the root `Makefile`. Never commit `.env`, credentials,
 OpenCode sessions, or Docker volume contents.
 
+## Run tests
+
+Run the dependency-free unit tests with:
+
+```sh
+make test
+```
+
+The tests use Python's standard library and do not require credentials, Docker, or
+access to Telegram or an LLM.
+
 ## Draft a release
 
 After the release changes are merged into `main`, checks have passed, and the version
