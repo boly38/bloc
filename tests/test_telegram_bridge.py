@@ -169,7 +169,7 @@ class TelegramBridgeTests(unittest.TestCase):
         )
 
     def test_async_answer_uses_correlated_completion_and_reports_cost(self):
-        prompt_id = "prompt-id"
+        prompt_id = "msg_prompt-id"
         assistant = {
             "info": {
                 "id": "assistant-id",
@@ -182,7 +182,7 @@ class TelegramBridgeTests(unittest.TestCase):
         }
         sessions = {"123": "session-1"}
         phases = []
-        with patch("bridge.uuid.uuid4", return_value=SimpleNamespace(hex=prompt_id)):
+        with patch("bridge.uuid.uuid4", return_value=SimpleNamespace(hex=prompt_id.removeprefix("msg_"))):
             with patch.object(
                 opencode_api,
                 "session_tree_messages",
@@ -218,7 +218,7 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertIn("response_wait", phases)
 
     def test_async_answer_forwards_only_safe_progress_for_its_assistant_message(self):
-        prompt_id = "prompt-id"
+        prompt_id = "msg_prompt-id"
         incomplete = {
             "info": {"id": "assistant-id", "parentID": prompt_id, "role": "assistant"},
             "parts": [],
@@ -249,7 +249,7 @@ class TelegramBridgeTests(unittest.TestCase):
             time.sleep(0.02)
 
         progress = []
-        with patch("bridge.uuid.uuid4", return_value=SimpleNamespace(hex=prompt_id)):
+        with patch("bridge.uuid.uuid4", return_value=SimpleNamespace(hex=prompt_id.removeprefix("msg_"))):
             with patch.object(
                 opencode_api,
                 "session_tree_messages",
@@ -298,11 +298,11 @@ class TelegramBridgeTests(unittest.TestCase):
     def test_assistant_message_chain_is_correlated_to_its_user_prompt(self):
         messages = [
             {"info": {"id": "other", "parentID": "other-prompt", "role": "assistant"}},
-            {"info": {"id": "step-1", "parentID": "prompt", "role": "assistant"}},
+            {"info": {"id": "step-1", "parentID": "msg_prompt", "role": "assistant"}},
             {"info": {"id": "step-2", "parentID": "step-1", "role": "assistant"}},
         ]
 
-        result = opencode_api.assistant_messages_for_prompt(messages, "prompt")
+        result = opencode_api.assistant_messages_for_prompt(messages, "msg_prompt")
 
         self.assertEqual([message["info"]["id"] for message in result], ["step-1", "step-2"])
 
@@ -435,6 +435,40 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(caught.exception.error_code, "UPSTREAM_DOWN")
         self.assertNotIn("private response text", str(caught.exception))
         self.assertNotIn("private-session-id", str(caught.exception))
+
+    def test_opencode_validation_error_logs_field_names_but_not_values(self):
+        error = urllib.error.HTTPError(
+            bridge_config.OC + "/session/session-1/prompt_async",
+            400,
+            "Bad request",
+            {},
+            io.BytesIO(
+                json.dumps(
+                    {
+                        "name": "InvalidRequestError",
+                        "data": {
+                            "issues": [
+                                {
+                                    "path": ["body", "messageID"],
+                                    "code": "invalid_value",
+                                    "message": "private validation detail",
+                                }
+                            ]
+                        },
+                    }
+                ).encode()
+            ),
+        )
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(http_api.OpenCodeHTTPError) as caught:
+                http_api.http(bridge_config.OC + "/session/session-1/prompt_async")
+
+        detail = bridge._safe_error_detail(caught.exception)
+        self.assertIn("http_status=400", detail)
+        self.assertIn("error_name=InvalidRequestError", detail)
+        self.assertIn("validation_fields=body.messageID", detail)
+        self.assertIn("validation_codes=invalid_value", detail)
+        self.assertNotIn("private validation detail", detail)
 
     def test_429_waits_for_retry_after_then_retries(self):
         rate_limit = telegram_http_error(
