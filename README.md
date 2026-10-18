@@ -185,7 +185,15 @@ without reviewing it.
    ```
 
 6. Send a message from an authorized chat. If there is an error,
-   `make logs SERVICE=telegram` shows the HTTP details returned by OpenCode.
+   Telegram returns a short reference. Search for `request_failed ref=<reference>` in
+   `make logs SERVICE=telegram` to find the client, phase, elapsed time, timeout, and safe error
+   details. Prompts, credentials, session IDs, and raw OpenCode response bodies are not logged.
+
+The bridge acknowledges a request immediately, then edits that message with the result. It may
+also show generic thinking or tool-progress updates when OpenCode emits matching events; raw
+reasoning content is never forwarded. At startup, logs show the effective OpenCode and Telegram
+timeouts. OpenCode requests have a 300-second deadline; Telegram HTTP requests use 70 seconds,
+with long polling configured for 50 seconds.
 
 If Telegram replies `Invalid Opper API key` or the logs mention `401`, regenerate the
 key in your Opper AI project and replace only the

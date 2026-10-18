@@ -9,6 +9,12 @@ TG = f"https://api.telegram.org/bot{TOKEN}/"
 OC = os.getenv("OPENCODE_URL", "http://opencode:4096").rstrip("/")
 MODEL = os.getenv("OPENCODE_MODEL", "")
 
+OPENCODE_HTTP_TIMEOUT_SECONDS = 300
+OPENCODE_STATUS_TIMEOUT_SECONDS = 10
+OPENCODE_EVENT_TIMEOUT_SECONDS = 15
+TELEGRAM_HTTP_TIMEOUT_SECONDS = 70
+TELEGRAM_LONG_POLL_TIMEOUT_SECONDS = 50
+
 SESSIONS_PATH = "/data/sessions.json"
 POLLING_LOCK_PATH = "/data/telegram-polling.lock"
 COST_DIAGNOSTICS_ENABLED = os.getenv("TELEGRAM_COST_DIAGNOSTICS", "false").strip().lower() == "true"
