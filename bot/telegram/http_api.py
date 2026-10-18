@@ -8,7 +8,14 @@ import urllib.error
 import urllib.request
 from typing import NoReturn
 
-from bridge_config import OC, POLLING_LOCK_PATH, TG
+from bridge_config import (
+    OC,
+    OPENCODE_EVENT_TIMEOUT_SECONDS,
+    OPENCODE_HTTP_TIMEOUT_SECONDS,
+    POLLING_LOCK_PATH,
+    TG,
+    TELEGRAM_HTTP_TIMEOUT_SECONDS,
+)
 
 
 class TelegramConflict(RuntimeError):
@@ -27,6 +34,24 @@ class TelegramFormattingError(RuntimeError):
     """Raised when Telegram rejects message entity or HTML formatting."""
 
 
+class OpenCodeHTTPError(RuntimeError):
+    """An OpenCode HTTP error with a safe status code for diagnostics."""
+
+    def __init__(self, status, error_name=None, error_code=None):
+        self.status = status
+        self.error_name = error_name
+        self.error_code = error_code
+        super().__init__(f"OpenCode API HTTP {status}")
+
+
+def http_timeout(url):
+    if url.startswith(TG):
+        return TELEGRAM_HTTP_TIMEOUT_SECONDS
+    if url.startswith(OC):
+        return OPENCODE_HTTP_TIMEOUT_SECONDS
+    return TELEGRAM_HTTP_TIMEOUT_SECONDS
+
+
 def acquire_polling_lock():
     lock = open(POLLING_LOCK_PATH, "w", encoding="utf-8")
     try:
@@ -37,7 +62,9 @@ def acquire_polling_lock():
     return lock
 
 
-def http(url, payload=None, timeout=70):
+def http(url, payload=None, timeout=None):
+    if timeout is None:
+        timeout = http_timeout(url)
     data = None if payload is None else json.dumps(payload).encode()
     request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
 
@@ -51,7 +78,22 @@ def http(url, payload=None, timeout=70):
             _handle_telegram_error(url, error.code, details)
         if url.startswith(OC):
             # Session URLs and response bodies can contain private identifiers or content.
-            raise RuntimeError(f"OpenCode API HTTP {error.code}") from None
+            error_name = None
+            error_code = None
+            try:
+                response_error = json.loads(details)
+                if isinstance(response_error, dict):
+                    error_value = response_error.get("error")
+                    if isinstance(error_value, dict):
+                        error_name = error_value.get("name") or error_value.get("code")
+                    elif isinstance(error_value, str):
+                        error_name = error_value
+                    candidate_code = response_error.get("code")
+                    if isinstance(candidate_code, (str, int)):
+                        error_code = candidate_code
+            except json.JSONDecodeError:
+                pass
+            raise OpenCodeHTTPError(error.code, error_name, error_code) from None
         raise RuntimeError(f"HTTP {error.code} {url}: {details[:1000]}") from error
 
 
@@ -92,7 +134,36 @@ def _handle_telegram_error(url, status, details) -> NoReturn:
 def telegram(method, payload):
     while True:
         try:
-            return http(TG + method, payload, 70).get("result")
+            return http(TG + method, payload, TELEGRAM_HTTP_TIMEOUT_SECONDS).get("result")
         except TelegramRateLimit as error:
             print(f"Telegram rate limited ({method}); retrying in {error.retry_after}s.", file=sys.stderr, flush=True)
             time.sleep(error.retry_after)
+
+
+def opencode_events():
+    """Yield decoded OpenCode SSE events without logging response content."""
+    request = urllib.request.Request(
+        OC + "/event",
+        headers={"Accept": "text/event-stream"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=OPENCODE_EVENT_TIMEOUT_SECONDS) as response:
+            for line in response:
+                if isinstance(line, str):
+                    line = line.encode()
+                if not line.startswith(b"data:"):
+                    if line.startswith(b":"):
+                        yield None
+                    continue
+                data = line[5:].strip()
+                if not data:
+                    yield None
+                    continue
+                event = json.loads(data)
+                if isinstance(event, dict) and isinstance(event.get("payload"), dict):
+                    event = event["payload"]
+                if isinstance(event, dict):
+                    yield event
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise OpenCodeHTTPError(error.code) from None

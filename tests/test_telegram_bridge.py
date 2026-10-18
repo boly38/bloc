@@ -3,9 +3,11 @@ import json
 import os
 import sys
 import tempfile
+import time
 import urllib.error
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import call, patch
 
 
@@ -34,6 +36,9 @@ class FakeResponse:
     def read(self):
         return self.body
 
+    def __iter__(self):
+        return iter(self.body.splitlines(keepends=True))
+
 
 def telegram_http_error(code, body, method="getUpdates"):
     return urllib.error.HTTPError(
@@ -46,6 +51,26 @@ def telegram_http_error(code, body, method="getUpdates"):
 
 
 class TelegramBridgeTests(unittest.TestCase):
+    def test_http_timeout_defaults_are_separate_for_each_client(self):
+        for url, expected in (
+            (bridge_config.OC + "/global/health", 300),
+            (bridge_config.TG + "getMe", 70),
+        ):
+            with self.subTest(url=url):
+                with patch("urllib.request.urlopen", return_value=FakeResponse(b"{}")) as urlopen:
+                    http_api.http(url)
+                self.assertEqual(urlopen.call_args.kwargs["timeout"], expected)
+
+    def test_opencode_sse_events_are_decoded_without_losing_payload_fields(self):
+        event = {"type": "message.part.updated", "properties": {"sessionID": "session-1"}}
+        body = f"data: {json.dumps({'payload': event})}\n\n".encode()
+        with patch("urllib.request.urlopen", return_value=FakeResponse(body)) as urlopen:
+            result = list(http_api.opencode_events())
+
+        self.assertEqual(result, [event])
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 15)
+        self.assertEqual(urlopen.call_args.args[0].full_url, bridge_config.OC + "/event")
+
     def test_http_requests_do_not_add_basic_authentication(self):
         for url in (bridge_config.OC + "/global/health", bridge_config.TG + "getMe"):
             with self.subTest(url=url):
@@ -106,6 +131,262 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(send_message.call_count, 3)
         self.assertEqual([len(item.args[1]["text"]) for item in send_message.call_args_list], [4000, 4000, 500])
 
+    def test_edit_reply_replaces_ack_and_sends_remaining_chunks(self):
+        with patch.object(http_api, "telegram") as telegram:
+            bridge.edit_reply(123, 456, "x" * 8500)
+
+        self.assertEqual(
+            [item.args[0] for item in telegram.call_args_list],
+            ["editMessageText", "sendMessage", "sendMessage"],
+        )
+        self.assertEqual(telegram.call_args_list[0].args[1]["message_id"], 456)
+        self.assertEqual(
+            [len(item.args[1]["text"]) for item in telegram.call_args_list],
+            [4000, 4000, 500],
+        )
+
+    def test_handle_update_sends_ack_before_enqueuing_worker(self):
+        update = {
+            "update_id": 987,
+            "message": {"chat": {"id": 123}, "text": "Explain this"},
+        }
+        with patch.object(bridge, "send", return_value={"message_id": 654}) as send:
+            with patch.object(bridge._REQUEST_EXECUTOR, "submit") as submit:
+                with patch.object(bridge, "_REQUEST_SLOTS") as slots:
+                    slots.acquire.return_value = True
+                    bridge.handle_update(update, {})
+
+        send.assert_called_once()
+        self.assertIn("Ref:", send.call_args.args[1])
+        submit.assert_called_once()
+        self.assertEqual(
+            submit.call_args.args[:3],
+            (bridge._request_worker_with_slot, 123, "Explain this"),
+        )
+        self.assertEqual(
+            submit.call_args.args[3:],
+            ({}, 987, send.call_args.args[1].rsplit(" ", 1)[-1], 654),
+        )
+
+    def test_async_answer_uses_correlated_completion_and_reports_cost(self):
+        prompt_id = "prompt-id"
+        assistant = {
+            "info": {
+                "id": "assistant-id",
+                "parentID": prompt_id,
+                "role": "assistant",
+                "time": {"completed": 123},
+                "cost": 0.25,
+            },
+            "parts": [{"type": "text", "text": "Done"}],
+        }
+        sessions = {"123": "session-1"}
+        phases = []
+        with patch("bridge.uuid.uuid4", return_value=SimpleNamespace(hex=prompt_id)):
+            with patch.object(
+                opencode_api,
+                "session_tree_messages",
+                side_effect=[[], [{"session_id": "session-1", "message": assistant}]],
+            ):
+                with patch.object(opencode_api, "submit_async") as submit:
+                    with patch.object(opencode_api, "session_status", return_value={}):
+                        with patch.object(opencode_api, "session_messages", return_value=[assistant]):
+                            with patch.object(opencode_api, "iter_events", return_value=iter(())):
+                                result = bridge.answer_async(
+                                    123,
+                                    "Hi",
+                                    sessions,
+                                    "REF12345",
+                                    phases.append,
+                                    lambda _text: None,
+                                )
+
+        self.assertEqual(result, "Done\n\nCost: $0.250000")
+        submit.assert_called_once()
+        self.assertEqual(
+            submit.call_args.args[:3],
+            (
+                "session-1",
+                prompt_id,
+                {
+                    "system": bridge_config.SYSTEM,
+                    "parts": [{"type": "text", "text": "Hi"}],
+                },
+            ),
+        )
+        self.assertEqual(submit.call_args.args[3], 300)
+        self.assertIn("response_wait", phases)
+
+    def test_async_answer_forwards_only_safe_progress_for_its_assistant_message(self):
+        prompt_id = "prompt-id"
+        incomplete = {
+            "info": {"id": "assistant-id", "parentID": prompt_id, "role": "assistant"},
+            "parts": [],
+        }
+        assistant = {
+            "info": {
+                "id": "assistant-id",
+                "parentID": prompt_id,
+                "role": "assistant",
+                "time": {"completed": 123},
+                "cost": 0,
+            },
+            "parts": [{"type": "text", "text": "Done"}],
+        }
+
+        def event_stream():
+            yield {
+                "type": "message.part.updated",
+                "properties": {
+                    "part": {
+                        "sessionID": "session-1",
+                        "messageID": "assistant-id",
+                        "type": "reasoning",
+                        "text": "private reasoning content",
+                    }
+                },
+            }
+            time.sleep(0.02)
+
+        progress = []
+        with patch("bridge.uuid.uuid4", return_value=SimpleNamespace(hex=prompt_id)):
+            with patch.object(
+                opencode_api,
+                "session_tree_messages",
+                side_effect=[[], [{"session_id": "session-1", "message": assistant}]],
+            ):
+                with patch.object(opencode_api, "submit_async"):
+                    with patch.object(
+                        opencode_api,
+                        "session_status",
+                        side_effect=[{"session-1": {"type": "busy"}}, {}, {}],
+                    ):
+                        with patch.object(
+                            opencode_api,
+                            "session_messages",
+                            side_effect=[[incomplete], [assistant], [assistant]],
+                        ):
+                            with patch.object(opencode_api, "iter_events", side_effect=event_stream):
+                                result = bridge.answer_async(
+                                    123,
+                                    "Hi",
+                                    {"123": "session-1"},
+                                    "REF12345",
+                                    lambda _phase: None,
+                                    progress.append,
+                                )
+
+        self.assertEqual(result, "Done\n\nCost: $0.000000")
+        self.assertEqual(progress, ["OpenCode is thinking…"])
+        self.assertNotIn("private reasoning content", " ".join(progress))
+
+    def test_async_answer_raises_explicit_timeout_at_deadline(self):
+        with patch.object(bridge, "OPENCODE_HTTP_TIMEOUT_SECONDS", 0):
+            with patch.object(opencode_api, "session_tree_messages", return_value=[]):
+                with patch.object(opencode_api, "submit_async"):
+                    with patch.object(opencode_api, "iter_events", return_value=iter(())):
+                        with self.assertRaises(bridge.OpenCodeRequestTimeout):
+                            bridge.answer_async(
+                                123,
+                                "Hi",
+                                {"123": "session-1"},
+                                "REF12345",
+                                lambda _phase: None,
+                                lambda _text: None,
+                            )
+
+    def test_assistant_message_chain_is_correlated_to_its_user_prompt(self):
+        messages = [
+            {"info": {"id": "other", "parentID": "other-prompt", "role": "assistant"}},
+            {"info": {"id": "step-1", "parentID": "prompt", "role": "assistant"}},
+            {"info": {"id": "step-2", "parentID": "step-1", "role": "assistant"}},
+        ]
+
+        result = opencode_api.assistant_messages_for_prompt(messages, "prompt")
+
+        self.assertEqual([message["info"]["id"] for message in result], ["step-1", "step-2"])
+
+    def test_safe_error_details_do_not_include_untrusted_exception_text(self):
+        private_detail = "private prompt and token-like-value"
+        self.assertEqual(bridge._safe_error_detail(RuntimeError(private_detail)), "detail=redacted")
+        wrapped_timeout = urllib.error.URLError(TimeoutError(private_detail))
+        self.assertTrue(bridge._is_timeout_error(wrapped_timeout))
+        self.assertEqual(
+            bridge._safe_error_detail(wrapped_timeout),
+            "url_error=TimeoutError socket_timeout=true",
+        )
+        with self.assertRaises(opencode_api.OpenCodeResponseError) as caught:
+            opencode_api.text_from_response(
+                {"info": {"error": {"name": "ProviderError", "data": {"message": private_detail}}}}
+            )
+        self.assertNotIn(private_detail, str(caught.exception))
+        self.assertEqual(bridge._safe_error_detail(caught.exception), "response_error=ProviderError")
+
+    def test_open_code_retry_status_is_still_considered_busy(self):
+        self.assertTrue(bridge._session_is_busy({"type": "retry"}))
+
+    def test_worker_reports_timeout_without_claiming_request_was_cancelled(self):
+        output = io.StringIO()
+        with patch.object(bridge, "answer_async", side_effect=bridge.OpenCodeRequestTimeout()):
+            with patch.object(bridge, "edit_reply") as edit:
+                with patch("sys.stderr", output):
+                    bridge._request_worker(123, "private prompt", {}, 987, "REF12345", 654)
+
+        self.assertIn("may still be running", edit.call_args.args[2])
+        self.assertIn("REF12345", edit.call_args.args[2])
+        self.assertIn("phase=opencode_request", output.getvalue())
+        self.assertIn("timeout_s=300", output.getvalue())
+        self.assertNotIn("private prompt", output.getvalue())
+
+    def test_worker_reports_generic_opencode_error_with_reference_only(self):
+        output = io.StringIO()
+        with patch.object(bridge, "answer_async", side_effect=RuntimeError("private prompt text")):
+            with patch.object(bridge, "edit_reply") as edit:
+                with patch("sys.stderr", output):
+                    bridge._request_worker(123, "Hi", {}, 990, "REF98765", 656)
+
+        self.assertIn("OpenCode request failed", edit.call_args.args[2])
+        self.assertIn("REF98765", edit.call_args.args[2])
+        self.assertNotIn("private prompt text", output.getvalue())
+        self.assertIn("detail=redacted", output.getvalue())
+
+    def test_worker_does_not_send_a_second_message_when_final_edit_fails(self):
+        output = io.StringIO()
+        with patch.object(bridge, "answer_async", return_value="Done"):
+            with patch.object(bridge, "edit_reply", side_effect=TimeoutError()) as edit:
+                with patch("sys.stderr", output):
+                    bridge._request_worker(123, "Hi", {}, 989, "REF54321", 655)
+
+        edit.assert_called_once()
+        self.assertIn("phase=telegram_final_edit", output.getvalue())
+        self.assertNotIn("phase=telegram_error_edit", output.getvalue())
+
+    def test_telegram_ack_timeout_is_not_misreported_as_opencode_failure(self):
+        update = {
+            "update_id": 988,
+            "message": {"chat": {"id": 123}, "text": "Hi"},
+        }
+        output = io.StringIO()
+        with patch.object(bridge, "send", side_effect=TimeoutError()):
+            with patch("sys.stderr", output):
+                handled = bridge.handle_update(update, {})
+
+        self.assertTrue(handled)
+        self.assertIn("client=telegram", output.getvalue())
+        self.assertIn("phase=telegram_acknowledgement", output.getvalue())
+        self.assertIn("timeout_s=70", output.getvalue())
+
+    def test_timeout_configuration_is_logged_without_secrets(self):
+        output = io.StringIO()
+        with patch("sys.stderr", output):
+            bridge._log_timeout_configuration()
+
+        self.assertIn("OpenCode=300s", output.getvalue())
+        self.assertIn("events=15s", output.getvalue())
+        self.assertIn("Telegram=70s", output.getvalue())
+        self.assertIn("long poll=50s", output.getvalue())
+        self.assertNotIn("unit-test-secret", output.getvalue())
+
     def test_409_conflict_is_recognized_without_exposing_token(self):
         conflict = telegram_http_error(409, {"description": "another getUpdates request is active"})
         with patch("urllib.request.urlopen", side_effect=conflict):
@@ -129,6 +410,31 @@ class TelegramBridgeTests(unittest.TestCase):
 
         self.assertEqual(str(caught.exception), "OpenCode API HTTP 500")
         self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_opencode_http_error_retains_only_safe_classification_metadata(self):
+        error = urllib.error.HTTPError(
+            bridge_config.OC + "/session/private-session-id/message",
+            503,
+            "Server error",
+            {},
+            io.BytesIO(
+                json.dumps(
+                    {
+                        "error": {"name": "ProviderUnavailable", "message": "private response text"},
+                        "code": "UPSTREAM_DOWN",
+                    }
+                ).encode()
+            ),
+        )
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(http_api.OpenCodeHTTPError) as caught:
+                http_api.http(bridge_config.OC + "/session/private-session-id/message")
+
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(caught.exception.error_name, "ProviderUnavailable")
+        self.assertEqual(caught.exception.error_code, "UPSTREAM_DOWN")
+        self.assertNotIn("private response text", str(caught.exception))
+        self.assertNotIn("private-session-id", str(caught.exception))
 
     def test_429_waits_for_retry_after_then_retries(self):
         rate_limit = telegram_http_error(
