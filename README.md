@@ -207,6 +207,10 @@ these settings:
   Coolify resource environment, replacing the example credentials and chat ID. The
   `COMPOSE_PROFILES=telegram` setting enables the Telegram service. `GH_TOKEN` is
   optional; set it only if the agent needs GitHub CLI access.
+- Store credentials in Coolify's environment configuration and restrict access to the
+  resource. This Compose file does not publish the OpenCode port or configure a public
+  route. Check the Coolify resource's domains, port mappings, and proxy settings as well:
+  platform-level routing is outside this repository's control and must not expose the API.
 
 ## GitHub CLI access (optional)
 
@@ -245,14 +249,31 @@ host, not inside this container.
   or a publicly reachable endpoint. The bridge processes only chats listed in
   `TELEGRAM_ALLOWED_CHAT_IDS`.
 - The bridge uses no external Python dependencies.
-- The OpenCode API has no HTTP authentication configured. Its port is not published on
-  the host; the API is intended to remain on the trusted Docker network. Other containers
-  attached to that network and Docker administrators can reach it. Do not publish the
-  port, add a public proxy route, or attach untrusted services to the network.
-- Authentication, TLS, and reverse-proxy hardening are not included for this
-  private-network-only deployment. Complete
-  [issue #1](https://github.com/boly38/bloc/issues/1) before publishing the API or
-  adding a network-facing web client.
+- The OpenCode API has no HTTP authentication configured. Compose does not publish its
+  port on the host, and this project does not provide a public OpenCode UI or route. The
+  API is intended to be reachable only by the Telegram bridge and trusted Docker
+  operators on the deployment's private network.
+- The Telegram chat allowlist is the application-level access boundary. Treat every
+  allowed chat as a trusted operator: its users can submit prompts to OpenCode and use
+  the agent's available tools and credentials.
+- The deployment platform is part of the trust boundary. Docker/Coolify administrators
+  can access containers and their environment; they can also expose ports or attach
+  workloads to networks. Restrict platform administration to trusted operators, do not
+  attach untrusted workloads to the OpenCode network, and verify that no platform-level
+  route or port mapping exposes the API. This repository cannot verify a live Coolify
+  resource's routing or firewall configuration.
+- Secrets in `.env` or Coolify's environment are available to the host/platform
+  administrators. Keep them out of Git and logs. Grant `GH_TOKEN` only the minimum
+  permissions needed, and leave it unset when GitHub access is unnecessary.
+- To rotate a credential, follow its issuing provider's replacement/revocation process
+  (Telegram via BotFather, Opper in the project settings, or GitHub for `GH_TOKEN`),
+  update the environment value, redeploy the affected service, and verify it
+  works. Revoke the previous credential as soon as the replacement is confirmed; if a
+  credential is suspected to be compromised, revoke it immediately.
+- Authentication, TLS, and reverse-proxy hardening are not included because the API is
+  not intended to be exposed. If public API access or a network-facing web client is
+  introduced, treat it as a new security project: define authentication and authorization,
+  TLS, and a threat model before exposing the service.
 - The TUI is available only through an interactive Docker-host command. It adds no
   published port or public web interface, but Docker access is privileged and must be
   restricted to trusted operators.
