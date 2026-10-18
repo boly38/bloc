@@ -1,15 +1,14 @@
 # Implementation tracking
 
-This file tracks the MVP described in [`specifications.md`](specifications.md),
-[issue #3 — MVP: OpenCode accessible via Telegram](https://github.com/boly38/bloc/issues/3),
-and [issue #7 — Configurable launch mode](https://github.com/boly38/bloc/issues/7), which
-formalizes the work on branch `bloc-v0`.
+This file tracks the first BLOC release described in [`specifications.md`](specifications.md),
+[issue #3 — OpenCode accessible via Telegram](https://github.com/boly38/bloc/issues/3),
+and [issue #7 — Configurable launch mode](https://github.com/boly38/bloc/issues/7).
 
 > **Checkboxes:** a checked item under “Already in the repository” means it is
 > implemented, not necessarily validated in real-world use. Executed tests are listed
 > separately. **[QA OK]** marks a user-reported manual test; its scope is stated to
 > avoid implying unperformed checks. Unchecked items remain open; follow the checklist
-> order to validate the MVP without skipping steps.
+> order to validate the release without skipping steps.
 
 ## Already in the repository
 
@@ -20,6 +19,7 @@ formalizes the work on branch `bloc-v0`.
 - [x] The Opper AI provider, its environment-based API key, and the default model `opper/gpt-5.6-luna#medium` are configured.
 - [x] The main and repair Compose stacks are separate; the repair stack mounts the data/workspace volumes and read-only `opencode.json`.
 - [x] Common operations are available in the root Makefile; the README documents local startup and Coolify deployment.
+- [x] `make tui` opens the OpenCode TUI on the running server through Docker exec without publishing the API port.
 - [x] `.env` is ignored by Git and `.env.template` documents the expected variables.
 - [x] The bridge injects an anti-hallucination instruction into OpenCode sessions.
 
@@ -36,6 +36,7 @@ formalizes the work on branch `bloc-v0`.
 - [x] `scripts/compose.sh` routing tested with a fake Docker executable: OpenCode-only mode stops Telegram then starts OpenCode; true mode activates the Telegram profile.
 - [x] Before publication, verified that `.env` is ignored by Git and not tracked (`git check-ignore` / `git ls-files`).
 - [x] **[QA OK]** User reports a quick successful retest of the configurable launch mode after the Makefile refactor.
+- [x] `make tui` dispatch was checked with a fake Docker command in both Telegram launch modes.
 
 ## To qualify / test
 
@@ -53,18 +54,21 @@ Complete these items before considering the implementation fully accepted:
 10. [ ] Confirm the OpenCode API is not publicly exposed in Coolify; verify Coolify volume-name alignment if the independent repair stack will be used with its data.
 11. [x] `.env` is ignored and not tracked by Git; verified again before publication.
 12. [ ] Once these criteria are met, update and close [issue #3](https://github.com/boly38/bloc/issues/3) if all its acceptance criteria are satisfied.
+13. [ ] User to verify that `make tui` connects locally while Telegram remains active,
+    and that responses stay in their originating interfaces.
 
-## Remaining MVP work
+## Remaining release work
 
 - [ ] Resolve the allowlist bootstrap issue (item 1) and keep the README, Compose file, and `.env.template` aligned.
 - [ ] Complete and record end-to-end tests for items 2–10. Local commands and the basic flow are reported **[QA OK]**; unauthorized-chat behavior and the remaining Coolify checks are still open.
 - [ ] Fix any issues found; check items only after actual verification.
-- [ ] Confirm that the MVP scope of [issue #3](https://github.com/boly38/bloc/issues/3) is met before considering the MVP complete.
+- [ ] Confirm that the first-release scope of [issue #3](https://github.com/boly38/bloc/issues/3) is met before considering the release ready.
 
 ## Later work — tracked in dedicated issues
 
 - [ ] [#1 — Secure the OpenCode server](https://github.com/boly38/bloc/issues/1): authentication, threat model, unauthorized-access tests, and secret-handling procedures. `OPENCODE_SERVER_PASSWORD` is not currently passed through Compose. **Do not expose the OpenCode API to the Internet before this is addressed.**
-- [ ] [#6 — Add TUI access to the OpenCode server](https://github.com/boly38/bloc/issues/6): documented administrator access without unnecessarily publishing the port.
+- [ ] [#6 — Add TUI access to the OpenCode server](https://github.com/boly38/bloc/issues/6):
+  implementation is in `feat/issue-6-opencode-tui`; local user verification is pending.
 - [ ] [#7 — Select OpenCode-only or Telegram mode through configuration](https://github.com/boly38/bloc/issues/7): implementation and checks are complete, with a quick user retest confirmed; [PR #4](https://github.com/boly38/bloc/pull/4) is open and will close the issue when merged.
 - [ ] [#5 — Show the cost of an exchange or session on demand](https://github.com/boly38/bloc/issues/5): use cost data actually exposed by OpenCode/Opper.
 - [ ] [#2 — Translate the project documentation and user-facing text into English](https://github.com/boly38/bloc/issues/2): translation is included in this PR; close after merge.
@@ -74,6 +78,6 @@ Complete these items before considering the implementation fully accepted:
 - Repository specification: [`specifications.md`](specifications.md)
 - User guide: [`README.md`](README.md)
 - Contribution and release-draft guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
-- MVP issue: [boly38/bloc#3](https://github.com/boly38/bloc/issues/3)
+- Initial Telegram access issue: [boly38/bloc#3](https://github.com/boly38/bloc/issues/3)
 - Configurable launch issue: [boly38/bloc#7](https://github.com/boly38/bloc/issues/7)
 - Deferred issues: [#1](https://github.com/boly38/bloc/issues/1), [#2](https://github.com/boly38/bloc/issues/2), [#5](https://github.com/boly38/bloc/issues/5), [#6](https://github.com/boly38/bloc/issues/6)

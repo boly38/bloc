@@ -2,8 +2,9 @@
 
 ## Goal
 
-`bloc` is a minimal MVP that runs OpenCode in Docker and allows users to query it from
-Telegram through a dependency-free Python bridge.
+`bloc` runs OpenCode in Docker and allows users to query it from Telegram through a
+dependency-free Python bridge. Trusted operators can connect to the same server through
+the local OpenCode TUI without publishing its API port.
 
 ## Constraints
 
@@ -16,6 +17,7 @@ Telegram through a dependency-free Python bridge.
 - `.env` is local and ignored by Git; `.env.template` documents the expected variables.
 - The default model is `opper/gpt-5.6-luna#medium` via Opper AI.
 - Telegram uses long polling and requires the `TELEGRAM_ALLOWED_CHAT_IDS` allowlist.
+- OpenCode TUI access is for trusted Docker administrators and must not publish the API port.
 - Do not expose the OpenCode API to the Internet without addressing authentication,
   authorization, and TLS encryption.
 - Do not invent APIs or behavior: verify them in official documentation or with a

@@ -6,7 +6,7 @@ export ENV_FILE
 
 COMPOSE_SCRIPT := ./scripts/compose.sh
 
-.PHONY: help test diagnostics format-test check-env config build start stop down restart logs status health repair clean
+.PHONY: help test diagnostics format-test check-env config build start stop down restart logs status health tui repair clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "%-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -48,6 +48,9 @@ status: ## Show container status
 
 health: ## Check the OpenCode server health
 	@$(COMPOSE_SCRIPT) health
+
+tui: ## Open the OpenCode TUI on the running server (requires Docker access)
+	@$(COMPOSE_SCRIPT) tui
 
 repair: ## Open the independent repair container
 	@$(COMPOSE_SCRIPT) repair

@@ -30,6 +30,7 @@ make down        # remove containers, keep volumes
 make status      # show service status
 make logs        # follow logs
 make health      # check the OpenCode API
+make tui         # open the OpenCode TUI on the running server
 make repair      # open the repair container
 ```
 
@@ -40,8 +41,7 @@ Contribution and release-draft instructions are in [`CONTRIBUTING.md`](CONTRIBUT
 Set the mode in `.env` with `TELEGRAM_ENABLED`:
 
 - `TELEGRAM_ENABLED=false` or unset: `make start` starts OpenCode alone. Telegram
-  variables are not required. This starts only the server; interactive TUI access is
-  tracked separately in [issue #6](https://github.com/boly38/bloc/issues/6).
+  variables are not required.
 - `TELEGRAM_ENABLED=true`: `make start` starts OpenCode and the Telegram bridge. Set
   `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_CHAT_IDS` as well; the Makefile refuses to
   start if either value is missing.
@@ -53,6 +53,31 @@ network; no host port is published.
 
 The main Compose file is in `bot/`. The repair Compose file is intentionally separate
 in `bot-repair/` so it can be used independently if the main deployment has a problem.
+
+## OpenCode TUI
+
+Start the Compose services first, then run `make tui` from an interactive terminal on
+the Docker host:
+
+```sh
+make start
+make tui
+```
+
+The command runs the OpenCode CLI inside the existing `opencode` container and connects
+it to `http://127.0.0.1:4096` using `opencode attach`. It uses the same server, workspace, and configured
+credentials as the Telegram bridge, including the optional `GH_TOKEN` available to the
+agent. The TUI is not a separate security boundary. A prompt entered in the TUI is
+answered in the TUI; the bridge sends Telegram replies only for incoming Telegram
+updates. The server stores sessions centrally: selecting a Telegram session in the TUI
+shares its history and concurrent requests may interleave, so use a separate session
+for independent work.
+
+The TUI is an administrative interface. Running it requires Docker access, which must
+be restricted to trusted operators. Closing the TUI exits only the client; it does not
+stop OpenCode or Telegram. Use `make stop` to stop the services. The TUI does not publish
+a port or add a route through Coolify. A Coolify deployment requires an operator shell
+with Docker access to that deployment.
 
 ## Opper AI provider
 
@@ -214,14 +239,25 @@ repairing the workspace. The repository's `bot/opencode.json` is mounted read-on
 and recreate the service if needed. The shell is minimal: run `make` commands on the
 host, not inside this container.
 
-## MVP choices and limitations
+## Security model and product scope
 
 - Telegram was chosen because its official API supports long polling without a webhook
-  or public infrastructure.
+  or a publicly reachable endpoint. The bridge processes only chats listed in
+  `TELEGRAM_ALLOWED_CHAT_IDS`.
 - The bridge uses no external Python dependencies.
-- The OpenCode server is not exposed to the Internet; only the bridge can access it on
-  the Docker network. HTTP authentication is therefore not enabled in Compose because
-  the API is not published on the host.
+- The OpenCode API has no HTTP authentication configured. Its port is not published on
+  the host; the API is intended to remain on the trusted Docker network. Other containers
+  attached to that network and Docker administrators can reach it. Do not publish the
+  port, add a public proxy route, or attach untrusted services to the network.
+- Authentication, TLS, and reverse-proxy hardening are not included for this
+  private-network-only deployment. Complete
+  [issue #1](https://github.com/boly38/bloc/issues/1) before publishing the API or
+  adding a network-facing web client.
+- The TUI is available only through an interactive Docker-host command. It adds no
+  published port or public web interface, but Docker access is privileged and must be
+  restricted to trusted operators.
+- The OpenCode web client and a publicly reachable OpenCode API are not included in
+  this release.
 - Services explicitly clear proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`
   and their lowercase variants) so they do not inherit a proxy configured on the host.
 - The anti-hallucination instruction is injected into every session. It does not
