@@ -8,6 +8,7 @@ import urllib.parse
 
 import cost_reporting
 import http_api
+import markdown_renderer
 import opencode_api
 import session_state
 from bridge_config import ALLOWED, MODEL, OC, SYSTEM
@@ -108,9 +109,12 @@ def authorized_response(chat_id, prompt, sessions):
 
 
 def send(chat_id, text):
-    # Telegram limits messages to 4096 characters.
-    for start in range(0, max(1, len(text)), 4000):
-        http_api.telegram("sendMessage", {"chat_id": chat_id, "text": text[start : start + 4000]})
+    for message in markdown_renderer.render_markdown(text):
+        payload = {"chat_id": chat_id, "text": message.html, "parse_mode": "HTML"}
+        try:
+            http_api.telegram("sendMessage", payload)
+        except http_api.TelegramFormattingError:
+            http_api.telegram("sendMessage", {"chat_id": chat_id, "text": message.plain})
 
 
 def handle_update(update, sessions):
