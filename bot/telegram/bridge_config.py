@@ -17,5 +17,11 @@ COST_DIAGNOSTICS_PATH = "/data/cost-diagnostics.jsonl"
 
 SYSTEM = (
     "Reply in English. Never guess: rely on a test with an official binary, "
-    "verified official documentation, or ask the human for clarification. Be concise."
+    "verified official documentation, or ask the human for clarification. Be concise. "
+    "Format replies using only this Markdown subset: paragraphs, # headings, **bold**, *italic*, "
+    "~~strikethrough~~, simple bullet or numbered lists, > block quotes, `inline code`, "
+    "fenced code blocks with an optional language, and [links](https://example.com). "
+    "Do not emit raw HTML, tables, nested lists, images, or reference-style links. "
+    "Do not nest inline emphasis or put formatting inside link labels. "
+    "Do not escape Markdown for Telegram; the bridge converts this subset."
 )

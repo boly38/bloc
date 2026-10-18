@@ -144,6 +144,18 @@ case "$COMMAND" in
 		fi
 		compose_mode exec -T telegram cat /data/cost-diagnostics.jsonl
 		;;
+	format-test)
+		check_mode_and_telegram
+		if [ "$mode" != true ]; then
+			printf 'Error: enable Telegram mode before sending the formatting fixture.\n' >&2
+			exit 1
+		fi
+		if [ -z "${1:-}" ]; then
+			printf 'Usage: make format-test CHAT_ID=<allowed-id>\n' >&2
+			exit 2
+		fi
+		compose_mode exec -T telegram python -u format_test.py "$1"
+		;;
 	status)
 		check_env_file
 		compose_all ps
@@ -161,7 +173,7 @@ case "$COMMAND" in
 		compose_all down --volumes
 		;;
 	*)
-		printf 'Usage: %s {check-env|config|build|start|stop|down|logs|diagnostics|status|health|repair|clean}\n' "$0" >&2
+		printf 'Usage: %s {check-env|config|build|start|stop|down|logs|diagnostics|format-test|status|health|repair|clean}\n' "$0" >&2
 		exit 2
 		;;
 esac

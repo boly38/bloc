@@ -6,7 +6,7 @@ export ENV_FILE
 
 COMPOSE_SCRIPT := ./scripts/compose.sh
 
-.PHONY: help test diagnostics check-env config build start stop down restart logs status health repair clean
+.PHONY: help test diagnostics format-test check-env config build start stop down restart logs status health repair clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "%-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -16,6 +16,9 @@ test: ## Run dependency-free unit tests
 
 diagnostics: ## Print sanitized Telegram cost diagnostics from the running bridge
 	@$(COMPOSE_SCRIPT) diagnostics
+
+format-test: ## Send a static Markdown formatting fixture; usage: make format-test CHAT_ID=<allowed-id>
+	@$(COMPOSE_SCRIPT) format-test "$(CHAT_ID)"
 
 check-env: ## Check that the environment file exists
 	@$(COMPOSE_SCRIPT) check-env

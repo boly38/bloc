@@ -24,6 +24,10 @@ class TelegramRateLimit(RuntimeError):
         super().__init__(f"Telegram rate limit; retry after {retry_after}s")
 
 
+class TelegramFormattingError(RuntimeError):
+    """Raised when Telegram rejects message entity or HTML formatting."""
+
+
 def acquire_polling_lock():
     lock = open(POLLING_LOCK_PATH, "w", encoding="utf-8")
     try:
@@ -69,6 +73,22 @@ def _handle_telegram_error(url, status, details) -> NoReturn:
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
             retry_after = 1
         raise TelegramRateLimit(retry_after) from None
+    if status == 400 and method == "sendMessage":
+        try:
+            description = json.loads(details).get("description", "").lower()
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            description = ""
+        if any(
+            marker in description
+            for marker in (
+                "parse entities",
+                "can't parse",
+                "entity",
+                "unsupported start tag",
+                "unsupported end tag",
+            )
+        ):
+            raise TelegramFormattingError("Telegram rejected message formatting") from None
     # Telegram URLs contain the bot token; never include them in logs.
     raise RuntimeError(f"Telegram API HTTP {status} ({method})") from None
 

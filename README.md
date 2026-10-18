@@ -75,6 +75,30 @@ logs; add it to `TELEGRAM_ALLOWED_CHAT_IDS` and restart the service. The allowli
 be populated before the first Telegram startup; the bootstrap procedure for an
 unknown initial chat ID is still to be defined.
 
+Telegram replies use a fixed Markdown subset:
+
+- headings: `# Heading`;
+- emphasis: `**bold**`, `*italic*`, and `~~strikethrough~~` (not nested);
+- simple lists: `- item` or `1. item`;
+- quotes: `> quoted text`;
+- code: `` `inline` `` or fenced blocks with an optional language;
+- links: `[label](https://example.com)`.
+
+The bridge converts this syntax to Telegram HTML, escapes text, and splits long answers
+into independently valid messages. Unsupported constructs are sent as readable text. If
+Telegram rejects formatting, the affected message is retried without formatting.
+
+To manually check rendering in an authorized chat without making an OpenCode/LLM call,
+run:
+
+```sh
+make format-test CHAT_ID=<allowed-chat-id>
+```
+
+Ensure the Telegram service is running with the current image first (`make start`). The
+fixture includes special characters and a long code block to exercise message splitting.
+It only sends to a chat already present in `TELEGRAM_ALLOWED_CHAT_IDS`.
+
 Only one process can poll a bot token at a time. Bridge instances sharing the
 `telegram-data` volume coordinate with a local lock; a poller running on another host
 still needs to be stopped manually. Telegram 409 conflicts are logged without exposing
