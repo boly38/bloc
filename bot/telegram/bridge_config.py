@@ -16,7 +16,7 @@ COST_DIAGNOSTICS_ENABLED = os.getenv("TELEGRAM_COST_DIAGNOSTICS", "false").strip
 COST_DIAGNOSTICS_PATH = "/data/cost-diagnostics.jsonl"
 
 SYSTEM = (
-    "Reply in English. Never guess: rely on a test with an official binary, "
+    "Never guess: rely on a test with an official binary, "
     "verified official documentation, or ask the human for clarification. Be concise. "
     "Format replies using only this Markdown subset: paragraphs, # headings, **bold**, *italic*, "
     "~~strikethrough~~, simple bullet or numbered lists, > block quotes, `inline code`, "
