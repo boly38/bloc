@@ -222,7 +222,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
 
     request_body = {"system": SYSTEM, "parts": [{"type": "text", "text": prompt}]}
     _model_options(request_body)
-    prompt_message_id = uuid.uuid4().hex
+    prompt_message_id = f"msg_{uuid.uuid4().hex}"
     stop_events = threading.Event()
     event_queue = queue.Queue(maxsize=128)
     event_thread = threading.Thread(
@@ -382,6 +382,10 @@ def _safe_error_detail(error):
                 safe_value = re.sub(r"[^A-Za-z0-9_.-]", "", str(value))[:80]
                 if safe_value:
                     details.append(f"{key}={safe_value}")
+        if error.validation_fields:
+            details.append(f"validation_fields={','.join(error.validation_fields)}")
+        if error.validation_codes:
+            details.append(f"validation_codes={','.join(error.validation_codes)}")
         return " ".join(details)
     if isinstance(error, opencode_api.OpenCodeResponseError):
         error_name = re.sub(r"[^A-Za-z0-9_.-]", "", error.error_name)[:80] or "unknown"

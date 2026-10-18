@@ -2,6 +2,7 @@
 
 import fcntl
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -37,10 +38,12 @@ class TelegramFormattingError(RuntimeError):
 class OpenCodeHTTPError(RuntimeError):
     """An OpenCode HTTP error with a safe status code for diagnostics."""
 
-    def __init__(self, status, error_name=None, error_code=None):
+    def __init__(self, status, error_name=None, error_code=None, validation_fields=(), validation_codes=()):
         self.status = status
         self.error_name = error_name
         self.error_code = error_code
+        self.validation_fields = validation_fields
+        self.validation_codes = validation_codes
         super().__init__(f"OpenCode API HTTP {status}")
 
 
@@ -80,20 +83,55 @@ def http(url, payload=None, timeout=None):
             # Session URLs and response bodies can contain private identifiers or content.
             error_name = None
             error_code = None
+            validation_fields = set()
+            validation_codes = set()
             try:
                 response_error = json.loads(details)
                 if isinstance(response_error, dict):
+                    error_name = response_error.get("name")
                     error_value = response_error.get("error")
-                    if isinstance(error_value, dict):
-                        error_name = error_value.get("name") or error_value.get("code")
-                    elif isinstance(error_value, str):
-                        error_name = error_value
+                    if error_name is None:
+                        if isinstance(error_value, dict):
+                            error_name = error_value.get("name") or error_value.get("code")
+                        elif isinstance(error_value, str):
+                            error_name = error_value
+                    error_data = response_error.get("data")
                     candidate_code = response_error.get("code")
+                    if candidate_code is None and isinstance(error_data, dict):
+                        candidate_code = error_data.get("code")
                     if isinstance(candidate_code, (str, int)):
                         error_code = candidate_code
+                    issue_list = response_error.get("issues") or response_error.get("errors")
+                    if isinstance(error_data, dict):
+                        issue_list = issue_list or error_data.get("issues") or error_data.get("errors")
+                    if isinstance(issue_list, list):
+                        for issue in issue_list:
+                            if not isinstance(issue, dict):
+                                continue
+                            path = issue.get("path")
+                            if isinstance(path, list):
+                                safe_parts = [
+                                    re.sub(r"[^A-Za-z0-9_.-]", "", str(part))[:40]
+                                    for part in path
+                                    if isinstance(part, (str, int))
+                                ]
+                                safe_path = ".".join(part for part in safe_parts if part)[:100]
+                                if safe_path:
+                                    validation_fields.add(safe_path)
+                            issue_code = issue.get("code")
+                            if isinstance(issue_code, str):
+                                safe_code = re.sub(r"[^A-Za-z0-9_.-]", "", issue_code)[:80]
+                                if safe_code:
+                                    validation_codes.add(safe_code)
             except json.JSONDecodeError:
                 pass
-            raise OpenCodeHTTPError(error.code, error_name, error_code) from None
+            raise OpenCodeHTTPError(
+                error.code,
+                error_name,
+                error_code,
+                tuple(sorted(validation_fields)),
+                tuple(sorted(validation_codes)),
+            ) from None
         raise RuntimeError(f"HTTP {error.code} {url}: {details[:1000]}") from error
 
 
