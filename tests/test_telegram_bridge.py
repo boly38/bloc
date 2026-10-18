@@ -46,6 +46,15 @@ def telegram_http_error(code, body, method="getUpdates"):
 
 
 class TelegramBridgeTests(unittest.TestCase):
+    def test_http_requests_do_not_add_basic_authentication(self):
+        for url in (bridge_config.OC + "/global/health", bridge_config.TG + "getMe"):
+            with self.subTest(url=url):
+                with patch("urllib.request.urlopen", return_value=FakeResponse(b"{}")) as urlopen:
+                    http_api.http(url)
+
+                request = urlopen.call_args.args[0]
+                self.assertNotIn("Authorization", request.headers)
+
     def test_telegram_returns_result_from_successful_response(self):
         updates = [{"update_id": 10}]
         with patch.object(http_api, "http", return_value={"ok": True, "result": updates}) as request:

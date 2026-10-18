@@ -7,7 +7,6 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED = {item.strip() for item in os.environ["TELEGRAM_ALLOWED_CHAT_IDS"].split(",") if item.strip()}
 TG = f"https://api.telegram.org/bot{TOKEN}/"
 OC = os.getenv("OPENCODE_URL", "http://opencode:4096").rstrip("/")
-PASSWORD = os.getenv("OPENCODE_SERVER_PASSWORD", "")
 MODEL = os.getenv("OPENCODE_MODEL", "")
 
 SESSIONS_PATH = "/data/sessions.json"

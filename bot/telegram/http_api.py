@@ -1,6 +1,5 @@
 """HTTP transport and Telegram polling helpers."""
 
-import base64
 import fcntl
 import json
 import sys
@@ -9,7 +8,7 @@ import urllib.error
 import urllib.request
 from typing import NoReturn
 
-from bridge_config import OC, PASSWORD, POLLING_LOCK_PATH, TG
+from bridge_config import OC, POLLING_LOCK_PATH, TG
 
 
 class TelegramConflict(RuntimeError):
@@ -41,9 +40,6 @@ def acquire_polling_lock():
 def http(url, payload=None, timeout=70):
     data = None if payload is None else json.dumps(payload).encode()
     request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    if PASSWORD:
-        value = base64.b64encode(f"opencode:{PASSWORD}".encode()).decode()
-        request.add_header("Authorization", f"Basic {value}")
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
