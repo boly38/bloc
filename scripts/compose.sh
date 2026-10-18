@@ -164,6 +164,10 @@ case "$COMMAND" in
 		check_env_file
 		compose_base exec opencode wget -qO- http://127.0.0.1:4096/global/health
 		;;
+	tui)
+		load_mode
+		compose_mode exec opencode opencode attach http://127.0.0.1:4096
+		;;
 	repair)
 		check_env_file
 		docker compose --project-name bloc-repair --env-file "$ENV_FILE" -f bot-repair/docker-compose.yml run --rm repair
@@ -173,7 +177,7 @@ case "$COMMAND" in
 		compose_all down --volumes
 		;;
 	*)
-		printf 'Usage: %s {check-env|config|build|start|stop|down|logs|diagnostics|format-test|status|health|repair|clean}\n' "$0" >&2
+		printf 'Usage: %s {check-env|config|build|start|stop|down|logs|diagnostics|format-test|status|health|tui|repair|clean}\n' "$0" >&2
 		exit 2
 		;;
 esac
