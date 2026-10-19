@@ -625,8 +625,45 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertIn("Session: $0.125000", report)
         request.assert_not_called()
 
-    def test_unauthorized_cost_command_is_rejected(self):
-        update = {"message": {"chat": {"id": 456}, "text": "/cost"}}
+    def test_health_command_reports_only_sanitized_status_without_a_model_call(self):
+        with patch.object(http_api, "http", return_value={"healthy": True}) as request:
+            with patch.object(
+                opencode_api,
+                "session_details",
+                return_value={"id": "private-session-id", "title": "private title"},
+            ) as get_session:
+                with patch.object(bridge, "answer") as answer:
+                    report = bridge.authorized_response(123, "/health", {"123": "private-session-id"})
+
+        self.assertEqual(
+            report,
+            "Bridge: healthy\nOpenCode API: healthy\nThis chat's session: available",
+        )
+        self.assertNotIn("private-session-id", report)
+        self.assertNotIn("private title", report)
+        request.assert_called_once_with(
+            bridge_config.OC + "/global/health",
+            timeout=bridge_config.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        get_session.assert_called_once_with(
+            "private-session-id",
+            timeout=bridge_config.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        answer.assert_not_called()
+
+    def test_health_command_does_not_require_a_session(self):
+        with patch.object(http_api, "http", return_value={"healthy": False}):
+            with patch.object(opencode_api, "session_details") as get_session:
+                report = bridge.authorized_response(123, "/health", {})
+
+        self.assertEqual(
+            report,
+            "Bridge: healthy\nOpenCode API: unavailable\nThis chat's session: not initialized",
+        )
+        get_session.assert_not_called()
+
+    def test_unauthorized_health_command_is_rejected(self):
+        update = {"message": {"chat": {"id": 456}, "text": "/health"}}
         with patch.object(bridge, "authorized_response") as respond:
             with patch.object(bridge, "send") as send:
                 bridge.handle_update(update, {})
@@ -666,6 +703,13 @@ class TelegramBridgeTests(unittest.TestCase):
                 call(bridge_config.OC + "/session/child-session/children"),
             ]
         )
+
+    def test_session_details_uses_the_read_only_session_endpoint(self):
+        with patch.object(opencode_api, "http", return_value={"id": "session one"}) as request:
+            result = opencode_api.session_details("session one", timeout=10)
+
+        self.assertEqual(result, {"id": "session one"})
+        request.assert_called_once_with(bridge_config.OC + "/session/session%20one", timeout=10)
 
 
 if __name__ == "__main__":

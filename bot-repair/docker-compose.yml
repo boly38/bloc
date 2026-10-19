@@ -4,7 +4,7 @@ name: bloc-repair
 # even if the main Compose stack fails to start.
 services:
   repair:
-    image: ghcr.io/anomalyco/opencode:latest
+    image: "${OPENCODE_IMAGE:-ghcr.io/anomalyco/opencode@sha256:6ebc13097f2381301220abe9d1b2a54f50cd1603a910dc1c66e93d8f2c4e8ebb}"
     entrypoint: ["/bin/sh"]
     stdin_open: true
     tty: true

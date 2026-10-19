@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  unit-tests:
+  checks:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -18,3 +18,20 @@ jobs:
           python-version: "3.13"
       - name: Run unit tests
         run: make test
+      - name: Check Python syntax
+        run: python3 -m py_compile bot/telegram/*.py scripts/telegram_chat_id.py
+      - name: Validate Compose in both launch modes
+        run: |
+          env_file="$(mktemp)"
+          trap 'rm -f "$env_file"' EXIT
+          cat > "$env_file" <<'EOF'
+          TELEGRAM_ENABLED=false
+          TELEGRAM_BOT_TOKEN=ci-placeholder
+          TELEGRAM_ALLOWED_CHAT_IDS=123456789
+          OPPER_API_KEY=ci-placeholder
+          OPPER_MODEL=gpt-5.6-luna
+          OPPER_VARIANT=medium
+          OPENCODE_IMAGE=ghcr.io/anomalyco/opencode@sha256:6ebc13097f2381301220abe9d1b2a54f50cd1603a910dc1c66e93d8f2c4e8ebb
+          EOF
+          make config ENV_FILE="$env_file"
+          TELEGRAM_ENABLED=true make config ENV_FILE="$env_file"

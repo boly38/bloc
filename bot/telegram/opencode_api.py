@@ -43,6 +43,15 @@ def session_messages(session_id, timeout=None):
     return messages
 
 
+def session_details(session_id, timeout=None):
+    """Return one session's metadata without requesting a model response."""
+    encoded_id = urllib.parse.quote(session_id)
+    session = http(f"{OC}/session/{encoded_id}", timeout=timeout)
+    if not isinstance(session, dict):
+        raise RuntimeError("OpenCode returned an invalid session")
+    return session
+
+
 def session_tree_messages(session_id):
     """Return messages from a session and all descendants, preserving session IDs internally."""
     messages = []
