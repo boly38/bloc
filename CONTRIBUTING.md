@@ -1,9 +1,9 @@
 # Contributing
 
-Run local operations through the root `Makefile`. Never commit `.env`, credentials,
-OpenCode sessions, or Docker volume contents.
+Use the root `Makefile` for project operations. Never commit `.env`, credentials, OpenCode
+sessions, or Docker volume contents.
 
-## Run tests
+## Automated checks
 
 Run the dependency-free unit tests with:
 
@@ -11,24 +11,46 @@ Run the dependency-free unit tests with:
 make test
 ```
 
-The tests use Python's standard library and do not require credentials, Docker, or
-access to Telegram or an LLM.
+The tests use Python's standard library and need no credentials, Docker, Telegram, or LLM
+access. Before submitting changes, also run:
+
+```sh
+make config
+python3 -m py_compile bot/telegram/bridge.py
+git diff --check
+```
+
+## Manual checks
+
+For changes to configuration or deployment, validate the Compose configuration in the
+intended mode. `make config` uses the local `.env`; check both OpenCode-only mode and
+Telegram mode when applicable. Do not share the output of environment files or secrets.
+
+For Telegram formatting changes, start the bridge and send the static fixture to an
+already allowed chat:
+
+```sh
+make format-test CHAT_ID=<allowed-chat-id>
+```
+
+For an end-to-end check, start the services, send a message from an allowed chat, then
+check `make status`, `make health`, and `make logs SERVICE=telegram`. The `/health` and
+`/cost` commands check status and usage without making an LLM call.
 
 ## Draft a release
 
-After the release changes are merged into `main`, checks have passed, and the version
-has been approved, create and push an annotated tag, then create a GitHub draft:
+After release changes are merged into `main`, checks have passed, and the version is
+approved, create a GitHub draft with generated release notes. Replace the example version
+with the approved tag:
 
 ```sh
 git switch main
 git pull --ff-only
-VERSION='v0.X.Y' # replace with the approved version, e.g. v0.1.0
+VERSION='v1.2.3' # replace if a different version is approved
 git tag -a "$VERSION" -m "Release $VERSION"
 git push origin "$VERSION"
 gh release create "$VERSION" --draft --verify-tag --title "$VERSION" --generate-notes
 ```
 
-`--verify-tag` requires the tag to have been pushed; `--draft` does not publish the
-release. To provide hand-written notes, replace `--generate-notes` with
-`--notes-file release-notes.md`. Review the draft before publishing. Never attach
-`.env`, credentials, sessions, or Docker volumes.
+`--verify-tag` requires the tag to have been pushed. Review the generated notes and draft
+before publishing. Never attach `.env`, credentials, sessions, or Docker volumes.

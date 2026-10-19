@@ -2,7 +2,10 @@ name: bloc
 
 services:
   opencode:
-    build: ./opencode
+    build:
+      context: ./opencode
+      args:
+        OPENCODE_IMAGE: "${OPENCODE_IMAGE:-ghcr.io/anomalyco/opencode@sha256:6ebc13097f2381301220abe9d1b2a54f50cd1603a910dc1c66e93d8f2c4e8ebb}"
     command: serve --hostname 0.0.0.0 --port 4096
     environment:
       # Do not inherit a proxy configured in the image or on the host.

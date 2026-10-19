@@ -2,14 +2,16 @@ SHELL := /bin/sh
 
 ENV_FILE ?= .env
 SERVICE ?=
+BACKUP_DIR ?= backups
 export ENV_FILE
 
 COMPOSE_SCRIPT := ./scripts/compose.sh
 
-.PHONY: help test diagnostics format-test check-env config build start stop down restart logs status health tui repair clean
+.PHONY: help test diagnostics format-test telegram-chat-id backup restore check-env config build \
+	start stop down restart logs status health tui repair clean
 
 help: ## Show available commands
-	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "%-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "%-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 test: ## Run dependency-free unit tests
 	@python3 -m unittest discover -s tests -v
@@ -19,6 +21,15 @@ diagnostics: ## Print sanitized Telegram cost diagnostics from the running bridg
 
 format-test: ## Send a static Markdown formatting fixture; usage: make format-test CHAT_ID=<allowed-id>
 	@$(COMPOSE_SCRIPT) format-test "$(CHAT_ID)"
+
+telegram-chat-id: ## Safely discover the first Telegram chat ID without starting the bridge
+	@ENV_FILE="$(ENV_FILE)" python3 scripts/telegram_chat_id.py
+
+backup: ## Back up persistent volumes under backups/; override with BACKUP_DIR=<directory>
+	@$(COMPOSE_SCRIPT) backup "$(BACKUP_DIR)"
+
+restore: ## Restore from the latest backup in backups/ or a specific BACKUP_DIR
+	@$(COMPOSE_SCRIPT) restore "$(BACKUP_DIR)"
 
 check-env: ## Check that the environment file exists
 	@$(COMPOSE_SCRIPT) check-env

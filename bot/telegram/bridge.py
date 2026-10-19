@@ -325,12 +325,41 @@ def authorized_response(chat_id, prompt, sessions):
     command = prompt.split(maxsplit=1)[0].split("@", 1)[0].lower()
     if command == "/start":
         return "Hello. Send your request to OpenCode."
+    if command == "/health":
+        return health_response(chat_id, sessions)
     if command == "/cost":
         session_id = sessions.get(str(chat_id))
         if not session_id:
             return "No OpenCode session or cost data yet."
         return cost_reporting.cost_report(session_id)
     return answer(chat_id, prompt, sessions)
+
+
+def health_response(chat_id, sessions):
+    """Report sanitized bridge dependency and persisted-session status without model calls."""
+    lines = ["Bridge: healthy"]
+    try:
+        health = http_api.http(OC + "/global/health", timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+        opencode_status = (
+            "healthy"
+            if isinstance(health, dict) and health.get("healthy") is True
+            else "unavailable"
+        )
+        lines.append(f"OpenCode API: {opencode_status}")
+    except Exception:
+        lines.append("OpenCode API: unavailable")
+
+    session_id = sessions.get(str(chat_id))
+    if not session_id:
+        lines.append("This chat's session: not initialized")
+    else:
+        try:
+            session = opencode_api.session_details(session_id, timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+            available = session.get("id") == session_id
+            lines.append("This chat's session: available" if available else "This chat's session: unavailable")
+        except Exception:
+            lines.append("This chat's session: unavailable")
+    return "\n".join(lines)
 
 
 def send(chat_id, text):
@@ -484,7 +513,7 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
             if command == "/start":
                 set_phase("command")
                 response = authorized_response(chat_id, prompt, sessions)
-            elif command == "/cost":
+            elif command in ("/cost", "/health"):
                 set_phase("opencode_cost")
                 response = authorized_response(chat_id, prompt, sessions)
             else:

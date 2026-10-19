@@ -94,6 +94,9 @@ check_mode_and_telegram() {
 }
 
 case "$COMMAND" in
+	backup|restore)
+		"$ROOT_DIR/scripts/volumes.sh" "$COMMAND" "${1:-backups}"
+		;;
 	check-env)
 		check_env_file
 		;;
