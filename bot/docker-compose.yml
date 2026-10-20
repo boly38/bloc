@@ -55,6 +55,7 @@ services:
         condition: service_healthy
     volumes:
       - telegram-data:/data
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:

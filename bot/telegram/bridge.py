@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import queue
 import re
+import signal
 import sys
 import threading
 import time
@@ -691,35 +692,53 @@ def handle_update(update, sessions):
     return True
 
 
-def main():
-    polling_lock = http_api.acquire_polling_lock()
-    sessions = session_state.load_sessions()
-    _log_timeout_configuration()
+def main(stop_event=None):
+    stop_event = stop_event or threading.Event()
 
-    offset = 0
-    conflict_backoff = 5
-    while True:
-        try:
-            updates = http_api.telegram(
-                "getUpdates",
-                {
-                    "offset": offset,
-                    "timeout": TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
-                    "allowed_updates": ["message"],
-                },
-            ) or []
-            conflict_backoff = 5
-            for update in updates:
-                if not handle_update(update, sessions):
-                    break
-                offset = update["update_id"] + 1
-        except http_api.TelegramConflict as error:
-            print(f"Telegram polling conflict: {error}; retrying in {conflict_backoff}s.", file=sys.stderr, flush=True)
-            time.sleep(conflict_backoff)
-            conflict_backoff = min(conflict_backoff * 2, 60)
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
-            print(f"Telegram network error ({type(error).__name__}); retrying in 5s.", file=sys.stderr, flush=True)
-            time.sleep(5)
+    def request_shutdown(signum, _frame):
+        print(f"Received {signal.Signals(signum).name}; shutting down.", file=sys.stderr, flush=True)
+        stop_event.set()
+
+    previous_handlers = {
+        signum: signal.signal(signum, request_shutdown)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+    polling_lock = None
+    try:
+        polling_lock = http_api.acquire_polling_lock()
+        sessions = session_state.load_sessions()
+        _log_timeout_configuration()
+        offset = 0
+        conflict_backoff = 5
+        while not stop_event.is_set():
+            try:
+                updates = http_api.telegram(
+                    "getUpdates",
+                    {
+                        "offset": offset,
+                        "timeout": TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
+                        "allowed_updates": ["message"],
+                    },
+                ) or []
+                conflict_backoff = 5
+                for update in updates:
+                    if stop_event.is_set():
+                        break
+                    if not handle_update(update, sessions):
+                        break
+                    offset = update["update_id"] + 1
+            except http_api.TelegramConflict as error:
+                print(f"Telegram polling conflict: {error}; retrying in {conflict_backoff}s.", file=sys.stderr, flush=True)
+                stop_event.wait(conflict_backoff)
+                conflict_backoff = min(conflict_backoff * 2, 60)
+            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+                print(f"Telegram network error ({type(error).__name__}); retrying in 5s.", file=sys.stderr, flush=True)
+                stop_event.wait(5)
+    finally:
+        if polling_lock is not None:
+            polling_lock.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def _log_timeout_configuration():
