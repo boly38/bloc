@@ -7,11 +7,22 @@ OpenCode session per chat, so later messages continue that chat's conversation. 
 stores sessions centrally; selecting a Telegram session in the TUI shares its history.
 Use a separate session for independent work.
 
-The bot supports `/health` for a sanitized service and session check, and `/cost` for the
-current chat's session total and current fixed UTC-hour total. Neither command sends a
-prompt to the model. Costs are based on usage reported by OpenCode, not an estimate from
-provider prices, and are not account-wide totals. Replies include a cost line when
-OpenCode provides usage data.
+The Telegram commands are:
+
+- `/start` displays a welcome message and points to `/help`; it does not reset the session.
+- `/help` lists the available commands without calling the model.
+- `/new` starts a new OpenCode session for the chat. The previous session and its history
+  are kept and remain available in OpenCode/TUI. `/cost` then reports usage for the new
+  session, starting at zero.
+- `/health` reports a sanitized bridge, OpenCode API, and current-session status.
+- `/cost` reports the current session's total and its total for the current fixed UTC hour.
+  Costs are based on usage reported by OpenCode, not an estimate from provider prices, and
+  are not account-wide totals. Replies include a cost line when OpenCode provides usage
+  data.
+
+An unknown slash command returns an error directing you to `/help`; it is not sent to the
+model. Normal messages are still sent to OpenCode. `/health` and `/cost` do not send a
+prompt to the model.
 
 Telegram replies support this Markdown subset:
 
@@ -36,10 +47,12 @@ services. See [Security](security.md).
 
 ## Persistent data
 
-`make stop` and `make down` preserve OpenCode data, workspace files, and Telegram session
-mappings. Use `make backup` and `make restore` for volume backups and recovery. Backups go
-under the ignored `backups/` directory by default, in a timestamped folder containing one
-`.tar.gz` archive per Docker volume.
+`make restart`, `make stop`, and `make down` preserve OpenCode data, workspace files, and
+Telegram session mappings. Restarting the services therefore continues the current session;
+use `/new` to start a fresh one without deleting the old history. Use `make backup` and
+`make restore` for volume backups and recovery. Backups go under the ignored `backups/`
+directory by default, in a timestamped folder containing one `.tar.gz` archive per Docker
+volume.
 
 ```sh
 make stop

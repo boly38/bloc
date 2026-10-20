@@ -322,9 +322,13 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
 
 
 def authorized_response(chat_id, prompt, sessions):
-    command = prompt.split(maxsplit=1)[0].split("@", 1)[0].lower()
+    command = _command_name(prompt)
     if command == "/start":
-        return "Hello. Send your request to OpenCode."
+        return "Welcome! Send a message to OpenCode. Use /help to see the available commands."
+    if command == "/help":
+        return help_response()
+    if command == "/new":
+        return new_session_response(chat_id, sessions)
     if command == "/health":
         return health_response(chat_id, sessions)
     if command == "/cost":
@@ -332,7 +336,52 @@ def authorized_response(chat_id, prompt, sessions):
         if not session_id:
             return "No OpenCode session or cost data yet."
         return cost_reporting.cost_report(session_id)
+    if command is not None:
+        return "Unknown command. Use /help to list the available commands."
     return answer(chat_id, prompt, sessions)
+
+
+def _command_name(prompt):
+    """Return a normalized Telegram slash command, or None for a regular message."""
+    words = prompt.split(maxsplit=1)
+    first_word = words[0] if words else ""
+    if not first_word.startswith("/"):
+        return None
+    return first_word.split("@", 1)[0].lower()
+
+
+def help_response():
+    """List Telegram commands without making an OpenCode request."""
+    return "\n".join(
+        (
+            "Available commands:",
+            "/start — welcome message",
+            "/help — list available commands",
+            "/new — start a new session; the previous session is kept",
+            "/health — check bridge, OpenCode API, and session status",
+            "/cost — show cost and usage for this chat's current session",
+        )
+    )
+
+
+def new_session_response(chat_id, sessions):
+    """Create and select a new session while preserving the current session."""
+    session = http_api.http(OC + "/session", {"title": f"Telegram {chat_id}"})
+    session_id = session.get("id") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise RuntimeError("OpenCode returned an invalid session")
+
+    key = str(chat_id)
+    with _SESSIONS_LOCK:
+        updated_sessions = dict(sessions)
+        updated_sessions[key] = session_id
+        session_state.save_sessions(updated_sessions)
+        sessions[key] = session_id
+
+    return (
+        "Started a new OpenCode session. The previous session and its history are kept. "
+        "Use /cost to see usage for the new session."
+    )
 
 
 def health_response(chat_id, sessions):
@@ -509,12 +558,14 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
 
     try:
         with lock:
-            command = prompt.split(maxsplit=1)[0].split("@", 1)[0].lower()
-            if command == "/start":
-                set_phase("command")
-                response = authorized_response(chat_id, prompt, sessions)
-            elif command in ("/cost", "/health"):
-                set_phase("opencode_cost")
+            command = _command_name(prompt)
+            if command is not None:
+                if command == "/new":
+                    set_phase("session_create")
+                elif command in ("/cost", "/health"):
+                    set_phase("opencode_cost")
+                else:
+                    set_phase("command")
                 response = authorized_response(chat_id, prompt, sessions)
             else:
                 set_phase("opencode_request")
