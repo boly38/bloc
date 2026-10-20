@@ -625,6 +625,71 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertIn("Session: $0.125000", report)
         request.assert_not_called()
 
+    def test_help_lists_commands_without_calling_the_llm(self):
+        with patch.object(bridge, "answer") as answer:
+            response = bridge.authorized_response(123, "/help", {})
+
+        for command in ("/start", "/help", "/new", "/health", "/cost"):
+            with self.subTest(command=command):
+                self.assertIn(command, response)
+        answer.assert_not_called()
+
+    def test_start_welcomes_user_and_points_to_help_without_calling_the_llm(self):
+        with patch.object(bridge, "answer") as answer:
+            response = bridge.authorized_response(123, "/start", {})
+
+        self.assertIn("Welcome", response)
+        self.assertIn("/help", response)
+        answer.assert_not_called()
+
+    def test_unknown_slash_commands_return_help_hint_without_calling_the_llm(self):
+        with patch.object(bridge, "answer") as answer:
+            for prompt in ("/", "/unknown", "/unknown@bloc_bot args"):
+                with self.subTest(prompt=prompt):
+                    response = bridge.authorized_response(123, prompt, {})
+                    self.assertIn("Unknown command", response)
+                    self.assertIn("/help", response)
+
+        answer.assert_not_called()
+
+    def test_new_command_persists_a_fresh_session_without_removing_the_old_one(self):
+        sessions = {"123": "old-session", "456": "other-chat-session"}
+        with patch.object(http_api, "http", return_value={"id": "new-session"}) as request:
+            with patch.object(session_state, "save_sessions") as save:
+                with patch.object(bridge, "answer") as answer:
+                    response = bridge.authorized_response(123, "/new", sessions)
+
+        self.assertEqual(sessions, {"123": "new-session", "456": "other-chat-session"})
+        save.assert_called_once_with({"123": "new-session", "456": "other-chat-session"})
+        request.assert_called_once_with(
+            bridge_config.OC + "/session",
+            {"title": "Telegram 123"},
+        )
+        self.assertIn("previous session and its history are kept", response)
+        answer.assert_not_called()
+
+    def test_cost_starts_at_zero_after_creating_a_new_session(self):
+        sessions = {"123": "old-session"}
+        with patch.object(http_api, "http", return_value={"id": "new-session"}):
+            with patch.object(session_state, "save_sessions"):
+                bridge.authorized_response(123, "/new", sessions)
+        with patch.object(cost_reporting, "session_tree_messages", return_value=[]) as history:
+            report = bridge.authorized_response(123, "/cost", sessions)
+
+        self.assertIn("Session: $0.000000", report)
+        self.assertIn("UTC hour (", report)
+        self.assertIn("$0.000000", report)
+        history.assert_called_once_with("new-session")
+
+    def test_worker_does_not_forward_unknown_slash_commands_to_the_llm(self):
+        with patch.object(bridge, "authorized_response", return_value="Use /help") as respond:
+            with patch.object(bridge, "answer_async") as answer:
+                with patch.object(bridge, "edit_reply"):
+                    bridge._request_worker(123, "/unknown", {}, 991, "REF12345", 657)
+
+        respond.assert_called_once_with(123, "/unknown", {})
+        answer.assert_not_called()
+
     def test_health_command_reports_only_sanitized_status_without_a_model_call(self):
         with patch.object(http_api, "http", return_value={"healthy": True}) as request:
             with patch.object(
