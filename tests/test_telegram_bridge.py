@@ -4,11 +4,12 @@ import os
 import sys
 import tempfile
 import time
+import threading
 import urllib.error
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot", "telegram"))
@@ -735,6 +736,23 @@ class TelegramBridgeTests(unittest.TestCase):
 
         respond.assert_not_called()
         send.assert_not_called()
+
+    def test_shutdown_signal_stops_before_processing_returned_updates(self):
+        stop_event = threading.Event()
+        updates = [{"update_id": 10, "message": {"chat": {"id": 123}, "text": "Hello"}}]
+
+        def poll(_method, _payload):
+            stop_event.set()
+            return updates
+
+        with patch.object(http_api, "acquire_polling_lock") as acquire_lock:
+            acquire_lock.return_value.close = Mock()
+            with patch.object(http_api, "telegram", side_effect=poll):
+                with patch.object(bridge, "handle_update") as handle_update:
+                    bridge.main(stop_event)
+
+        handle_update.assert_not_called()
+        acquire_lock.return_value.close.assert_called_once_with()
 
     def test_cost_report_uses_the_current_chats_session(self):
         first_session = [{"session_id": "session-a", "message": {"info": {"role": "assistant", "cost": 0.1}}}]
