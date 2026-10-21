@@ -58,18 +58,10 @@ check `make status`, `make health`, and `make logs SERVICE=telegram`. The `/heal
 
 ## Draft a release
 
-After release changes are merged into `main`, checks have passed, and the version is
-approved, create a GitHub draft with generated release notes. Replace the example version
-with the approved tag:
+After release changes are merged into `main`, open **Actions > Draft patch release >
+Run workflow**, select `main`, and run the workflow. It runs the offline checks, creates
+the next patch version tag (for example, `v1.0.0` becomes `v1.0.1`), and prepares a GitHub
+release draft with generated notes. Review the notes and publish the draft manually.
 
-```sh
-git switch main
-git pull --ff-only
-VERSION='v1.2.3' # replace if a different version is approved
-git tag -a "$VERSION" -m "Release $VERSION"
-git push origin "$VERSION"
-gh release create "$VERSION" --draft --verify-tag --title "$VERSION" --generate-notes
-```
-
-`--verify-tag` requires the tag to have been pushed. Review the generated notes and draft
-before publishing. Never attach `.env`, credentials, sessions, or Docker volumes.
+Only patch releases are currently supported. Never attach `.env`, credentials, sessions,
+or Docker volumes.
