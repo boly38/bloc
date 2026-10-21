@@ -1,6 +1,5 @@
 """Telegram polling loop and orchestration for the OpenCode bridge."""
 
-from concurrent.futures import ThreadPoolExecutor
 import json
 import queue
 import re
@@ -12,12 +11,10 @@ import urllib.error
 import urllib.parse
 import uuid
 
-import cost_reporting
-import http_api
-import markdown_renderer
-import opencode_api
-import session_state
-from bridge_config import (
+from . import bridge_runtime, http_api, session_state
+from .opencode import cost_reporting, api as opencode_api
+from .telegram import markdown_renderer, polling as telegram_polling
+from .bridge_config import (
     ALLOWED,
     MODEL,
     OC,
@@ -30,7 +27,7 @@ from bridge_config import (
 )
 
 
-_REQUEST_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="telegram-request")
+_REQUEST_EXECUTOR = bridge_runtime.RequestWorkers()
 _REQUEST_SLOTS = threading.BoundedSemaphore(32)
 _SESSIONS_LOCK = threading.RLock()
 _CHAT_LOCKS_LOCK = threading.Lock()
@@ -177,7 +174,7 @@ def _watch_events(session_id, reference, events, stop):
                         pass
             if not stop.is_set():
                 stop.wait(1)
-        except (TimeoutError, OSError, urllib.error.URLError, RuntimeError, json.JSONDecodeError) as error:
+        except (OSError, RuntimeError, json.JSONDecodeError) as error:
             if stop.is_set():
                 return
             if not error_reported:
@@ -249,6 +246,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
         last_progress = None
         response_messages = []
         while True:
+            bridge_runtime.check_shutdown()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise OpenCodeRequestTimeout("OpenCode response deadline exceeded")
@@ -293,7 +291,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
                 and idle_samples >= 2
             ):
                 break
-            time.sleep(min(1, max(0, remaining)))
+            bridge_runtime.wait(min(1, max(0, remaining)))
 
         set_phase("history_after")
         new_messages = []
@@ -323,6 +321,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
 
 
 def authorized_response(chat_id, prompt, sessions):
+    """Route local slash commands and send regular prompts to OpenCode."""
     command = _command_name(prompt)
     if command == "/start":
         return "Welcome! Send a message to OpenCode. Use /help to see the available commands."
@@ -542,11 +541,13 @@ def _log_request_error(reference, update_id, phase, started, error):
 
 
 def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledgement_id):
+    """Run a queued request and update its Telegram acknowledgement with progress or a result."""
     started = time.monotonic()
     state = {"phase": "response"}
     lock = _chat_lock(chat_id)
 
     def set_phase(phase):
+        bridge_runtime.check_shutdown()
         state["phase"] = phase
 
     def progress(text):
@@ -559,6 +560,7 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
 
     try:
         with lock:
+            bridge_runtime.check_shutdown()
             command = _command_name(prompt)
             if command is not None:
                 if command == "/new":
@@ -576,6 +578,13 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
         elapsed_ms = int((time.monotonic() - started) * 1000)
         print(
             f"request_completed ref={reference} update_id={update_id} elapsed_ms={elapsed_ms}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except bridge_runtime.ShutdownRequested:
+        print(
+            f"request_interrupted ref={reference} update_id={update_id} reason=bridge_shutdown "
+            "opencode_may_still_be_running=true",
             file=sys.stderr,
             flush=True,
         )
@@ -620,24 +629,31 @@ def _request_worker_with_slot(*args):
 
 
 def handle_update(update, sessions):
+    """Validate an incoming Telegram update before handing it to the request flow."""
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     prompt = message.get("text", "").strip()
     if chat_id is None or not prompt:
-        return True
+        return
     if str(chat_id) not in ALLOWED:
         print(f"Rejected message for chat_id={chat_id}", file=sys.stderr, flush=True)
-        return True
+        return
     update_id = update.get("update_id", "unknown")
+    _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id)
+
+
+def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
+    """Acknowledge an authorized message and queue its background worker."""
     reference = uuid.uuid4().hex[:8].upper()
     started = time.monotonic()
     try:
+        # Acknowledge before queuing so users get an immediate response.
         acknowledgement = send(chat_id, f"Request received. Ref: {reference}")
     except Exception as error:
         _log_request_error(reference, update_id, "telegram_acknowledgement", started, error)
         # Telegram may have accepted the send despite a transport timeout. Consume the update
         # rather than retrying it and potentially creating a duplicate acknowledgement.
-        return True
+        return
 
     acknowledgement_id = acknowledgement.get("message_id") if isinstance(acknowledgement, dict) else None
     if acknowledgement_id is None:
@@ -647,12 +663,13 @@ def handle_update(update, sessions):
             file=sys.stderr,
             flush=True,
         )
-        return True
+        return
     print(
         f"request_accepted ref={reference} update_id={update_id}",
         file=sys.stderr,
         flush=True,
     )
+    # Bound queued work before submitting to the executor.
     if not _REQUEST_SLOTS.acquire(blocking=False):
         print(
             f"request_rejected ref={reference} update_id={update_id} reason=bridge_queue_full",
@@ -667,7 +684,7 @@ def handle_update(update, sessions):
             )
         except Exception as error:
             _log_request_error(reference, update_id, "telegram_error_edit", started, error)
-        return True
+        return
     try:
         _REQUEST_EXECUTOR.submit(
             _request_worker_with_slot,
@@ -678,6 +695,9 @@ def handle_update(update, sessions):
             reference,
             acknowledgement_id,
         )
+    except bridge_runtime.ShutdownRequested:
+        _REQUEST_SLOTS.release()
+        raise
     except Exception as error:
         _REQUEST_SLOTS.release()
         _log_request_error(reference, update_id, "request_enqueue", started, error)
@@ -689,10 +709,10 @@ def handle_update(update, sessions):
             )
         except Exception as delivery_error:
             _log_request_error(reference, update_id, "telegram_error_edit", started, delivery_error)
-    return True
 
 
 def main(stop_event=None):
+    """Poll Telegram updates until shutdown, advancing only past consumed updates."""
     stop_event = stop_event or threading.Event()
 
     def request_shutdown(signum, _frame):
@@ -705,36 +725,21 @@ def main(stop_event=None):
     }
     polling_lock = None
     try:
-        polling_lock = http_api.acquire_polling_lock()
+        polling_lock = http_api.acquire_polling_lock(stop_event)
+        if polling_lock is None:
+            return
         sessions = session_state.load_sessions()
         _log_timeout_configuration()
-        offset = 0
-        conflict_backoff = 5
-        while not stop_event.is_set():
-            try:
-                updates = http_api.telegram(
-                    "getUpdates",
-                    {
-                        "offset": offset,
-                        "timeout": TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
-                        "allowed_updates": ["message"],
-                    },
-                ) or []
-                conflict_backoff = 5
-                for update in updates:
-                    if stop_event.is_set():
-                        break
-                    if not handle_update(update, sessions):
-                        break
-                    offset = update["update_id"] + 1
-            except http_api.TelegramConflict as error:
-                print(f"Telegram polling conflict: {error}; retrying in {conflict_backoff}s.", file=sys.stderr, flush=True)
-                stop_event.wait(conflict_backoff)
-                conflict_backoff = min(conflict_backoff * 2, 60)
-            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
-                print(f"Telegram network error ({type(error).__name__}); retrying in 5s.", file=sys.stderr, flush=True)
-                stop_event.wait(5)
+        bridge_runtime.run_until_stopped(
+            stop_event, telegram_polling.poll_updates, stop_event, handle_update, sessions,
+        )
     finally:
+        stop_event.set()
+        print(
+            "Bridge stopping; queued requests are discarded and in-flight OpenCode work may continue.",
+            file=sys.stderr,
+            flush=True,
+        )
         if polling_lock is not None:
             polling_lock.close()
         for signum, handler in previous_handlers.items():

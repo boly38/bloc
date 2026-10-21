@@ -47,6 +47,13 @@ services. See [Security](security.md).
 
 ## Persistent data
 
+`make stop` sends SIGTERM to the bridge. Its main thread stays responsive while a single
+background poller handles Telegram I/O; blocked HTTP calls do not delay process exit.
+Queued requests are discarded on shutdown, and in-flight replies are not guaranteed to
+be delivered. Work already submitted to OpenCode may continue there: inspect the session
+before retrying a prompt. The Compose 30-second grace period is a safety limit, not a
+mandatory wait.
+
 `make restart`, `make stop`, and `make down` preserve OpenCode data, workspace files, and
 Telegram session mappings. Restarting the services therefore continues the current session;
 use `/new` to start a fresh one without deleting the old history. Use `make backup` and

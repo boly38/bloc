@@ -14,12 +14,8 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot", "telegram"))
 with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "unit-test-secret", "TELEGRAM_ALLOWED_CHAT_IDS": "123"}):
-    import bridge
-    import bridge_config
-    import cost_reporting
-    import http_api
-    import opencode_api
-    import session_state
+    from bloc_bridge import bridge, bridge_config, http_api, session_state
+    from bloc_bridge.opencode import cost_reporting, api as opencode_api
 
 
 class FakeResponse:
@@ -183,7 +179,7 @@ class TelegramBridgeTests(unittest.TestCase):
         }
         sessions = {"123": "session-1"}
         phases = []
-        with patch("bridge.uuid.uuid4", return_value=SimpleNamespace(hex=prompt_id.removeprefix("msg_"))):
+        with patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex=prompt_id.removeprefix("msg_"))):
             with patch.object(
                 opencode_api,
                 "session_tree_messages",
@@ -250,7 +246,7 @@ class TelegramBridgeTests(unittest.TestCase):
             time.sleep(0.02)
 
         progress = []
-        with patch("bridge.uuid.uuid4", return_value=SimpleNamespace(hex=prompt_id.removeprefix("msg_"))):
+        with patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex=prompt_id.removeprefix("msg_"))):
             with patch.object(
                 opencode_api,
                 "session_tree_messages",
@@ -370,9 +366,8 @@ class TelegramBridgeTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(bridge, "send", side_effect=TimeoutError()):
             with patch("sys.stderr", output):
-                handled = bridge.handle_update(update, {})
+                bridge.handle_update(update, {})
 
-        self.assertTrue(handled)
         self.assertIn("client=telegram", output.getvalue())
         self.assertIn("phase=telegram_acknowledgement", output.getvalue())
         self.assertIn("timeout_s=70", output.getvalue())

@@ -157,7 +157,7 @@ case "$COMMAND" in
 			printf 'Usage: make format-test CHAT_ID=<allowed-id>\n' >&2
 			exit 2
 		fi
-		compose_mode exec -T telegram python -u format_test.py "$1"
+		compose_mode exec -T telegram python -u -m bloc_bridge.telegram.format_test "$1"
 		;;
 	status)
 		check_env_file

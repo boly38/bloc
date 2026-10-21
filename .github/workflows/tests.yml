@@ -19,7 +19,7 @@ jobs:
       - name: Run unit tests
         run: make test
       - name: Check Python syntax
-        run: python3 -m py_compile bot/telegram/*.py scripts/telegram_chat_id.py
+        run: python3 -m compileall -q bot/telegram/bloc_bridge scripts/telegram_chat_id.py
       - name: Validate Compose in both launch modes
         run: |
           env_file="$(mktemp)"

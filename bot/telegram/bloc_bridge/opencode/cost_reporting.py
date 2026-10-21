@@ -7,8 +7,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from bridge_config import COST_DIAGNOSTICS_ENABLED, COST_DIAGNOSTICS_PATH
-from opencode_api import session_tree_messages
+from ..bridge_config import COST_DIAGNOSTICS_ENABLED, COST_DIAGNOSTICS_PATH
+from .api import session_tree_messages
 
 
 UTC = timezone.utc

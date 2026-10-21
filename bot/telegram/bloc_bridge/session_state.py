@@ -3,7 +3,7 @@
 import json
 import os
 
-from bridge_config import SESSIONS_PATH
+from .bridge_config import SESSIONS_PATH
 
 
 def load_sessions():
