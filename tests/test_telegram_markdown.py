@@ -11,11 +11,8 @@ with patch.dict(
     os.environ,
     {"TELEGRAM_BOT_TOKEN": "unit-test-secret", "TELEGRAM_ALLOWED_CHAT_IDS": "123"},
 ):
-    import bridge
-    import bridge_config
-    import format_test
-    import http_api
-    import markdown_renderer
+    from bloc_bridge import bridge, bridge_config, http_api
+    from bloc_bridge.telegram import format_test, markdown_renderer
 
 
 class _TagBalanceParser(html.parser.HTMLParser):

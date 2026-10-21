@@ -9,7 +9,8 @@ import urllib.error
 import urllib.request
 from typing import NoReturn
 
-from bridge_config import (
+from . import bridge_runtime
+from .bridge_config import (
     OC,
     OPENCODE_EVENT_TIMEOUT_SECONDS,
     OPENCODE_HTTP_TIMEOUT_SECONDS,
@@ -55,17 +56,38 @@ def http_timeout(url):
     return TELEGRAM_HTTP_TIMEOUT_SECONDS
 
 
-def acquire_polling_lock():
+def acquire_polling_lock(stop=None):
     lock = open(POLLING_LOCK_PATH, "w", encoding="utf-8")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print("Another Telegram bridge shares this data volume; waiting for its polling lock.", file=sys.stderr, flush=True)
-        fcntl.flock(lock, fcntl.LOCK_EX)
-    return lock
+    reported = False
+    while stop is None or not stop.is_set():
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except BlockingIOError:
+            if not reported:
+                print(
+                    "Another Telegram bridge shares this data volume; waiting for its polling lock.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                reported = True
+            if stop is None:
+                time.sleep(0.1)
+            else:
+                stop.wait(0.1)
+    lock.close()
+    return None
 
 
 def http(url, payload=None, timeout=None):
+    bridge_runtime.check_shutdown()
+    try:
+        return _http(url, payload, timeout)
+    finally:
+        bridge_runtime.check_shutdown()
+
+
+def _http(url, payload=None, timeout=None):
     if timeout is None:
         timeout = http_timeout(url)
     data = None if payload is None else json.dumps(payload).encode()

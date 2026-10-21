@@ -2,8 +2,8 @@
 
 import sys
 
-import bridge
-from bridge_config import ALLOWED
+from .. import bridge
+from ..bridge_config import ALLOWED
 
 
 FIXTURE = """# Telegram formatting smoke test
@@ -37,7 +37,7 @@ def send_fixture(chat_id):
 
 def main(argv):
     if len(argv) != 2:
-        raise SystemExit("Usage: format_test.py <allowed-chat-id>")
+        raise SystemExit("Usage: python -m bloc_bridge.telegram.format_test <allowed-chat-id>")
     try:
         chat_id = int(argv[1])
     except ValueError as error:

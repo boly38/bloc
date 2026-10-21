@@ -2,9 +2,9 @@
 
 import urllib.parse
 
-from bridge_config import OC
-import http_api
-from http_api import http
+from ..bridge_config import OC
+from .. import http_api
+from ..http_api import http
 
 
 class OpenCodeResponseError(RuntimeError):
