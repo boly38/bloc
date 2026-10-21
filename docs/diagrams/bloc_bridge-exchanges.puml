@@ -12,6 +12,7 @@ participant "Request worker\nbridge._request_worker" as worker
 database "Session mapping\nsession_state + volume" as state
 participant "OpenCode API\nvia opencode.api" as oc
 participant "Event watcher\nDaemon thread" as events
+participant "Opper API\noptional, no credentials" as opper
 
 note over poll,oc
   Network calls use http_api; Telegram replies use telegram.markdown_renderer.
@@ -43,6 +44,10 @@ else Allowed text message
                 opt /new
                     worker -> state : Persist selected session
                 end
+                opt /health and TELEGRAM_HEALTH_OPPER_ENABLED=true
+                    worker -> opper : GET /v3/compat/models (5 s socket timeout)
+                    opper --> worker : Reachability only; no inference
+                end
             end
         else Regular prompt
             opt No session for this chat
@@ -63,7 +68,13 @@ else Allowed text message
                 opt Correlated reasoning/tool event available
                     oc --> events : SSE event
                     events -> worker : Bounded event queue (128)
-                    worker -> tg : Edit acknowledgement with safe progress
+                    worker -> worker : Select safe progress stage
+                end
+                opt Assistant error in correlated history
+                    worker -> worker : Fail promptly with sanitized status + reference
+                end
+                opt First progress event or 30 s since last progress
+                    worker -> tg : Edit acknowledgement with safe progress or elapsed wait\nKeep original deadline
                 end
             end
             worker -> oc : Read session tree history

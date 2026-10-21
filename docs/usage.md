@@ -15,6 +15,8 @@ The Telegram commands are:
   are kept and remain available in OpenCode/TUI. `/cost` then reports usage for the new
   session, starting at zero.
 - `/health` reports a sanitized bridge, OpenCode API, and current-session status.
+  Set `TELEGRAM_HEALTH_OPPER_ENABLED=true` to also check Opper API reachability without
+  credentials or inference; it is disabled by default. See [Provider](provider.md#optional-reachability-check).
 - `/cost` reports the current session's total and its total for the current fixed UTC hour.
   Costs are based on usage reported by OpenCode, not an estimate from provider prices, and
   are not account-wide totals. Replies include a cost line when OpenCode provides usage
@@ -23,6 +25,14 @@ The Telegram commands are:
 An unknown slash command returns an error directing you to `/help`; it is not sent to the
 model. Normal messages are still sent to OpenCode. `/health` and `/cost` do not send a
 prompt to the model.
+
+While a normal request is running, the acknowledgement is updated with sanitized
+reasoning/tool progress or a waiting message approximately every 30 seconds when no
+progress is available. Network calls can delay updates. These updates do not reset the
+300-second OpenCode deadline. Failures include a reference for the operator and, when
+OpenCode supplies a structured error, distinguish provider authentication/access,
+rate/quota limits, and provider service errors. Do not automatically retry: an interrupted
+request may still be running in OpenCode.
 
 Telegram replies support this Markdown subset:
 

@@ -18,6 +18,7 @@ Docker runs `python -m bloc_bridge`. Its Dockerfile copies the entire package.
 - `opencode/cost_reporting.py`: usage aggregation and sanitized diagnostics.
 - `bridge_runtime.py`: daemon workers, shutdown context, and cooperative cancellation.
 - `http_api.py`: shared HTTP transport, Telegram error classification, and polling lock.
+- `opper_health.py`: isolated, optional, unauthenticated Opper reachability check for `/health` only.
 - `bridge_config.py` and `session_state.py`: environment settings and persisted chat sessions.
 
 For an overview, see [message flow](../../docs/diagrams/bloc_bridge-overview.puml).
@@ -36,6 +37,8 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
   persist mappings with atomic file replacement.
 - Slash commands never submit a model prompt. `/new`, `/health`, and `/cost` can call
   OpenCode APIs; `/start`, `/help`, and unknown commands are handled locally.
+- `/health` contacts Opper only when `TELEGRAM_HEALTH_OPPER_ENABLED=true`; this is a
+  bridge-side reachability check, not proof of authentication or working inference.
 - Correlate assistant responses to the generated prompt message ID. SSE is optional
   progress information, not proof of completion; status and history determine completion.
 - Costs come from OpenCode usage, including descendant sessions, not price estimates.
