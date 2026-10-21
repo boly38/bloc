@@ -10,13 +10,28 @@ from ..http_api import http
 class OpenCodeResponseError(RuntimeError):
     """OpenCode returned an assistant error; keep user/provider text out of logs."""
 
-    def __init__(self, error_name, error_code=None):
+    def __init__(self, error_name, error_code=None, status_code=None):
         self.error_name = error_name if isinstance(error_name, str) else "unknown"
         self.error_code = error_code if isinstance(error_code, (str, int)) else None
+        self.status_code = status_code if type(status_code) is int and 100 <= status_code <= 599 else None
         super().__init__("OpenCode returned an error response")
 
 
+def raise_response_error(response):
+    """Raise on an assistant error, retaining only structured diagnostic fields."""
+    error = response.get("info", {}).get("error")
+    if error is None:
+        return
+    if not isinstance(error, dict):
+        raise OpenCodeResponseError("unknown")
+    details = error.get("data", {})
+    if not isinstance(details, dict):
+        details = {}
+    raise OpenCodeResponseError(error.get("name"), details.get("code"), details.get("statusCode"))
+
+
 def text_from_response(response):
+    raise_response_error(response)
     text = "\n".join(
         part.get("text", "")
         for part in response.get("parts", [])
@@ -25,13 +40,6 @@ def text_from_response(response):
     if text:
         return text
 
-    error = response.get("info", {}).get("error", {})
-    details = error.get("data", {}) if isinstance(error, dict) else {}
-    detail_message = details.get("message") if isinstance(details, dict) else None
-    message = detail_message or error.get("name") if isinstance(error, dict) else None
-    if message:
-        error_code = details.get("code") if isinstance(details, dict) else None
-        raise OpenCodeResponseError(error.get("name"), error_code)
     raise RuntimeError("OpenCode returned no text")
 
 

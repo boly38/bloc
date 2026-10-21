@@ -698,7 +698,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
         self.assertEqual(
             report,
-            "Bridge: healthy\nOpenCode API: healthy\nThis chat's session: available",
+            "Bridge: healthy\nOpenCode API: healthy\nThis chat's session: available\nOpper API: not checked (disabled)",
         )
         self.assertNotIn("private-session-id", report)
         self.assertNotIn("private title", report)
@@ -719,7 +719,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
         self.assertEqual(
             report,
-            "Bridge: healthy\nOpenCode API: unavailable\nThis chat's session: not initialized",
+            "Bridge: healthy\nOpenCode API: unavailable\nThis chat's session: not initialized\nOpper API: not checked (disabled)",
         )
         get_session.assert_not_called()
 

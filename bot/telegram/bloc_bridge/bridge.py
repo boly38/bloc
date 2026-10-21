@@ -11,15 +11,17 @@ import urllib.error
 import urllib.parse
 import uuid
 
-from . import bridge_runtime, http_api, session_state
+from . import bridge_runtime, http_api, opper_health, session_state
 from .opencode import cost_reporting, api as opencode_api
 from .telegram import markdown_renderer, polling as telegram_polling
 from .bridge_config import (
     ALLOWED,
+    HEALTH_OPPER_ENABLED,
     MODEL,
     OC,
     OPENCODE_HTTP_TIMEOUT_SECONDS,
     OPENCODE_STATUS_TIMEOUT_SECONDS,
+    OPENCODE_PROGRESS_INTERVAL_SECONDS,
     SYSTEM,
     TELEGRAM_HTTP_TIMEOUT_SECONDS,
     TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
@@ -244,6 +246,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
         set_phase("response_wait")
         idle_samples = 0
         last_progress = None
+        last_progress_at = time.monotonic()
         response_messages = []
         while True:
             bridge_runtime.check_shutdown()
@@ -264,11 +267,14 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
             if time.monotonic() >= deadline:
                 raise OpenCodeRequestTimeout("OpenCode response deadline exceeded")
             correlated = opencode_api.assistant_messages_for_prompt(response_messages, prompt_message_id)
+            for message in correlated:
+                opencode_api.raise_response_error(message)
             assistant_ids = {
                 message.get("info", {}).get("id")
                 for message in correlated
                 if message.get("info", {}).get("id")
             }
+            stage = None
             while True:
                 try:
                     event_message_id, part_type = event_queue.get_nowait()
@@ -276,13 +282,12 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
                     break
                 if event_message_id not in assistant_ids:
                     continue
-                stage = {
+                event_stage = {
                     "reasoning": "OpenCode is thinking…",
                     "tool": "OpenCode is working with a tool…",
                 }.get(part_type)
-                if stage and stage != last_progress:
-                    progress(stage)
-                    last_progress = stage
+                if event_stage:
+                    stage = event_stage
 
             if (
                 correlated
@@ -291,6 +296,21 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
                 and idle_samples >= 2
             ):
                 break
+            now = time.monotonic()
+            if (
+                (stage and last_progress is None)
+                or now - last_progress_at >= OPENCODE_PROGRESS_INTERVAL_SECONDS
+            ):
+                elapsed = int(now - (deadline - OPENCODE_HTTP_TIMEOUT_SECONDS))
+                text = stage or "Still waiting for OpenCode"
+                if last_progress is not None or stage is None:
+                    text = f"{text} ({elapsed}s elapsed)."
+                progress(text)
+                last_progress = stage or "waiting"
+                last_progress_at = time.monotonic()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OpenCodeRequestTimeout("OpenCode response deadline exceeded")
             bridge_runtime.wait(min(1, max(0, remaining)))
 
         set_phase("history_after")
@@ -358,7 +378,7 @@ def help_response():
             "/start — welcome message",
             "/help — list available commands",
             "/new — start a new session; the previous session is kept",
-            "/health — check bridge, OpenCode API, and session status",
+            "/health — check bridge, OpenCode API, session, and optional provider reachability",
             "/cost — show cost and usage for this chat's current session",
         )
     )
@@ -408,6 +428,11 @@ def health_response(chat_id, sessions):
             lines.append("This chat's session: available" if available else "This chat's session: unavailable")
         except Exception:
             lines.append("This chat's session: unavailable")
+    lines.append(
+        opper_health.health_status()
+        if HEALTH_OPPER_ENABLED
+        else "Opper API: not checked (disabled)"
+    )
     return "\n".join(lines)
 
 
@@ -473,6 +498,8 @@ def _safe_error_detail(error):
             else None
         )
         suffix = f" error_code={error_code}" if error_code else ""
+        if error.status_code is not None:
+            suffix += f" http_status={error.status_code}"
         return f"response_error={error_name}{suffix}"
     if isinstance(error, urllib.error.URLError):
         reason = error.reason
@@ -506,6 +533,31 @@ def _is_timeout_error(error):
     if isinstance(error, urllib.error.URLError):
         return isinstance(error.reason, TimeoutError)
     return isinstance(error, http_api.OpenCodeHTTPError) and error.status in (408, 504)
+
+
+def _opencode_failure_text(error, reference):
+    if _is_timeout_error(error):
+        summary = "OpenCode timed out."
+    elif isinstance(error, opencode_api.OpenCodeResponseError):
+        status = error.status_code
+        if error.error_name == "ProviderAuthError" or status in (401, 403):
+            summary = "OpenCode reported a provider authentication/access failure. Ask the operator to check credentials."
+        elif status == 429:
+            summary = "OpenCode reported a provider rate/quota limit. Ask the operator to check provider limits."
+        elif status is not None and status >= 500:
+            summary = "OpenCode reported a provider service error. Ask the operator to check provider availability."
+        else:
+            summary = "OpenCode reported an assistant/provider error."
+    elif isinstance(error, (urllib.error.URLError, ConnectionError)):
+        summary = "OpenCode API is unreachable. Ask the operator to check the service and network."
+    elif isinstance(error, http_api.OpenCodeHTTPError):
+        summary = f"OpenCode API rejected the request (HTTP {error.status})."
+    else:
+        summary = "OpenCode request failed."
+    return (
+        f"{summary} The request may still be running; please check before retrying. "
+        f"Please share this reference with the operator: {reference}"
+    )
 
 
 def _log_request_error(reference, update_id, phase, started, error):
@@ -556,6 +608,7 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
             edit_reply(chat_id, acknowledgement_id, f"{text}\n\nRef: {reference}")
         except Exception as error:
             _log_request_error(reference, update_id, state["phase"], started, error)
+        finally:
             set_phase("response_wait")
 
     try:
@@ -603,13 +656,7 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                 "response_wait",
                 "history_after",
             ):
-                if _is_timeout_error(error):
-                    error_text = (
-                        "OpenCode timed out. The request may still be running; "
-                        f"please check before retrying. Ref: {reference}"
-                    )
-                else:
-                    error_text = f"OpenCode request failed. Please share this reference with the operator: {reference}"
+                error_text = _opencode_failure_text(error, reference)
             else:
                 error_text = f"Request failed. Please share this reference with the operator: {reference}"
             edit_reply(
