@@ -20,6 +20,7 @@ Docker runs `python -m bloc_bridge`. Its Dockerfile copies the entire package.
 - `http_api.py`: shared HTTP transport, Telegram error classification, and polling lock.
 - `opper_health.py`: isolated, optional, unauthenticated Opper reachability check for `/health` only.
 - `bridge_config.py` and `session_state.py`: environment settings and persisted chat sessions.
+- `request_store.py`: durable request metadata and Telegram-update deduplication.
 
 For an overview, see [message flow](../../docs/diagrams/bloc_bridge-overview.puml).
 For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchanges.puml).
@@ -31,8 +32,9 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
   chunks only when needed. A failed send may already have reached Telegram: do not
   blindly retry an acknowledgement after a transport timeout.
 - Keep one poller and advance offsets only after handling an update.
-- Bound admitted work (currently 32 requests, 4 workers) and retain per-chat locking.
-  Do not assume that a lock guarantees FIFO execution of requests within a chat.
+- Bound admitted work (currently 32 requests, 4 workers), admit at most one active request
+  per chat, and retain per-chat locking. `/status` and `/cancel` must remain available while
+  a request is active.
 - Reuse the selected session per chat. `/new` changes the mapping without deleting history;
   persist mappings with atomic file replacement.
 - Slash commands never submit a model prompt. `/new`, `/health`, and `/cost` can call
@@ -41,6 +43,13 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
   bridge-side reachability check, not proof of authentication or working inference.
 - Correlate assistant responses to the generated prompt message ID. SSE is optional
   progress information, not proof of completion; status and history determine completion.
+- Persist request references, Telegram update IDs, acknowledgement IDs, and OpenCode
+  correlation IDs without persisting prompt or response text. Resume submitted work by
+  correlation; never replay an uncertain submission. Mark queued, unsubmitted work interrupted
+  on restart.
+- Retry transient status/history HTTP timeouts. The configurable overall request limit is
+  30 minutes by default; request timeout or cancellation must not release a chat until
+  OpenCode is confirmed idle.
 - Costs come from OpenCode usage, including descendant sessions, not price estimates.
 - Render through the existing Markdown renderer. Fall back to plain text only for a
   classified Telegram formatting rejection, not for every delivery error.
@@ -54,7 +63,8 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
 - `ShutdownRequested` intentionally inherits from `BaseException` so request error handlers
   do not swallow cancellation. Handle it only at lifecycle boundaries; preserve cleanup.
 - Shutdown discards queued work and may lose replies. A submitted OpenCode prompt may
-  continue on the server; do not claim it was cancelled or automatically replay it.
+  continue on the server; recover it on restart by session/prompt IDs, but do not claim it was
+  cancelled or automatically replay it.
 - Never log bot-token URLs, prompt/response bodies, provider error text, or session IDs.
   Use existing sanitized diagnostics and request references; surface failures explicitly.
 

@@ -15,7 +15,7 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot", "telegram"))
 with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "unit-test-secret", "TELEGRAM_ALLOWED_CHAT_IDS": "123"}):
-    from bloc_bridge import bridge, bridge_config, http_api, session_state
+    from bloc_bridge import bridge, bridge_config, http_api, request_store, session_state
     from bloc_bridge.opencode import cost_reporting, api as opencode_api
 
 
@@ -49,6 +49,18 @@ def telegram_http_error(code, body, method="getUpdates"):
 
 
 class TelegramBridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.request_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.request_directory.cleanup)
+        patcher = patch.object(
+            request_store,
+            "REQUESTS_PATH",
+            os.path.join(self.request_directory.name, "requests.sqlite3"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        request_store.initialize()
+
     def test_http_timeout_defaults_are_separate_for_each_client(self):
         for url, expected in (
             (bridge_config.OC + "/global/health", 300),
@@ -219,7 +231,7 @@ class TelegramBridgeTests(unittest.TestCase):
                 },
             ),
         )
-        self.assertEqual(submit.call_args.args[3], 300)
+        self.assertEqual(submit.call_args.args[3], bridge_config.OPENCODE_STATUS_TIMEOUT_SECONDS)
         self.assertIn("response_wait", phases)
 
     def test_async_answer_creates_session_with_an_opaque_title(self):
@@ -233,11 +245,21 @@ class TelegramBridgeTests(unittest.TestCase):
                 patch.object(http_api, "http", return_value={"id": "session-1"})
             )
             save = stack.enter_context(patch.object(session_state, "save_sessions"))
-            stack.enter_context(patch.object(bridge, "OPENCODE_HTTP_TIMEOUT_SECONDS", 0))
+            stack.enter_context(patch.object(bridge, "OPENCODE_REQUEST_MAX_DURATION_SECONDS", 0))
+            stack.enter_context(patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt")))
             stack.enter_context(patch.object(opencode_api, "session_tree_messages", return_value=[]))
             stack.enter_context(patch.object(opencode_api, "submit_async"))
+            stack.enter_context(patch.object(opencode_api, "session_status", return_value={}))
+            stack.enter_context(
+                patch.object(
+                    opencode_api,
+                    "session_messages",
+                    return_value=[{"info": {"id": "msg_prompt", "role": "user"}}],
+                )
+            )
+            stack.enter_context(patch.object(opencode_api, "abort_session", return_value=False))
             stack.enter_context(patch.object(opencode_api, "iter_events", return_value=iter(())))
-            with self.assertRaises(bridge.OpenCodeRequestTimeout):
+            with self.assertRaises(bridge.OpenCodeRequestStopped):
                 bridge.answer_async(
                     123,
                     "Hi",
@@ -319,19 +341,30 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertNotIn("private reasoning content", " ".join(progress))
 
     def test_async_answer_raises_explicit_timeout_at_deadline(self):
-        with patch.object(bridge, "OPENCODE_HTTP_TIMEOUT_SECONDS", 0):
-            with patch.object(opencode_api, "session_tree_messages", return_value=[]):
-                with patch.object(opencode_api, "submit_async"):
-                    with patch.object(opencode_api, "iter_events", return_value=iter(())):
-                        with self.assertRaises(bridge.OpenCodeRequestTimeout):
-                            bridge.answer_async(
-                                123,
-                                "Hi",
-                                {"123": "session-1"},
-                                "REF12345",
-                                lambda _phase: None,
-                                lambda _text: None,
-                            )
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(bridge, "OPENCODE_REQUEST_MAX_DURATION_SECONDS", 0))
+            stack.enter_context(patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt")))
+            stack.enter_context(patch.object(opencode_api, "session_tree_messages", return_value=[]))
+            stack.enter_context(patch.object(opencode_api, "submit_async"))
+            stack.enter_context(patch.object(opencode_api, "session_status", return_value={}))
+            stack.enter_context(
+                patch.object(
+                    opencode_api,
+                    "session_messages",
+                    return_value=[{"info": {"id": "msg_prompt", "role": "user"}}],
+                )
+            )
+            stack.enter_context(patch.object(opencode_api, "abort_session", return_value=False))
+            stack.enter_context(patch.object(opencode_api, "iter_events", return_value=iter(())))
+            with self.assertRaises(bridge.OpenCodeRequestStopped):
+                bridge.answer_async(
+                    123,
+                    "Hi",
+                    {"123": "session-1"},
+                    "REF12345",
+                    lambda _phase: None,
+                    lambda _text: None,
+                )
 
     def test_assistant_message_chain_is_correlated_to_its_user_prompt(self):
         messages = [
@@ -377,7 +410,7 @@ class TelegramBridgeTests(unittest.TestCase):
         )
         self.assertIn("REF12345", edit.call_args.args[2])
         self.assertIn("phase=opencode_request", output.getvalue())
-        self.assertIn("timeout_s=300", output.getvalue())
+        self.assertIn("timeout_s=1800", output.getvalue())
         self.assertNotIn("private prompt", output.getvalue())
 
     def test_worker_reports_generic_opencode_error_with_reference_only(self):
@@ -423,7 +456,7 @@ class TelegramBridgeTests(unittest.TestCase):
         with patch("sys.stderr", output):
             bridge._log_timeout_configuration()
 
-        self.assertIn("OpenCode=300s", output.getvalue())
+        self.assertIn("OpenCode request max=1800s", output.getvalue())
         self.assertIn("events=15s", output.getvalue())
         self.assertIn("Telegram=70s", output.getvalue())
         self.assertIn("long poll=50s", output.getvalue())

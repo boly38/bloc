@@ -21,6 +21,10 @@ The Telegram commands are:
   Costs are based on usage reported by OpenCode, not an estimate from provider prices, and
   are not account-wide totals. Replies include a cost line when OpenCode provides usage
   data.
+- `/status [reference]` shows the active request, or the state of a request with the given
+  reference. A reference can only be inspected from the chat that owns it.
+- `/cancel <reference>` asks OpenCode to abort the request. The command reports whether the
+  stop was confirmed; use `/status` to check the final state.
 
 An unknown slash command returns an error directing you to `/help`; it is not sent to the
 model. Normal messages are still sent to OpenCode. `/health` and `/cost` do not send a
@@ -28,11 +32,19 @@ prompt to the model.
 
 While a normal request is running, the acknowledgement is updated with sanitized
 reasoning/tool progress or a waiting message approximately every 30 seconds when no
-progress is available. Network calls can delay updates. These updates do not reset the
-300-second OpenCode deadline. Failures include a reference for the operator and, when
-OpenCode supplies a structured error, distinguish provider authentication/access,
-rate/quota limits, and provider service errors. Do not automatically retry: an interrupted
-request may still be running in OpenCode.
+progress is available. Network calls can delay updates. Temporary status/history HTTP
+timeouts are retried; they do not end the request. The default maximum request duration is
+30 minutes, configurable with `OPENCODE_REQUEST_MAX_DURATION_SECONDS`. At that limit, the
+bridge asks OpenCode to abort and keeps the chat busy until it confirms the session has
+stopped. If the stop cannot be confirmed, `/status` reports that the request may still be
+running; check before retrying. Failures include a reference and, when OpenCode supplies a
+structured error, distinguish provider authentication/access, rate/quota limits, and
+provider service errors.
+
+Only one request at a time is admitted per chat. A new prompt while one is active is refused
+with the active request's reference. Use `/status` or `/cancel` to manage it. References do
+not expose OpenCode session IDs or prompt content.
+The final reply retains its reference so the request can still be inspected afterward.
 
 Telegram replies support this Markdown subset:
 
@@ -59,10 +71,13 @@ services. See [Security](security.md).
 
 `make stop` sends SIGTERM to the bridge. Its main thread stays responsive while a single
 background poller handles Telegram I/O; blocked HTTP calls do not delay process exit.
-Queued requests are discarded on shutdown, and in-flight replies are not guaranteed to
-be delivered. Work already submitted to OpenCode may continue there: inspect the session
-before retrying a prompt. The Compose 30-second grace period is a safety limit, not a
-mandatory wait.
+Request metadata is persisted in `/data/requests.sqlite3` in the Telegram volume, but prompts
+and generated responses are not copied into that database. On restart, submitted requests
+are correlated with OpenCode history and monitored without resubmission. Requests that had
+not reached OpenCode are marked interrupted rather than replayed. Replies may be delayed or
+their delivery may be uncertain if shutdown occurs while Telegram is updating the
+acknowledgement. Use `/status <reference>` before retrying. The Compose 30-second grace period
+is a safety limit, not a mandatory wait.
 
 `make restart`, `make stop`, and `make down` preserve OpenCode data, workspace files, and
 Telegram session mappings. Restarting the services therefore continues the current session;
