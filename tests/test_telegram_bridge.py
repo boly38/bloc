@@ -7,6 +7,7 @@ import time
 import threading
 import urllib.error
 import unittest
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -84,20 +85,27 @@ class TelegramBridgeTests(unittest.TestCase):
         request.assert_called_once_with(bridge_config.TG + "getUpdates", {"offset": 0}, 70)
 
     def test_answer_creates_and_persists_a_session(self):
+        session_title = "Telegram 2026-10-22T14:35:12Z__opaque-suffix"
         response = {"parts": [{"type": "text", "text": "Hello"}]}
         message = {
             "info": {"id": "message-1", "role": "assistant", "agent": "build", "cost": 0.1},
             "parts": [],
         }
-        with patch.object(http_api, "http", side_effect=[{"id": "session-1"}, response]) as request:
-            with patch.object(opencode_api, "session_tree_messages", side_effect=[[], [{"session_id": "session-1", "message": message}]]):
-                with patch.object(session_state, "save_sessions") as save:
-                    result = bridge.answer(123, "Hi", {})
+        with patch.object(bridge, "_new_telegram_session_title", return_value=session_title) as title:
+            with patch.object(http_api, "http", side_effect=[{"id": "session-1"}, response]) as request:
+                with patch.object(
+                    opencode_api,
+                    "session_tree_messages",
+                    side_effect=[[], [{"session_id": "session-1", "message": message}]],
+                ):
+                    with patch.object(session_state, "save_sessions") as save:
+                        result = bridge.answer(123, "Hi", {})
 
         self.assertEqual(result, "Hello\n\nCost: $0.100000 (build: $0.100000)")
+        title.assert_called_once_with()
         request.assert_has_calls(
             [
-                call(bridge_config.OC + "/session", {"title": "Telegram 123"}),
+                call(bridge_config.OC + "/session", {"title": session_title}),
                 call(
                     bridge_config.OC + "/session/session-1/message",
                     {"system": bridge_config.SYSTEM, "parts": [{"type": "text", "text": "Hi"}]},
@@ -213,6 +221,39 @@ class TelegramBridgeTests(unittest.TestCase):
         )
         self.assertEqual(submit.call_args.args[3], 300)
         self.assertIn("response_wait", phases)
+
+    def test_async_answer_creates_session_with_an_opaque_title(self):
+        session_title = "Telegram 2026-10-22T14:35:12Z__opaque-suffix"
+        sessions = {}
+        with ExitStack() as stack:
+            title = stack.enter_context(
+                patch.object(bridge, "_new_telegram_session_title", return_value=session_title)
+            )
+            create_session = stack.enter_context(
+                patch.object(http_api, "http", return_value={"id": "session-1"})
+            )
+            save = stack.enter_context(patch.object(session_state, "save_sessions"))
+            stack.enter_context(patch.object(bridge, "OPENCODE_HTTP_TIMEOUT_SECONDS", 0))
+            stack.enter_context(patch.object(opencode_api, "session_tree_messages", return_value=[]))
+            stack.enter_context(patch.object(opencode_api, "submit_async"))
+            stack.enter_context(patch.object(opencode_api, "iter_events", return_value=iter(())))
+            with self.assertRaises(bridge.OpenCodeRequestTimeout):
+                bridge.answer_async(
+                    123,
+                    "Hi",
+                    sessions,
+                    "REF12345",
+                    lambda _phase: None,
+                    lambda _text: None,
+                )
+
+        title.assert_called_once_with()
+        create_session.assert_called_once_with(
+            bridge_config.OC + "/session",
+            {"title": session_title},
+        )
+        self.assertEqual(sessions, {"123": "session-1"})
+        save.assert_called_once_with({"123": "session-1"})
 
     def test_async_answer_forwards_only_safe_progress_for_its_assistant_message(self):
         prompt_id = "msg_prompt-id"
@@ -654,20 +695,42 @@ class TelegramBridgeTests(unittest.TestCase):
         answer.assert_not_called()
 
     def test_new_command_persists_a_fresh_session_without_removing_the_old_one(self):
+        session_title = "Telegram 2026-10-22T14:35:12Z__opaque-suffix"
         sessions = {"123": "old-session", "456": "other-chat-session"}
-        with patch.object(http_api, "http", return_value={"id": "new-session"}) as request:
-            with patch.object(session_state, "save_sessions") as save:
-                with patch.object(bridge, "answer") as answer:
-                    response = bridge.authorized_response(123, "/new", sessions)
+        with patch.object(bridge, "_new_telegram_session_title", return_value=session_title) as title:
+            with patch.object(http_api, "http", return_value={"id": "new-session"}) as request:
+                with patch.object(session_state, "save_sessions") as save:
+                    with patch.object(bridge, "answer") as answer:
+                        response = bridge.authorized_response(123, "/new", sessions)
 
         self.assertEqual(sessions, {"123": "new-session", "456": "other-chat-session"})
+        title.assert_called_once_with()
         save.assert_called_once_with({"123": "new-session", "456": "other-chat-session"})
         request.assert_called_once_with(
             bridge_config.OC + "/session",
-            {"title": "Telegram 123"},
+            {"title": session_title},
         )
         self.assertIn("previous session and its history are kept", response)
         answer.assert_not_called()
+
+    def test_new_telegram_session_titles_are_opaque_and_unique_within_same_second(self):
+        timestamp = "2026-10-22T14:35:12Z"
+        random_suffixes = ["a4f91c2e" * 4, "b5c02d3f" * 4]
+        with patch.object(bridge, "datetime") as clock:
+            clock.now.return_value.strftime.return_value = timestamp
+            with patch.object(
+                bridge.uuid,
+                "uuid4",
+                side_effect=[SimpleNamespace(hex=suffix) for suffix in random_suffixes],
+            ):
+                titles = [bridge._new_telegram_session_title() for _ in random_suffixes]
+
+        self.assertEqual(
+            titles,
+            [f"Telegram {timestamp}__{suffix}" for suffix in random_suffixes],
+        )
+        self.assertEqual(len(set(titles)), 2)
+        self.assertNotIn("Telegram 123", " ".join(titles))
 
     def test_cost_starts_at_zero_after_creating_a_new_session(self):
         sessions = {"123": "old-session"}

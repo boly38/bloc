@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import uuid
+from datetime import datetime, timezone
 
 from . import bridge_runtime, http_api, opper_health, session_state
 from .opencode import cost_reporting, api as opencode_api
@@ -90,11 +91,16 @@ def _model_options(body):
         body["variant"] = variant
 
 
+def _new_telegram_session_title():
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"Telegram {timestamp}__{uuid.uuid4().hex}"
+
+
 def answer(chat_id, prompt, sessions):
     key = str(chat_id)
     session_id = sessions.get(key)
     if not session_id:
-        session = http_api.http(OC + "/session", {"title": f"Telegram {chat_id}"})
+        session = http_api.http(OC + "/session", {"title": _new_telegram_session_title()})
         session_id = session["id"]
         sessions[key] = session_id
         session_state.save_sessions(sessions)
@@ -203,7 +209,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
         session_id = sessions.get(chat_key)
     if not session_id:
         set_phase("session_create")
-        session = http_api.http(OC + "/session", {"title": f"Telegram {chat_id}"})
+        session = http_api.http(OC + "/session", {"title": _new_telegram_session_title()})
         session_id = session["id"]
         with _SESSIONS_LOCK:
             sessions[chat_key] = session_id
@@ -386,7 +392,7 @@ def help_response():
 
 def new_session_response(chat_id, sessions):
     """Create and select a new session while preserving the current session."""
-    session = http_api.http(OC + "/session", {"title": f"Telegram {chat_id}"})
+    session = http_api.http(OC + "/session", {"title": _new_telegram_session_title()})
     session_id = session.get("id") if isinstance(session, dict) else None
     if not isinstance(session_id, str) or not session_id:
         raise RuntimeError("OpenCode returned an invalid session")
