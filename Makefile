@@ -8,7 +8,7 @@ export ENV_FILE
 COMPOSE_SCRIPT := ./scripts/compose.sh
 
 .PHONY: help test diagnostics format-test telegram-chat-id backup restore check-env config build \
-	start stop down restart logs status health tui repair clean
+	start stop down restart logs status health tui remote-tui repair clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "%-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -62,6 +62,9 @@ health: ## Check the OpenCode server health
 
 tui: ## Open the OpenCode TUI on the running server (requires Docker access)
 	@$(COMPOSE_SCRIPT) tui
+
+remote-tui: ## List remote containers or attach to OpenCode; usage: make remote-tui HOST=<ssh-host> [CONTAINER_ID=<id>]
+	@$(COMPOSE_SCRIPT) remote-tui "$(HOST)" "$(CONTAINER_ID)"
 
 repair: ## Open the independent repair container
 	@$(COMPOSE_SCRIPT) repair

@@ -171,6 +171,33 @@ case "$COMMAND" in
 		load_mode
 		compose_mode exec opencode opencode attach http://127.0.0.1:4096
 		;;
+	remote-tui)
+		remote_host=${1:-}
+		container_id=${2:-}
+		if [ -z "$remote_host" ]; then
+			printf 'Usage: make remote-tui HOST=SSH_HOST [CONTAINER_ID=ID_FROM_DOCKER_PS]\n' >&2
+			exit 2
+		fi
+		case "$remote_host" in
+			-*)
+				printf 'Error: HOST must be an SSH host or alias, not an option.\n' >&2
+				exit 2
+				;;
+		esac
+		if [ -z "$container_id" ]; then
+			ssh "$remote_host" docker ps
+			printf '\nFind the OpenCode container ID in the first column, then run:\n'
+			printf '  make remote-tui HOST=%s CONTAINER_ID=ID_FROM_DOCKER_PS\n' "$remote_host"
+		else
+			case "$container_id" in
+				*[!0123456789abcdefABCDEF]*|'')
+					printf 'Error: CONTAINER_ID must be the hexadecimal ID from docker ps.\n' >&2
+					exit 2
+					;;
+			esac
+			ssh -t "$remote_host" docker exec -it "$container_id" opencode attach http://127.0.0.1:4096
+		fi
+		;;
 	repair)
 		check_env_file
 		docker compose --project-name bloc-repair --env-file "$ENV_FILE" -f bot-repair/docker-compose.yml run --rm repair

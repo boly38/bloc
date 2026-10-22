@@ -18,3 +18,22 @@ outside this repository's control and must not expose the API.
 For provider settings, see [Provider](provider.md); for trust boundaries, see
 [Security](security.md). The local TUI requires an operator shell with Docker access to
 the deployment.
+
+## Remote TUI
+
+From a trusted operator workstation with SSH and Docker access to the VPS, list running
+containers and find the OpenCode container ID in the first column:
+
+```sh
+make remote-tui HOST=coolify
+```
+
+Then pass that ID to attach the TUI:
+
+```sh
+make remote-tui HOST=coolify CONTAINER_ID=0123456789ab
+```
+
+Replace `coolify` with your SSH host or alias and the example ID with the value shown by
+`docker ps`. Docker access on the VPS is equivalent to operator-level access; use this only
+from trusted administrator accounts. This workflow does not publish the OpenCode API.
