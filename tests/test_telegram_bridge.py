@@ -330,6 +330,10 @@ class TelegramBridgeTests(unittest.TestCase):
                     bridge._request_worker(123, "private prompt", {}, 987, "REF12345", 654)
 
         self.assertIn("may still be running", edit.call_args.args[2])
+        self.assertIn(
+            "An operator can inspect the session using the remote TUI (`make remote-tui`).",
+            edit.call_args.args[2],
+        )
         self.assertIn("REF12345", edit.call_args.args[2])
         self.assertIn("phase=opencode_request", output.getvalue())
         self.assertIn("timeout_s=300", output.getvalue())
@@ -343,6 +347,7 @@ class TelegramBridgeTests(unittest.TestCase):
                     bridge._request_worker(123, "Hi", {}, 990, "REF98765", 656)
 
         self.assertIn("OpenCode request failed", edit.call_args.args[2])
+        self.assertNotIn("remote TUI", edit.call_args.args[2])
         self.assertIn("REF98765", edit.call_args.args[2])
         self.assertNotIn("private prompt text", output.getvalue())
         self.assertIn("detail=redacted", output.getvalue())

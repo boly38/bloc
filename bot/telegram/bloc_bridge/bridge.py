@@ -536,7 +536,8 @@ def _is_timeout_error(error):
 
 
 def _opencode_failure_text(error, reference):
-    if _is_timeout_error(error):
+    timed_out = _is_timeout_error(error)
+    if timed_out:
         summary = "OpenCode timed out."
     elif isinstance(error, opencode_api.OpenCodeResponseError):
         status = error.status_code
@@ -554,8 +555,14 @@ def _opencode_failure_text(error, reference):
         summary = f"OpenCode API rejected the request (HTTP {error.status})."
     else:
         summary = "OpenCode request failed."
+    recovery_hint = (
+        " An operator can inspect the session using the remote TUI (`make remote-tui`)."
+        if timed_out
+        else ""
+    )
     return (
-        f"{summary} The request may still be running; please check before retrying. "
+        f"{summary} The request may still be running; please check before retrying."
+        f"{recovery_hint} "
         f"Please share this reference with the operator: {reference}"
     )
 
