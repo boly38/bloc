@@ -28,8 +28,9 @@ access is unnecessary. Store deployment credentials in the platform's secret env
 configuration.
 
 Persistent volumes and backups may contain session history, workspace files, credentials,
-or other private state. Restrict access, encrypt backups before storing them off-host, and
-never commit them.
+or other private state. Telegram request metadata includes chat, update, and OpenCode
+correlation identifiers, but does not store prompt or response text. Restrict access,
+encrypt backups before storing them off-host, and never commit them.
 
 The anti-hallucination instruction is not a security control. Review sensitive actions
 and outputs. If public API access is ever required, first define authentication,

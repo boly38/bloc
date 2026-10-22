@@ -103,6 +103,15 @@ def session_status(timeout):
     return statuses
 
 
+def abort_session(session_id, timeout=None):
+    """Ask OpenCode to stop the current operation in a session."""
+    encoded_id = urllib.parse.quote(session_id)
+    result = http(f"{OC}/session/{encoded_id}/abort", {}, timeout=timeout)
+    if not isinstance(result, bool):
+        raise RuntimeError("OpenCode returned an invalid abort result")
+    return result
+
+
 def assistant_messages_for_prompt(messages, prompt_message_id):
     """Select the assistant chain rooted at this prompt, preserving message order."""
     parent_ids = {prompt_message_id}
