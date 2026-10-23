@@ -36,3 +36,10 @@ while keeping Opper AI as the default BLOC provider.
 - Run `make config` with Docker Compose v2 and a local `.env` based on `.env.template`.
 - Run the project test suite and the documented health check in an environment with
   `make`, Python, and Docker installed.
+
+## Pull request
+
+- Branch: `docs/provider-alternatives-28`
+- Commit: `10a0712 docs: document GitHub Copilot provider setup`
+- Pull request: https://github.com/boly38/bloc/pull/37
+- Issue linkage: `Closes #28`
