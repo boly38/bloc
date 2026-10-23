@@ -3,7 +3,7 @@
 ## Requirements
 
 - Docker with Compose v2;
-- an [Opper AI](https://opper.ai/) API key (see [Provider](provider.md));
+- an [Opper AI](https://opper.ai/) API key for the default setup (see [Provider](provider.md));
 - a Telegram bot from [@BotFather](https://t.me/BotFather) if you want Telegram access.
 
 Run all operations from the repository root through the `Makefile`.

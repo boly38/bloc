@@ -20,7 +20,7 @@ Run `make help` for the available commands.
 
 - [Quickstart](docs/quickstart.md): configure, start, and stop BLOC.
 - [Usage](docs/usage.md): Telegram formatting, sessions, and cost reporting.
-- [Provider](docs/provider.md): configure Opper AI and select a model.
+- [Provider](docs/provider.md): configure Opper AI or an alternative provider and select a model.
 - [Security](docs/security.md): trust boundaries and safe deployment.
 - [Coolify deployment](docs/coolify_deploy.md): deploy with Coolify Compose.
 - [Contributing](CONTRIBUTING.md): tests and release process.
