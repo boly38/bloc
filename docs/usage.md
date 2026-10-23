@@ -23,23 +23,30 @@ The Telegram commands are:
   data.
 - `/status [reference]` shows the active request, or the state of a request with the given
   reference. A reference can only be inspected from the chat that owns it.
-- `/cancel <reference>` asks OpenCode to abort the request. The command reports whether the
-  stop was confirmed; use `/status` to check the final state.
+- `/cancel [reference]` asks OpenCode to abort the active request, or the identified request.
+  The command reports whether the stop was confirmed; use `/status` to check the final state.
 
 An unknown slash command returns an error directing you to `/help`; it is not sent to the
 model. Normal messages are still sent to OpenCode. `/health` and `/cost` do not send a
 prompt to the model.
 
-While a normal request is running, the acknowledgement is updated with sanitized
-reasoning/tool progress or a waiting message approximately every 30 seconds when no
+While a normal request is running, the acknowledgement is updated with deterministic
+analysis/tool/test stages, or a waiting message approximately every 30 seconds when no
 progress is available. Network calls can delay updates. Temporary status/history HTTP
 timeouts are retried; they do not end the request. The default maximum request duration is
-30 minutes, configurable with `OPENCODE_REQUEST_MAX_DURATION_SECONDS`. At that limit, the
+5 days, configurable with `OPENCODE_REQUEST_MAX_DURATION_SECONDS`. At that limit, the
 bridge asks OpenCode to abort and keeps the chat busy until it confirms the session has
 stopped. If the stop cannot be confirmed, `/status` reports that the request may still be
 running; check before retrying. Failures include a reference and, when OpenCode supplies a
 structured error, distinguish provider authentication/access, rate/quota limits, and
 provider service errors.
+
+Progress updates retain the request reference and can be controlled without copying it:
+use `/status` to inspect the active request or `/cancel` to ask OpenCode to stop it.
+Updates show deterministic analysis/tool/test stages and any cost OpenCode has reported so
+far; the cost is partial while the request is running and may be unavailable.
+The final Telegram reply also lists the tool names used, including recognized command-line
+tools such as `gh`; it does not include their arguments or output.
 
 Only one request at a time is admitted per chat. A new prompt while one is active is refused
 with the active request's reference. Use `/status` or `/cancel` to manage it. References do

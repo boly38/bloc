@@ -22,8 +22,9 @@ else (no)
     else (no)
       :Reuse or create this chat's\nOpenCode session;
       :Persist session and prompt correlation IDs;
-      :Submit once and monitor for up to 30 minutes;
+      :Submit once and monitor for up to 5 days;
       :Retry temporary status/history HTTP timeouts;
+      :Report deterministic progress and observed partial cost;
       :Abort on cancellation or maximum duration;
       :Confirm OpenCode is idle before releasing the chat;
     endif

@@ -81,6 +81,59 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 15)
         self.assertEqual(urlopen.call_args.args[0].full_url, bridge_config.OC + "/event")
 
+    def test_tool_progress_uses_safe_tool_metadata_without_echoing_arguments(self):
+        event = {
+            "properties": {
+                "sessionID": "session-1",
+                "messageID": "assistant-1",
+                "part": {
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {"status": "running", "input": {"command": "gh pr view 31 && make test"}},
+                },
+            }
+        }
+
+        details = bridge._event_details(event)
+
+        self.assertEqual(
+            details,
+            ("session-1", "assistant-1", "tool", "bash", "running", True, True),
+        )
+        self.assertEqual(bridge._event_progress_stage(*details[2:]), "Tests in progress")
+        self.assertEqual(
+            bridge._event_progress_stage("tool", "bash", "running", False, True),
+            "GitHub CLI in progress",
+        )
+
+    def test_tool_usage_log_lists_only_safe_names_and_recognized_gh_cli(self):
+        messages = [
+            {
+                "message": {
+                    "parts": [
+                        {
+                            "type": "tool",
+                            "tool": "bash",
+                            "state": {
+                                "status": "completed",
+                                "input": {"command": "gh issue view 31 --json title"},
+                                "output": "private command output",
+                            },
+                        },
+                        {"type": "tool", "tool": "read", "state": {"status": "completed"}},
+                        {"type": "tool", "tool": "read", "state": {"status": "completed"}},
+                    ]
+                }
+            }
+        ]
+
+        names = bridge._tool_names(messages)
+        report = bridge._format_tool_usage(names)
+
+        self.assertEqual(names, ["bash", "gh", "read"])
+        self.assertEqual(report, "Tools used: bash, gh, read")
+        self.assertNotIn("private command output", report)
+
     def test_http_requests_do_not_add_basic_authentication(self):
         for url in (bridge_config.OC + "/global/health", bridge_config.TG + "getMe"):
             with self.subTest(url=url):
@@ -175,6 +228,8 @@ class TelegramBridgeTests(unittest.TestCase):
 
         send.assert_called_once()
         self.assertIn("Ref:", send.call_args.args[1])
+        self.assertIn("/status", send.call_args.args[1])
+        self.assertIn("/cancel", send.call_args.args[1])
         submit.assert_called_once()
         self.assertEqual(
             submit.call_args.args[:3],
@@ -218,7 +273,7 @@ class TelegramBridgeTests(unittest.TestCase):
                                     lambda _text: None,
                                 )
 
-        self.assertEqual(result, "Done\n\nCost: $0.250000")
+        self.assertEqual(result, "Done\n\nCost: $0.250000\n\nTools used: none")
         submit.assert_called_once()
         self.assertEqual(
             submit.call_args.args[:3],
@@ -233,6 +288,18 @@ class TelegramBridgeTests(unittest.TestCase):
         )
         self.assertEqual(submit.call_args.args[3], bridge_config.OPENCODE_STATUS_TIMEOUT_SECONDS)
         self.assertIn("response_wait", phases)
+
+    def test_observed_cost_is_partial_and_only_sums_assistant_usage(self):
+        messages = [
+            {"info": {"role": "assistant", "cost": 0.125}},
+            {"info": {"role": "assistant"}},
+            {"info": {"role": "user", "cost": 9.0}},
+        ]
+
+        self.assertEqual(
+            cost_reporting.format_observed_cost(messages),
+            "Cost observed so far: $0.125000 (partial)",
+        )
 
     def test_async_answer_creates_session_with_an_opaque_title(self):
         session_title = "Telegram 2026-10-22T14:35:12Z__opaque-suffix"
@@ -336,8 +403,8 @@ class TelegramBridgeTests(unittest.TestCase):
                                     progress.append,
                                 )
 
-        self.assertEqual(result, "Done\n\nCost: $0.000000")
-        self.assertEqual(progress, ["OpenCode is thinking…"])
+        self.assertEqual(result, "Done\n\nCost: $0.000000\n\nTools used: none")
+        self.assertEqual(progress, ["Analysis in progress (0s elapsed)."])
         self.assertNotIn("private reasoning content", " ".join(progress))
 
     def test_async_answer_raises_explicit_timeout_at_deadline(self):
@@ -410,7 +477,7 @@ class TelegramBridgeTests(unittest.TestCase):
         )
         self.assertIn("REF12345", edit.call_args.args[2])
         self.assertIn("phase=opencode_request", output.getvalue())
-        self.assertIn("timeout_s=1800", output.getvalue())
+        self.assertIn("timeout_s=432000", output.getvalue())
         self.assertNotIn("private prompt", output.getvalue())
 
     def test_worker_reports_generic_opencode_error_with_reference_only(self):
@@ -456,7 +523,7 @@ class TelegramBridgeTests(unittest.TestCase):
         with patch("sys.stderr", output):
             bridge._log_timeout_configuration()
 
-        self.assertIn("OpenCode request max=1800s", output.getvalue())
+        self.assertIn("OpenCode request max=432000s", output.getvalue())
         self.assertIn("events=15s", output.getvalue())
         self.assertIn("Telegram=70s", output.getvalue())
         self.assertIn("long poll=50s", output.getvalue())
