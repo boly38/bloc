@@ -27,6 +27,10 @@ class TelegramRequestTests(unittest.TestCase):
         self.path_patch.start()
         self.addCleanup(self.path_patch.stop)
         request_store.initialize()
+        self.real_pending_permissions = opencode_api.pending_permissions
+        self.permission_patch = patch.object(opencode_api, "pending_permissions", return_value=[])
+        self.permission_patch.start()
+        self.addCleanup(self.permission_patch.stop)
 
     def test_create_is_idempotent_for_a_telegram_update(self):
         request, created = request_store.create("A" * 16, 123, 101)
@@ -151,6 +155,146 @@ class TelegramRequestTests(unittest.TestCase):
             {},
             timeout=7,
         )
+
+    def test_pending_permissions_uses_the_project_permission_endpoint(self):
+        permissions = [{"id": "per1"}]
+        with patch.object(opencode_api, "http", return_value=permissions) as request:
+            self.assertEqual(self.real_pending_permissions(timeout=7), permissions)
+
+        request.assert_called_once_with(f"{bridge.OC}/permission", timeout=7)
+
+    def test_monitor_only_surfaces_permissions_for_its_active_session(self):
+        permission = {
+            "id": "per-active",
+            "sessionID": "active-session",
+            "permission": "webfetch",
+            "patterns": ["https://docs.example.test"],
+        }
+        monitor = bridge._AsyncRequestMonitor("active-session", "msg_prompt", "REF12345", bridge.time.time())
+        with patch.object(opencode_api, "session_status", return_value={"active-session": {"type": "busy"}}):
+            with patch.object(
+                opencode_api,
+                "session_messages",
+                return_value=[{"info": {"id": "msg_prompt", "role": "user"}}],
+            ):
+                with patch.object(
+                    opencode_api,
+                    "pending_permissions",
+                    return_value=[permission, {**permission, "id": "per-other", "sessionID": "other-session"}],
+                ):
+                    with patch.object(opencode_api, "session_details", return_value={}):
+                        snapshot = monitor._read_snapshot()
+
+        self.assertEqual(snapshot.pending_permissions, [permission])
+
+    def test_permission_reply_uses_the_session_scoped_endpoint(self):
+        with patch.object(opencode_api, "http", return_value=True) as request:
+            self.assertTrue(
+                opencode_api.respond_to_permission(
+                    "session with space",
+                    "permission with space",
+                    "once",
+                    timeout=7,
+                )
+            )
+
+        request.assert_called_once_with(
+            f"{bridge.OC}/session/session%20with%20space/permissions/permission%20with%20space",
+            {"response": "once"},
+            timeout=7,
+        )
+
+    def test_allow_command_approves_only_the_active_sessions_permission_once(self):
+        request, _ = request_store.create("B" * 16, 123, 1052, state="running")
+        request_store.update(request["reference"], session_id="active-session")
+        pending = [
+            {"id": "per-other", "sessionID": "other-session", "permission": "read", "patterns": ["/**"]},
+            {"id": "per-active", "sessionID": "active-session", "permission": "webfetch", "patterns": ["https://docs.example.test"]},
+        ]
+        update = {"update_id": 1053, "message": {"chat": {"id": 123}, "text": "/allow"}}
+        with patch.object(opencode_api, "pending_permissions", return_value=pending):
+            with patch.object(opencode_api, "session_details", return_value={}):
+                with patch.object(opencode_api, "respond_to_permission", return_value=True) as respond:
+                    with patch.object(bridge, "send") as send:
+                        bridge.handle_update(update, {})
+
+        respond.assert_called_once_with(
+            "active-session",
+            "per-active",
+            "once",
+            timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        self.assertIn("allowed once", send.call_args.args[1])
+
+    def test_permission_commands_require_explicit_always_for_persistent_approval(self):
+        request, _ = request_store.create("B" * 16, 123, 1054, state="running")
+        request_store.update(request["reference"], session_id="active-session")
+        with patch.object(
+            opencode_api,
+            "pending_permissions",
+            return_value=[{
+                "id": "per1",
+                "sessionID": "active-session",
+                "permission": "read",
+                "patterns": ["/**"],
+                "always": ["/**"],
+            }],
+        ):
+            with patch.object(opencode_api, "respond_to_permission", return_value=True) as respond:
+                response = bridge.permission_reply_response(123, "/allow always", "/allow")
+
+        respond.assert_called_once_with(
+            "active-session",
+            "per1",
+            "always",
+            timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        self.assertIn("remembered", response)
+
+    def test_deny_command_rejects_without_persisting_a_rule(self):
+        request, _ = request_store.create("D" * 16, 123, 1056, state="running")
+        request_store.update(request["reference"], session_id="active-session")
+        with patch.object(
+            opencode_api,
+            "pending_permissions",
+            return_value=[{"id": "per1", "sessionID": "active-session", "permission": "read", "patterns": ["/**"]}],
+        ):
+            with patch.object(opencode_api, "respond_to_permission", return_value=True) as respond:
+                response = bridge.permission_reply_response(123, "/deny", "/deny")
+
+        respond.assert_called_once_with(
+            "active-session",
+            "per1",
+            "reject",
+            timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        self.assertIn("Permission 1 denied", response)
+
+    def test_permission_reply_includes_descendant_agent_sessions(self):
+        request, _ = request_store.create("C" * 16, 123, 1055, state="running")
+        request_store.update(request["reference"], session_id="active-session")
+        child_permission = {
+            "id": "per-child",
+            "sessionID": "child-session",
+            "permission": "read",
+            "patterns": ["/workspace/README.md"],
+        }
+        with patch.object(opencode_api, "pending_permissions", return_value=[child_permission]):
+            with patch.object(
+                opencode_api,
+                "session_details",
+                return_value={"parentID": "active-session"},
+            ):
+                with patch.object(opencode_api, "respond_to_permission", return_value=True) as respond:
+                    response = bridge.permission_reply_response(123, "/allow", "/allow")
+
+        respond.assert_called_once_with(
+            "child-session",
+            "per-child",
+            "once",
+            timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        self.assertIn("allowed once", response)
 
     def test_cancel_does_not_claim_success_when_opencode_returns_false(self):
         request, _ = request_store.create("E" * 16, 123, 106, state="running")
