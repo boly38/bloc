@@ -32,8 +32,10 @@ prompt to the model.
 
 While a normal request is running, the acknowledgement is updated with deterministic
 analysis/tool/test stages, or a waiting message approximately every 30 seconds when no
-progress is available. Network calls can delay updates. Temporary status/history HTTP
-timeouts are retried; they do not end the request. The default maximum request duration is
+progress is available. It also shows time since the last correlated OpenCode activity
+separately from the last successful API heartbeat; a responsive API does not guarantee that
+the agent or its current tool is progressing. Network calls can delay updates. Temporary
+status/history HTTP timeouts are retried; they do not end the request. The default maximum request duration is
 5 days, configurable with `OPENCODE_REQUEST_MAX_DURATION_SECONDS`. At that limit, the
 bridge asks OpenCode to abort and keeps the chat busy until it confirms the session has
 stopped. If the stop cannot be confirmed, `/status` reports that the request may still be
@@ -47,6 +49,13 @@ Updates show deterministic analysis/tool/test stages and any cost OpenCode has r
 far; the cost is partial while the request is running and may be unavailable.
 The final Telegram reply also lists the tool names used, including recognized command-line
 tools such as `gh`; it does not include their arguments or output.
+
+OpenCode permission requests for the active request's session tree are forwarded to the
+progress message.
+Use `/allow` to approve once, `/allow always` to remember a matching permission when that
+option is offered, or `/deny` to reject it. Number an argument when multiple permissions are
+pending. No permission is approved automatically. Interactive questions are not yet forwarded
+to Telegram; answer them in the remote TUI or use `/cancel` to stop the active request.
 
 Only one request at a time is admitted per chat. A new prompt while one is active is refused
 with the active request's reference. Use `/status` or `/cancel` to manage it. References do

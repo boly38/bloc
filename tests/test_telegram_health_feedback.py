@@ -173,6 +173,9 @@ class RequestFeedbackTests(unittest.TestCase):
         self.stack.enter_context(patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt")))
         self.stack.enter_context(patch.object(opencode_api, "session_tree_messages", return_value=[]))
         self.stack.enter_context(patch.object(opencode_api, "submit_async"))
+        self.permissions = self.stack.enter_context(
+            patch.object(opencode_api, "pending_permissions", return_value=[])
+        )
         self.stack.enter_context(patch.object(bridge, "_watch_events"))
         self.probe = self.stack.enter_context(patch.object(opper_health, "health_status"))
         self.status = self.stack.enter_context(patch.object(opencode_api, "session_status", return_value={}))
@@ -309,6 +312,76 @@ class RequestFeedbackTests(unittest.TestCase):
         self.assertIn("Continuing", result)
         self.assertTrue(self.progress)
         self.assertIn("Cost observed so far: $0.000123 (partial)", self.progress[0][1])
+
+    def test_progress_distinguishes_stale_agent_activity_from_live_api_heartbeat(self):
+        prompt = {"info": {"id": "msg_prompt", "role": "user"}}
+        self.messages.side_effect = lambda *_args, **_kwargs: (
+            [prompt, self.completed()] if self.clock >= 70 else [prompt]
+        )
+        self.status.side_effect = lambda _timeout: (
+            {"private-session": {"type": "busy"}} if self.clock < 70 else {}
+        )
+
+        self.answer()
+
+        self.assertEqual([when for when, _ in self.progress], [30, 60])
+        self.assertIn("OpenCode activity: 30s ago; API heartbeat: 0s ago.", self.progress[0][1])
+        self.assertIn("OpenCode activity: 60s ago; API heartbeat: 0s ago.", self.progress[1][1])
+
+    def test_progress_reports_age_of_last_api_response_during_polling_errors(self):
+        prompt = {"info": {"id": "msg_prompt", "role": "user"}}
+
+        def statuses(_timeout):
+            if self.clock == 0:
+                return {"private-session": {"type": "busy"}}
+            if self.clock < 61:
+                raise urllib.error.URLError(TimeoutError())
+            return {}
+
+        self.status.side_effect = statuses
+        self.messages.side_effect = lambda *_args, **_kwargs: (
+            [prompt, self.completed()] if self.clock >= 61 else [prompt]
+        )
+
+        self.answer()
+
+        self.assertEqual([when for when, _ in self.progress], [30, 60])
+        self.assertIn("OpenCode activity: 30s ago; API last responded: 30s ago.", self.progress[0][1])
+        self.assertIn("API last responded: 60s ago", self.progress[1][1])
+
+    def test_monitor_surfaces_pending_permission_with_explicit_commands(self):
+        permission = {
+            "id": "private-permission-id",
+            "sessionID": "private-session",
+            "permission": "webfetch",
+            "patterns": ["https://docs.example.test/config"],
+            "always": ["*"],
+        }
+        self.permissions.return_value = [permission]
+        monitor = bridge._AsyncRequestMonitor(
+            "private-session",
+            "msg_prompt",
+            "REF12345",
+            bridge.time.time(),
+        )
+        with patch.object(opencode_api, "session_status", return_value={"private-session": {"type": "busy"}}):
+            with patch.object(
+                opencode_api,
+                "session_messages",
+                return_value=[{"info": {"id": "msg_prompt", "role": "user"}}],
+            ):
+                with patch.object(opencode_api, "respond_to_permission") as respond:
+                    snapshot = monitor._read_snapshot()
+                    progress = []
+                    monitor._report_progress(snapshot, progress.append)
+
+        self.assertEqual(len(progress), 1)
+        self.assertIn("OpenCode is waiting for permission", progress[0])
+        self.assertIn("/allow to allow once", progress[0])
+        self.assertIn("/allow always", progress[0])
+        self.assertIn("/deny", progress[0])
+        self.assertNotIn("private-permission-id", progress[0])
+        respond.assert_not_called()
 
     def test_correlated_provider_failure_surfaces_before_completion_or_idle(self):
         self.status.return_value = {"private-session": {"type": "busy"}}

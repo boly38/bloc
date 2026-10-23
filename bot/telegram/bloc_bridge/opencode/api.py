@@ -103,6 +103,30 @@ def session_status(timeout):
     return statuses
 
 
+def pending_permissions(timeout=None):
+    """Return OpenCode's pending permission requests for the current project."""
+    permissions = http(f"{OC}/permission", timeout=timeout)
+    if not isinstance(permissions, list):
+        raise RuntimeError("OpenCode returned an invalid permission request list")
+    return permissions
+
+
+def respond_to_permission(session_id, permission_id, response, timeout=None):
+    """Answer one pending permission request without exposing its IDs to Telegram."""
+    if response not in ("once", "always", "reject"):
+        raise ValueError("Unsupported permission response")
+    encoded_session_id = urllib.parse.quote(session_id, safe="")
+    encoded_permission_id = urllib.parse.quote(permission_id, safe="")
+    result = http(
+        f"{OC}/session/{encoded_session_id}/permissions/{encoded_permission_id}",
+        {"response": response},
+        timeout=timeout,
+    )
+    if not isinstance(result, bool):
+        raise RuntimeError("OpenCode returned an invalid permission response")
+    return result
+
+
 def abort_session(session_id, timeout=None):
     """Ask OpenCode to stop the current operation in a session."""
     encoded_id = urllib.parse.quote(session_id)
