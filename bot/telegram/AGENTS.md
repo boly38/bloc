@@ -43,12 +43,19 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
   bridge-side reachability check, not proof of authentication or working inference.
 - Correlate assistant responses to the generated prompt message ID. SSE is optional
   progress information, not proof of completion; status and history determine completion.
+- Keep progress updates deterministic and sanitized: report analysis/tool/test stages and safe
+  tool names, never raw reasoning text, tool inputs, or tool output. Include the request reference
+  and remind users that `/status` and `/cancel` target the active request by default.
+- At exchange completion, report a deduplicated list of tool names, including recognized CLI names
+  such as `gh`; never include command arguments or tool output.
+- Report only OpenCode usage already observed for the active exchange, marked as partial; do not
+  estimate cost or count repeated history snapshots more than once.
 - Persist request references, Telegram update IDs, acknowledgement IDs, and OpenCode
   correlation IDs without persisting prompt or response text. Resume submitted work by
   correlation; never replay an uncertain submission. Mark queued, unsubmitted work interrupted
   on restart.
 - Retry transient status/history HTTP timeouts. The configurable overall request limit is
-  30 minutes by default; request timeout or cancellation must not release a chat until
+  5 days by default; request timeout or cancellation must not release a chat until
   OpenCode is confirmed idle.
 - Costs come from OpenCode usage, including descendant sessions, not price estimates.
 - Render through the existing Markdown renderer. Fall back to plain text only for a

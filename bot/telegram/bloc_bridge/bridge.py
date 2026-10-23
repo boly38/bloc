@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from . import bridge_runtime, http_api, opper_health, request_store, session_state
@@ -37,6 +38,27 @@ _REQUEST_SLOTS = threading.BoundedSemaphore(32)
 _SESSIONS_LOCK = threading.RLock()
 _CHAT_LOCKS_LOCK = threading.Lock()
 _CHAT_LOCKS = {}
+_PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 5
+_TEST_COMMAND = re.compile(
+    r"\b(?:pytest|tox|nox|unittest|cargo\s+test|go\s+test|"
+    r"npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|"
+    r"bun\s+(?:run\s+)?test|mvn\s+test|gradle\s+test|make\s+test)\b",
+    re.IGNORECASE,
+)
+_GH_CLI_COMMAND = re.compile(
+    r"\bgh\s+(?:api|auth|issue|pr|repo|run|workflow|release|label|search|gist|secret|variable)\b",
+    re.IGNORECASE,
+)
+_TOOL_PROGRESS_LABELS = {
+    "bash": "Command",
+    "edit": "File edit",
+    "glob": "File search",
+    "grep": "File search",
+    "read": "File read",
+    "task": "Subtask",
+    "webfetch": "Documentation fetch",
+    "write": "File write",
+}
 
 
 class OpenCodeRequestTimeout(TimeoutError):
@@ -46,8 +68,9 @@ class OpenCodeRequestTimeout(TimeoutError):
 class OpenCodeRequestStopped(RuntimeError):
     """OpenCode confirmed that an active request stopped."""
 
-    def __init__(self, state):
+    def __init__(self, state, tool_names=()):
         self.state = state
+        self.tool_names = tuple(tool_names)
         super().__init__("OpenCode request stopped")
 
 
@@ -82,6 +105,46 @@ def _new_assistant_messages(messages, previous_ids):
         for entry in messages
         if (key := _assistant_message_key(entry)) is not None and key not in previous_ids
     ]
+
+
+def _tool_names(messages):
+    """Return unique tool and recognized CLI names, without inputs or outputs."""
+    names = []
+    seen = set()
+    for entry in messages:
+        message = entry.get("message") if isinstance(entry, dict) else None
+        if not isinstance(message, dict):
+            message = entry if isinstance(entry, dict) else {}
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "tool":
+                continue
+            tool_name = part.get("tool")
+            if isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", tool_name):
+                normalized = tool_name.lower()
+                if normalized not in seen:
+                    names.append(normalized)
+                    seen.add(normalized)
+            state = part.get("state")
+            state = state if isinstance(state, dict) else {}
+            tool_input = state.get("input")
+            command = tool_input.get("command") if isinstance(tool_input, dict) else None
+            if tool_name == "bash" and isinstance(command, str) and _GH_CLI_COMMAND.search(command):
+                if "gh" not in seen:
+                    names.append("gh")
+                    seen.add("gh")
+    return names
+
+
+def _format_tool_usage(tool_names):
+    safe_names = [
+        name.lower()
+        for name in tool_names
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", name)
+    ]
+    return f"Tools used: {', '.join(dict.fromkeys(safe_names)) if safe_names else 'none'}"
 
 
 def _record_exchange_diagnostics(messages, response):
@@ -175,7 +238,42 @@ def _event_details(event):
     session_id = properties.get("sessionID") or part.get("sessionID")
     message_id = properties.get("messageID") or part.get("messageID")
     part_type = part.get("type")
-    return session_id, message_id, part_type
+    tool_name = part.get("tool") if part_type == "tool" else None
+    tool_state = part.get("state") if part_type == "tool" else None
+    tool_state = tool_state if isinstance(tool_state, dict) else {}
+    tool_status = tool_state.get("status")
+    tool_input = tool_state.get("input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    is_test_command = tool_name == "bash" and isinstance(command, str) and bool(_TEST_COMMAND.search(command))
+    is_gh_command = tool_name == "bash" and isinstance(command, str) and bool(_GH_CLI_COMMAND.search(command))
+    return session_id, message_id, part_type, tool_name, tool_status, is_test_command, is_gh_command
+
+
+def _event_progress_stage(
+    part_type,
+    tool_name=None,
+    tool_status=None,
+    is_test_command=False,
+    is_gh_command=False,
+):
+    if part_type == "reasoning":
+        return "Analysis in progress"
+    if part_type != "tool":
+        return None
+
+    if is_test_command:
+        label = "Tests"
+    elif is_gh_command:
+        label = "GitHub CLI"
+    elif isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", tool_name):
+        label = _TOOL_PROGRESS_LABELS.get(tool_name.lower(), f"Tool {tool_name}")
+    else:
+        label = "Tool"
+    suffix = {
+        "completed": "complete",
+        "error": "failed",
+    }.get(tool_status, "in progress")
+    return f"{label} {suffix}"
 
 
 def _watch_events(session_id, reference, events, stop):
@@ -188,10 +286,20 @@ def _watch_events(session_id, reference, events, stop):
                 details = _event_details(event)
                 if details is None:
                     continue
-                event_session, message_id, part_type = details
+                (
+                    event_session,
+                    message_id,
+                    part_type,
+                    tool_name,
+                    tool_status,
+                    is_test_command,
+                    is_gh_command,
+                ) = details
                 if event_session == session_id and message_id:
                     try:
-                        events.put_nowait((message_id, part_type))
+                        events.put_nowait(
+                            (message_id, part_type, tool_name, tool_status, is_test_command, is_gh_command)
+                        )
                     except queue.Full:
                         pass
             if not stop.is_set():
@@ -222,213 +330,333 @@ def _retryable_status_error(error):
     )
 
 
-def _monitor_async_request(session_id, prompt_message_id, reference, set_phase, progress, started_at):
-    """Poll OpenCode independently of individual HTTP timeouts until a terminal state is known."""
-    stop_events = threading.Event()
-    event_queue = queue.Queue(maxsize=128)
-    event_thread = threading.Thread(
-        target=_watch_events,
-        args=(session_id, reference, event_queue, stop_events),
-        name=f"opencode-events-{reference}",
-        daemon=True,
-    )
-    event_thread.start()
+@dataclass(frozen=True)
+class _MonitorSnapshot:
+    """One consistent status/history sample from OpenCode."""
 
-    max_duration = OPENCODE_REQUEST_MAX_DURATION_SECONDS
-    # Persist wall-clock start time for restart recovery; use monotonic time within this process.
-    elapsed_duration = max(0, time.time() - started_at)
-    remaining_duration = max(0, max_duration - elapsed_duration)
-    monitor_started_at = time.monotonic()
-    deadline = monitor_started_at + remaining_duration
-    prompt_reconcile_deadline = monitor_started_at + 10
-    abort_reason = None
-    abort_deadline = None
-    abort_sent = False
-    abort_unavailable = False
-    next_abort_at = 0
-    reconcile_deadline = None
-    reconcile_reported = False
-    idle_samples = 0
-    last_progress = None
-    last_progress_at = time.monotonic()
-    reported_read_error = False
+    busy: bool
+    prompt_found: bool
+    correlated_messages: list[dict]
 
-    try:
-        set_phase("response_wait")
-        while True:
-            bridge_runtime.check_shutdown()
-            request = request_store.get(reference) if reference else None
-            cancellation_pending = request and (
-                request["state"] == "cancellation_requested"
-                or (request["state"] == "recovering" and request.get("detail") == "user_cancelled")
-            )
-            if cancellation_pending and request.get("detail") == "user_cancelled" and abort_reason != "user_cancelled":
-                abort_reason = "user_cancelled"
-                abort_sent = False
-                abort_unavailable = False
-                next_abort_at = time.monotonic()
-            elif cancellation_pending and abort_reason is None:
-                abort_reason = request.get("detail") or "cancelled"
-            if abort_reason is None and time.monotonic() >= deadline:
-                abort_reason = "timed_out"
-            if abort_reason is not None and reconcile_deadline is None:
-                reconcile_deadline = time.monotonic() + 60
-                request_store.update(reference, state="cancellation_requested", detail=abort_reason)
 
-            try:
-                statuses = opencode_api.session_status(OPENCODE_STATUS_TIMEOUT_SECONDS)
-                busy = _session_is_busy(statuses.get(session_id))
-                response_messages = opencode_api.session_messages(
-                    session_id,
-                    timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
-                )
-            except Exception as error:
-                if not reported_read_error:
-                    diagnostic = (
-                        "opencode_status_retry"
-                        if _retryable_status_error(error)
-                        else "opencode_status_unavailable"
-                    )
-                    print(
-                        f"{diagnostic} ref={reference} error_type={type(error).__name__}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    reported_read_error = True
-                if not _retryable_status_error(error):
-                    request_store.update(reference, state="uncertain", detail="status_unavailable")
-                now = time.monotonic()
-                if abort_deadline is not None and now >= abort_deadline:
-                    request_store.update(reference, state="uncertain", detail="stop_unconfirmed")
-                    abort_deadline = None
-                    abort_sent = False
-                    next_abort_at = now + 30
-                if reconcile_deadline is not None and not reconcile_reported and now >= reconcile_deadline:
-                    request_store.update(reference, state="uncertain", detail="submission_unconfirmed")
-                    reconcile_reported = True
-                bridge_runtime.wait(1)
-                continue
+class _AsyncRequestMonitor:
+    """Own the state and lifecycle for monitoring one submitted OpenCode prompt."""
 
-            idle_samples = 0 if busy else idle_samples + 1
-            prompt_found = any(
-                isinstance(message, dict)
-                and isinstance(message.get("info"), dict)
-                and message["info"].get("id") == prompt_message_id
-                and message["info"].get("role") == "user"
-                for message in response_messages
-            )
-            correlated = opencode_api.assistant_messages_for_prompt(
-                response_messages,
-                prompt_message_id,
-            )
-            for message in correlated:
-                opencode_api.raise_response_error(message)
+    def __init__(self, session_id, prompt_message_id, reference, started_at):
+        self.session_id = session_id
+        self.prompt_message_id = prompt_message_id
+        self.reference = reference
+        self.started_at = started_at
+        self.events_to_stop = threading.Event()
+        self.events = queue.Queue(maxsize=128)
+        self.event_thread = threading.Thread(
+            target=_watch_events,
+            args=(session_id, reference, self.events, self.events_to_stop),
+            name=f"opencode-events-{reference}",
+            daemon=True,
+        )
 
-            assistant_ids = {
-                message.get("info", {}).get("id")
-                for message in correlated
-                if message.get("info", {}).get("id")
-            }
-            stage = None
+        self.monitor_started_at = time.monotonic()
+        # Use the persisted wall clock across restarts, then a monotonic deadline locally.
+        elapsed_duration = max(0, time.time() - started_at)
+        remaining_duration = max(0, OPENCODE_REQUEST_MAX_DURATION_SECONDS - elapsed_duration)
+        self.deadline = self.monitor_started_at + remaining_duration
+        self.prompt_reconcile_deadline = self.monitor_started_at + 10
+
+        self.abort_reason = None
+        self.abort_deadline = None
+        self.abort_sent = False
+        self.abort_unavailable = False
+        self.next_abort_at = 0
+        self.reconcile_deadline = None
+        self.reconcile_reported = False
+        self.idle_samples = 0
+        self.reported_read_error = False
+
+        self.current_stage = None
+        self.reported_stage = None
+        self.reported_cost = None
+        self.last_progress_at = time.monotonic()
+
+    def run(self, set_phase, progress):
+        """Poll until completion or an OpenCode stop is confirmed."""
+        self.event_thread.start()
+        try:
+            set_phase("response_wait")
             while True:
+                bridge_runtime.check_shutdown()
+                self._update_stop_reason()
                 try:
-                    event_message_id, part_type = event_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if event_message_id not in assistant_ids:
-                    continue
-                event_stage = {
-                    "reasoning": "OpenCode is thinking…",
-                    "tool": "OpenCode is working with a tool…",
-                }.get(part_type)
-                if event_stage:
-                    stage = event_stage
-
-            if (
-                correlated
-                and _assistant_response_complete(correlated[-1])
-                and not busy
-                and idle_samples >= 2
-            ):
-                return correlated
-            if (
-                abort_reason is not None
-                and prompt_found
-                and busy
-                and not abort_sent
-                and not abort_unavailable
-                and time.monotonic() >= next_abort_at
-            ):
-                try:
-                    # Abort is session-wide, so require this job's prompt in history first.
-                    abort_sent = opencode_api.abort_session(
-                        session_id,
-                        timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
-                    )
-                    if abort_sent:
-                        abort_deadline = time.monotonic() + 60
-                    else:
-                        next_abort_at = time.monotonic() + 30
+                    snapshot = self._read_snapshot()
                 except Exception as error:
-                    request_store.update(reference, state="uncertain", detail="abort_unconfirmed")
-                    if _retryable_status_error(error):
-                        next_abort_at = time.monotonic() + 30
-                    else:
-                        abort_unavailable = True
-            if abort_reason is not None and not busy and idle_samples >= 2:
-                if prompt_found or abort_sent:
-                    raise OpenCodeRequestStopped(abort_reason)
-                request_store.update(
-                    reference,
-                    state="failed",
-                    detail="submission_unconfirmed",
-                    completed_at=time.time(),
-                )
-                raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
-            if (
-                abort_reason is None
-                and not prompt_found
-                and not busy
-                and idle_samples >= 2
-                and now >= prompt_reconcile_deadline
-            ):
-                request_store.update(
-                    reference,
-                    state="failed",
-                    detail="submission_unconfirmed",
-                    completed_at=time.time(),
-                )
-                raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
-            now = time.monotonic()
-            if (
-                reconcile_deadline is not None
-                and not prompt_found
-                and not reconcile_reported
-                and now >= reconcile_deadline
-            ):
-                request_store.update(reference, state="uncertain", detail="submission_unconfirmed")
-                reconcile_reported = True
-            if abort_deadline is not None and now >= abort_deadline:
-                request_store.update(reference, state="uncertain", detail="stop_unconfirmed")
-                abort_deadline = None
-                abort_sent = False
-                next_abort_at = now + 30
+                    self._handle_read_error(error)
+                    bridge_runtime.wait(1)
+                    continue
 
-            now = time.monotonic()
-            if (
-                (stage and last_progress is None)
-                or now - last_progress_at >= OPENCODE_PROGRESS_INTERVAL_SECONDS
-            ):
-                elapsed = int(time.monotonic() - monitor_started_at)
-                text = stage or "Still waiting for OpenCode"
-                if last_progress is not None or stage is None:
-                    text = f"{text} ({elapsed}s elapsed)."
-                progress(text)
-                last_progress = stage or "waiting"
-                last_progress_at = time.monotonic()
-            bridge_runtime.wait(1)
-    finally:
-        stop_events.set()
+                self._raise_correlated_response_error(snapshot)
+                self._update_progress_stage(snapshot.correlated_messages)
+                if self._is_request_complete(snapshot):
+                    return snapshot.correlated_messages
+
+                self._request_abort(snapshot)
+                self._resolve_stop_outcome(snapshot)
+                self._reconcile_missing_prompt(snapshot)
+                self._update_stop_deadlines(snapshot)
+                self._report_progress(snapshot, progress)
+                bridge_runtime.wait(1)
+        finally:
+            self.events_to_stop.set()
+
+    def _update_stop_reason(self):
+        """Apply user cancellation or the request deadline to monitor state."""
+        request = request_store.get(self.reference) if self.reference else None
+        cancellation_pending = request and (
+            request["state"] == "cancellation_requested"
+            or (request["state"] == "recovering" and request.get("detail") == "user_cancelled")
+        )
+        if cancellation_pending and request.get("detail") == "user_cancelled":
+            if self.abort_reason != "user_cancelled":
+                self.abort_reason = "user_cancelled"
+                self.abort_sent = False
+                self.abort_unavailable = False
+                self.next_abort_at = time.monotonic()
+        elif cancellation_pending and self.abort_reason is None:
+            self.abort_reason = request.get("detail") or "cancelled"
+
+        if self.abort_reason is None and time.monotonic() >= self.deadline:
+            self.abort_reason = "timed_out"
+        if self.abort_reason is not None and self.reconcile_deadline is None:
+            self.reconcile_deadline = time.monotonic() + 60
+            request_store.update(
+                self.reference,
+                state="cancellation_requested",
+                detail=self.abort_reason,
+            )
+
+    def _read_snapshot(self):
+        """Read session activity and history, then correlate the active prompt."""
+        statuses = opencode_api.session_status(OPENCODE_STATUS_TIMEOUT_SECONDS)
+        busy = _session_is_busy(statuses.get(self.session_id))
+        messages = opencode_api.session_messages(
+            self.session_id,
+            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        self.idle_samples = 0 if busy else self.idle_samples + 1
+        prompt_found = any(
+            isinstance(message, dict)
+            and isinstance(message.get("info"), dict)
+            and message["info"].get("id") == self.prompt_message_id
+            and message["info"].get("role") == "user"
+            for message in messages
+        )
+        correlated = opencode_api.assistant_messages_for_prompt(
+            messages,
+            self.prompt_message_id,
+        )
+        return _MonitorSnapshot(busy, prompt_found, correlated)
+
+    def _handle_read_error(self, error):
+        """Log polling failures safely and mark unconfirmed stop states."""
+        if not self.reported_read_error:
+            diagnostic = (
+                "opencode_status_retry"
+                if _retryable_status_error(error)
+                else "opencode_status_unavailable"
+            )
+            print(
+                f"{diagnostic} ref={self.reference} error_type={type(error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.reported_read_error = True
+        if not _retryable_status_error(error):
+            request_store.update(self.reference, state="uncertain", detail="status_unavailable")
+
+        now = time.monotonic()
+        if self.abort_deadline is not None and now >= self.abort_deadline:
+            request_store.update(self.reference, state="uncertain", detail="stop_unconfirmed")
+            self.abort_deadline = None
+            self.abort_sent = False
+            self.next_abort_at = now + 30
+        self._report_unconfirmed_reconciliation(now)
+
+    def _raise_correlated_response_error(self, snapshot):
+        """Surface provider errors unless a timeout or cancellation is stopping work."""
+        # An abort may itself be recorded as an assistant error. Once stopping
+        # was requested, the confirmed stop reason takes precedence.
+        if self.abort_reason is not None:
+            return
+        try:
+            for message in snapshot.correlated_messages:
+                opencode_api.raise_response_error(message)
+        except opencode_api.OpenCodeResponseError as error:
+            error.tool_names = _tool_names(snapshot.correlated_messages)
+            raise
+
+    def _update_progress_stage(self, correlated_messages):
+        """Consume relevant SSE events and retain the latest deterministic stage."""
+        assistant_ids = {
+            message.get("info", {}).get("id")
+            for message in correlated_messages
+            if message.get("info", {}).get("id")
+        }
+        while True:
+            try:
+                (
+                    event_message_id,
+                    part_type,
+                    tool_name,
+                    tool_status,
+                    is_test_command,
+                    is_gh_command,
+                ) = self.events.get_nowait()
+            except queue.Empty:
+                return
+            if event_message_id not in assistant_ids:
+                continue
+            stage = _event_progress_stage(
+                part_type,
+                tool_name,
+                tool_status,
+                is_test_command,
+                is_gh_command,
+            )
+            if stage:
+                self.current_stage = stage
+
+    def _is_request_complete(self, snapshot):
+        return (
+            self.abort_reason is None
+            and snapshot.correlated_messages
+            and _assistant_response_complete(snapshot.correlated_messages[-1])
+            and not snapshot.busy
+            and self.idle_samples >= 2
+        )
+
+    def _request_abort(self, snapshot):
+        """Abort only after the submitted prompt is visible in the busy session."""
+        if not (
+            self.abort_reason is not None
+            and snapshot.prompt_found
+            and snapshot.busy
+            and not self.abort_sent
+            and not self.abort_unavailable
+            and time.monotonic() >= self.next_abort_at
+        ):
+            return
+
+        try:
+            # Abort is session-wide, so require this job's prompt in history first.
+            self.abort_sent = opencode_api.abort_session(
+                self.session_id,
+                timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+            )
+            if self.abort_sent:
+                self.abort_deadline = time.monotonic() + 60
+            else:
+                self.next_abort_at = time.monotonic() + 30
+        except Exception as error:
+            request_store.update(self.reference, state="uncertain", detail="abort_unconfirmed")
+            if _retryable_status_error(error):
+                self.next_abort_at = time.monotonic() + 30
+            else:
+                self.abort_unavailable = True
+
+    def _resolve_stop_outcome(self, snapshot):
+        """Resolve a requested stop, or fail if the submitted prompt is unconfirmed."""
+        if self.abort_reason is None or snapshot.busy or self.idle_samples < 2:
+            return
+        if snapshot.prompt_found or self.abort_sent:
+            raise OpenCodeRequestStopped(self.abort_reason, _tool_names(snapshot.correlated_messages))
+        request_store.update(
+            self.reference,
+            state="failed",
+            detail="submission_unconfirmed",
+            completed_at=time.time(),
+        )
+        raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
+
+    def _reconcile_missing_prompt(self, snapshot):
+        """Fail safely when OpenCode is idle but never confirms the submitted prompt."""
+        if not (
+            self.abort_reason is None
+            and not snapshot.prompt_found
+            and not snapshot.busy
+            and self.idle_samples >= 2
+            and time.monotonic() >= self.prompt_reconcile_deadline
+        ):
+            return
+        request_store.update(
+            self.reference,
+            state="failed",
+            detail="submission_unconfirmed",
+            completed_at=time.time(),
+        )
+        raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
+
+    def _update_stop_deadlines(self, snapshot):
+        """Mark abort or submission reconciliation as uncertain when its grace period ends."""
+        now = time.monotonic()
+        if (
+            self.reconcile_deadline is not None
+            and not snapshot.prompt_found
+            and not self.reconcile_reported
+            and now >= self.reconcile_deadline
+        ):
+            request_store.update(self.reference, state="uncertain", detail="submission_unconfirmed")
+            self.reconcile_reported = True
+        if self.abort_deadline is not None and now >= self.abort_deadline:
+            request_store.update(self.reference, state="uncertain", detail="stop_unconfirmed")
+            self.abort_deadline = None
+            self.abort_sent = False
+            self.next_abort_at = now + 30
+
+    def _report_unconfirmed_reconciliation(self, now):
+        """Record a submission that remains unconfirmed during a polling failure."""
+        if (
+            self.reconcile_deadline is not None
+            and not self.reconcile_reported
+            and now >= self.reconcile_deadline
+        ):
+            request_store.update(self.reference, state="uncertain", detail="submission_unconfirmed")
+            self.reconcile_reported = True
+
+    def _report_progress(self, snapshot, progress):
+        """Send throttled stage, heartbeat, and observed-cost updates."""
+        correlated = snapshot.correlated_messages
+        observed_cost = cost_reporting.format_observed_cost(correlated)
+        stage_pending = self.current_stage is not None and self.current_stage != self.reported_stage
+        cost_pending = observed_cost is not None and observed_cost != self.reported_cost
+        interval_elapsed = time.monotonic() - self.last_progress_at
+        heartbeat_due = interval_elapsed >= OPENCODE_PROGRESS_INTERVAL_SECONDS
+        first_update = self.reported_stage is None and self.reported_cost is None
+        change_due = (stage_pending or cost_pending) and (
+            first_update or interval_elapsed >= _PROGRESS_EVENT_MIN_INTERVAL_SECONDS
+        )
+        response_finishing = (
+            correlated
+            and _assistant_response_complete(correlated[-1])
+            and not snapshot.busy
+        )
+        if not (change_due or heartbeat_due) or response_finishing:
+            return
+
+        elapsed = int(time.monotonic() - self.monitor_started_at)
+        text = f"{self.current_stage or 'OpenCode is working on your request'} ({elapsed}s elapsed)."
+        cost_line = observed_cost or self.reported_cost
+        if cost_line:
+            text = f"{text}\n{cost_line}"
+        progress(text)
+        self.reported_stage = self.current_stage
+        if observed_cost is not None:
+            self.reported_cost = observed_cost
+        self.last_progress_at = time.monotonic()
+
+
+def _monitor_async_request(session_id, prompt_message_id, reference, set_phase, progress, started_at):
+    """Monitor one submitted prompt until it completes or OpenCode confirms it stopped."""
+    monitor = _AsyncRequestMonitor(session_id, prompt_message_id, reference, started_at)
+    return monitor.run(set_phase, progress)
 
 
 def _format_async_result(session_id, correlated, previous_ids, reference):
@@ -454,9 +682,12 @@ def _format_async_result(session_id, correlated, previous_ids, reference):
 
     _record_exchange_diagnostics(new_messages, response)
     text = opencode_api.text_from_response(response)
-    if previous_ids is None:
-        return text + "\n\nCost: unavailable"
-    return text + cost_reporting.format_exchange_footer([entry["message"] for entry in new_messages])
+    cost_footer = (
+        "\n\nCost: unavailable"
+        if previous_ids is None
+        else cost_reporting.format_exchange_footer([entry["message"] for entry in new_messages])
+    )
+    return f"{text}{cost_footer}\n\n{_format_tool_usage(_tool_names(new_messages))}"
 
 
 def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
@@ -629,10 +860,19 @@ def request_status_response(chat_id, reference=None):
     return f"Request {request['reference']}: {_request_status_text(request['state'])}."
 
 
-def cancel_request_response(chat_id, reference):
-    request = request_store.get_for_chat(reference, chat_id)
-    if request is None:
-        return "No request with that reference was found for this chat."
+def cancel_request_response(chat_id, reference=None):
+    if reference is None:
+        active = request_store.active_for_chat(chat_id)
+        if not active:
+            return "No active request to cancel."
+        if len(active) > 1:
+            return "Multiple requests are active. Use /cancel <reference> to choose one."
+        request = active[0]
+        reference = request["reference"]
+    else:
+        request = request_store.get_for_chat(reference, chat_id)
+        if request is None:
+            return "No request with that reference was found for this chat."
     if request["state"] not in request_store.ACTIVE_STATES:
         return f"Request {reference}: {_request_status_text(request['state'])}; it is not active."
     if request["state"] in ("acknowledging", "queued"):
@@ -741,7 +981,7 @@ def authorized_response(chat_id, prompt, sessions):
         except ValueError as error:
             return str(error)
         if reference is None:
-            return "Usage: /cancel <request-reference>"
+            return cancel_request_response(chat_id)
         return cancel_request_response(chat_id, reference)
     if command is not None:
         return "Unknown command. Use /help to list the available commands."
@@ -767,8 +1007,8 @@ def help_response():
             "/new — start a new session; the previous session is kept",
             "/health — check bridge, OpenCode API, session, and optional provider reachability",
             "/cost — show cost and usage for this chat's current session",
-            "/status [reference] — inspect an active or previous request",
-            "/cancel <reference> — ask OpenCode to stop a request",
+            "/status [reference] — inspect the active or a previous request",
+            "/cancel [reference] — stop the active request or one identified by reference",
         )
     )
 
@@ -1001,7 +1241,11 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
     def progress(text):
         set_phase("telegram_progress_edit")
         try:
-            edit_reply(chat_id, acknowledgement_id, f"{text}\n\nRef: {reference}")
+            edit_reply(
+                chat_id,
+                acknowledgement_id,
+                f"{text}\n\nUse /status to check progress or /cancel to stop.\nRef: {reference}",
+            )
         except Exception as error:
             _log_request_error(reference, update_id, state["phase"], started, error)
         finally:
@@ -1069,11 +1313,14 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
         elif isinstance(error, OpenCodeRequestStopped):
             terminal_state = "cancelled" if error.state == "user_cancelled" else "timed_out"
             limit_seconds = OPENCODE_REQUEST_MAX_DURATION_SECONDS
-            limit = (
-                f"{limit_seconds // 60}-minute limit"
-                if limit_seconds % 60 == 0
-                else f"{limit_seconds}-second limit"
-            )
+            if limit_seconds % 86400 == 0:
+                limit = f"{limit_seconds // 86400}-day limit"
+            elif limit_seconds % 3600 == 0:
+                limit = f"{limit_seconds // 3600}-hour limit"
+            elif limit_seconds % 60 == 0:
+                limit = f"{limit_seconds // 60}-minute limit"
+            else:
+                limit = f"{limit_seconds}-second limit"
             error_text = (
                 f"Request {reference} was cancelled and OpenCode confirmed it stopped."
                 if terminal_state == "cancelled"
@@ -1098,6 +1345,9 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
             else:
                 error_text = f"Request failed. Please share this reference with the operator: {reference}"
             request_store.update(reference, state="delivering", detail=terminal_state)
+        tool_names = getattr(error, "tool_names", None)
+        if tool_names is not None:
+            error_text = f"{error_text}\n\n{_format_tool_usage(tool_names)}"
         try:
             set_phase("telegram_error_edit")
             edit_reply(
@@ -1251,7 +1501,7 @@ def handle_update(update, sessions):
             if command == "/status":
                 response = request_status_response(chat_id, reference)
             elif reference is None:
-                response = "Usage: /cancel <request-reference>"
+                response = cancel_request_response(chat_id)
             else:
                 response = cancel_request_response(chat_id, reference)
             send(chat_id, response)
@@ -1288,7 +1538,7 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
             send(
                 chat_id,
                 f"This chat already has an active request ({active[0]['reference']}). "
-                f"Use /status {active[0]['reference']} or /cancel {active[0]['reference']}.",
+                "Use /status to check progress or /cancel to stop it.",
             )
         except Exception as error:
             _log_request_error(active[0]["reference"], update_id, "telegram_acknowledgement", time.monotonic(), error)
@@ -1301,7 +1551,10 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
     started = time.monotonic()
     try:
         # Acknowledge before queuing so users get an immediate response.
-        acknowledgement = send(chat_id, f"Request received. Ref: {reference}")
+        acknowledgement = send(
+            chat_id,
+            f"Request received. Use /status to check progress or /cancel to stop. Ref: {reference}",
+        )
     except Exception as error:
         request_store.update(
             reference,

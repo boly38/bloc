@@ -262,7 +262,7 @@ class RequestFeedbackTests(unittest.TestCase):
 
         def statuses(_timeout):
             if event_queues:
-                event_queues[0].put(("assistant", "reasoning" if self.clock % 2 else "tool"))
+                event_queues[0].put(("assistant", "tool", "bash", "running", False, False))
             return {"private-session": {"type": "busy"}} if self.clock < 330 else {}
 
         self.messages.return_value = [
@@ -285,9 +285,30 @@ class RequestFeedbackTests(unittest.TestCase):
 
         self.assertEqual(self.clock, 331)
         self.assertEqual([when for when, _ in self.progress], list(range(0, 331, 30)))
-        self.assertTrue(all("OpenCode is" in text for _, text in self.progress))
+        self.assertTrue(all("Command in progress" in text for _, text in self.progress))
         self.assertEqual(len({text for _, text in self.progress}), len(self.progress))
         self.abort.assert_called_once_with("private-session", timeout=10)
+
+    def test_progress_includes_cost_reported_for_completed_model_calls(self):
+        prompt = {"info": {"id": "msg_prompt", "role": "user"}}
+        assistant = {
+            "info": {
+                "role": "assistant",
+                "id": "assistant",
+                "parentID": "msg_prompt",
+                "time": {"completed": 123},
+                "cost": 0.000123,
+            },
+            "parts": [{"type": "text", "text": "Continuing"}],
+        }
+        self.messages.return_value = [prompt, assistant]
+        self.status.side_effect = [{"private-session": {"type": "busy"}}, {}, {}]
+
+        result = self.answer()
+
+        self.assertIn("Continuing", result)
+        self.assertTrue(self.progress)
+        self.assertIn("Cost observed so far: $0.000123 (partial)", self.progress[0][1])
 
     def test_correlated_provider_failure_surfaces_before_completion_or_idle(self):
         self.status.return_value = {"private-session": {"type": "busy"}}
@@ -359,6 +380,9 @@ class RequestFeedbackTests(unittest.TestCase):
              patch("sys.stderr", output):
             bridge._request_worker(123, "Hi", {}, 123, "REF12345", 456)
         self.assertEqual(edit.call_count, 2)
+        self.assertIn("/status", edit.call_args_list[0].args[2])
+        self.assertIn("/cancel", edit.call_args_list[0].args[2])
+        self.assertIn("REF12345", edit.call_args_list[0].args[2])
         self.assertIn("timed out", edit.call_args.args[2])
         self.assertIn("phase=response_wait", output.getvalue())
 

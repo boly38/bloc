@@ -75,7 +75,7 @@ else Allowed text message
                 worker -> oc : POST /session/{id}/prompt_async
                 oc --> worker : Submission accepted
                 worker -> state : Mark request running
-                loop Until correlated completion and two idle samples, or 30 min maximum
+                loop Until correlated completion and two idle samples, or 5 days maximum
                     worker -> oc : GET /session/status (10 s HTTP timeout)
                     oc --> worker : Busy / retry / idle
                     worker -> oc : GET /session/{id}/message (10 s HTTP timeout)
@@ -86,22 +86,26 @@ else Allowed text message
                     opt Correlated reasoning/tool event available
                         oc --> events : SSE event
                         events -> worker : Bounded event queue (128)
-                        worker -> worker : Select safe progress stage
+                        worker -> worker : Select deterministic safe stage and tool label
                     end
-                    opt Assistant error in correlated history
+                    opt OpenCode has reported correlated usage
+                        worker -> worker : Recompute partial cost from assistant history
+                        worker -> tg : Edit progress with observed cost, controls, and reference
+                    end
+                    opt Assistant error in correlated history outside a stop request
                         worker -> worker : Fail promptly with sanitized status + reference
                     end
                     opt First progress event or 30 s since last progress
                         worker -> tg : Edit acknowledgement with safe progress
                     end
                 end
-                opt User cancellation or 30 min limit
+                opt User cancellation or 5 days limit
                     worker -> oc : POST /session/{id}/abort
                     oc --> worker : Abort result
                     worker -> worker : Keep chat active until OpenCode is confirmed idle
                 end
                 worker -> oc : Read session tree history
-                worker -> worker : Build response + cost footer
+                worker -> worker : Build response + cost and tool-name footers
                 worker -> events : Set watcher stop event
             end
             worker -> state : Mark delivery pending

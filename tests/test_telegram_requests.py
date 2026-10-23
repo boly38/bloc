@@ -91,6 +91,7 @@ class TelegramRequestTests(unittest.TestCase):
         )
 
         self.assertIn("running in OpenCode", bridge.request_status_response(123, request["reference"]))
+        self.assertIn(request["reference"], bridge.request_status_response(123))
         self.assertIn("found for this chat", bridge.request_status_response(456, request["reference"]))
         self.assertNotIn("private-session-id", bridge.request_status_response(123, request["reference"]))
         self.assertNotIn("private-prompt-id", bridge.request_status_response(123, request["reference"]))
@@ -115,6 +116,30 @@ class TelegramRequestTests(unittest.TestCase):
             timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
         )
         self.assertIn("Cancellation requested", response)
+        self.assertEqual(request_store.get(request["reference"])["state"], "cancellation_requested")
+
+    def test_cancel_without_reference_targets_the_active_request(self):
+        request, _ = request_store.create("A" * 16, 123, 1050, state="running")
+        request_store.update(
+            request["reference"],
+            session_id="private-session-id",
+            prompt_message_id="msg_prompt",
+        )
+        update = {"update_id": 1051, "message": {"chat": {"id": 123}, "text": "/cancel"}}
+        with patch.object(opencode_api, "abort_session", return_value=True) as abort:
+            with patch.object(
+                opencode_api,
+                "session_messages",
+                return_value=[{"info": {"id": "msg_prompt", "role": "user"}}],
+            ):
+                with patch.object(bridge, "send") as send:
+                    bridge.handle_update(update, {})
+
+        abort.assert_called_once_with(
+            "private-session-id",
+            timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        self.assertIn(request["reference"], send.call_args.args[1])
         self.assertEqual(request_store.get(request["reference"])["state"], "cancellation_requested")
 
     def test_opencode_abort_uses_session_abort_endpoint(self):
@@ -216,7 +241,7 @@ class TelegramRequestTests(unittest.TestCase):
         edit.assert_called_once_with(
             123,
             509,
-            "Recovered result\n\nCost: unavailable\n\nRef: 2222222222222222",
+            "Recovered result\n\nCost: unavailable\n\nTools used: none\n\nRef: 2222222222222222",
         )
         self.assertEqual(request_store.get(request["reference"])["state"], "completed")
         submit.assert_not_called()
@@ -292,6 +317,81 @@ class TelegramRequestTests(unittest.TestCase):
 
         self.assertEqual(stopped.exception.state, "user_cancelled")
         abort.assert_called_once()
+
+    def test_monitor_reports_timeout_when_open_code_records_abort_as_assistant_error(self):
+        request, _ = request_store.create("2" * 16, 123, 109, state="running")
+        started_at = bridge.time.time()
+        request_store.update(
+            request["reference"],
+            session_id="private-session-id",
+            prompt_message_id="msg_prompt",
+            started_at=started_at,
+        )
+        response = [
+            {"info": {"id": "msg_prompt", "role": "user"}},
+            {
+                "info": {
+                    "id": "assistant-aborted",
+                    "parentID": "msg_prompt",
+                    "role": "assistant",
+                    "time": {"completed": 1},
+                    "error": {"name": "Aborted"},
+                },
+                "parts": [
+                    {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "gh pr view 31"},
+                        },
+                    }
+                ],
+            },
+        ]
+
+        with patch.object(bridge, "OPENCODE_REQUEST_MAX_DURATION_SECONDS", 0):
+            with patch.object(bridge, "_watch_events"):
+                with patch.object(opencode_api, "abort_session", return_value=True) as abort:
+                    with patch.object(
+                        opencode_api,
+                        "session_status",
+                        side_effect=[{"private-session-id": {"type": "busy"}}, {}, {}],
+                    ):
+                        with patch.object(opencode_api, "session_messages", return_value=response):
+                            with patch.object(bridge.bridge_runtime, "wait"):
+                                with self.assertRaises(bridge.OpenCodeRequestStopped) as stopped:
+                                    bridge._monitor_async_request(
+                                        "private-session-id",
+                                        "msg_prompt",
+                                        request["reference"],
+                                        lambda _phase: None,
+                                        lambda _text: None,
+                                        started_at,
+                                    )
+
+        self.assertEqual(stopped.exception.state, "timed_out")
+        self.assertEqual(
+            request_store.get(request["reference"])["detail"],
+            "timed_out",
+        )
+        abort.assert_called_once()
+
+        with patch.object(bridge, "answer_async", side_effect=stopped.exception):
+            with patch.object(bridge, "edit_reply") as edit:
+                bridge._request_worker(
+                    123,
+                    "Prepare a pull request",
+                    {},
+                    109,
+                    request["reference"],
+                    500,
+                )
+
+        self.assertEqual(request_store.get(request["reference"])["state"], "timed_out")
+        self.assertIn("timed out and stopped", bridge.request_status_response(123, request["reference"]))
+        self.assertIn("reached the configured 5-day limit", edit.call_args.args[2])
+        self.assertIn("Tools used: bash, gh", edit.call_args.args[2])
 
 
 if __name__ == "__main__":
