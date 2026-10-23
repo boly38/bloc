@@ -60,6 +60,9 @@ class TelegramBridgeTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         request_store.initialize()
+        permission_patcher = patch.object(opencode_api, "pending_permissions", return_value=[])
+        permission_patcher.start()
+        self.addCleanup(permission_patcher.stop)
 
     def test_http_timeout_defaults_are_separate_for_each_client(self):
         for url, expected in (
@@ -133,6 +136,26 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(names, ["bash", "gh", "read"])
         self.assertEqual(report, "Tools used: bash, gh, read")
         self.assertNotIn("private command output", report)
+
+    def test_permission_prompt_shows_sanitized_scope_and_explicit_choices(self):
+        prompt = bridge._format_permission_prompt(
+            [
+                {
+                    "id": "private-permission-id",
+                    "permission": "webfetch",
+                    "patterns": ["https://docs.example.test/path?token=private-secret"],
+                    "always": ["*"],
+                }
+            ]
+        )
+
+        self.assertIn("webfetch: https://docs.example.test/path", prompt)
+        self.assertIn("remember scope: *", prompt)
+        self.assertIn("/allow to allow once", prompt)
+        self.assertIn("/allow always", prompt)
+        self.assertIn("/deny", prompt)
+        self.assertNotIn("private-permission-id", prompt)
+        self.assertNotIn("private-secret", prompt)
 
     def test_http_requests_do_not_add_basic_authentication(self):
         for url in (bridge_config.OC + "/global/health", bridge_config.TG + "getMe"):
@@ -404,7 +427,13 @@ class TelegramBridgeTests(unittest.TestCase):
                                 )
 
         self.assertEqual(result, "Done\n\nCost: $0.000000\n\nTools used: none")
-        self.assertEqual(progress, ["Analysis in progress (0s elapsed)."])
+        self.assertEqual(
+            progress,
+            [
+                "Analysis in progress (0s elapsed).\n"
+                "OpenCode activity: 0s ago; API heartbeat: 0s ago."
+            ],
+        )
         self.assertNotIn("private reasoning content", " ".join(progress))
 
     def test_async_answer_raises_explicit_timeout_at_deadline(self):

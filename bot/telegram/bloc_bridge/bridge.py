@@ -39,6 +39,9 @@ _SESSIONS_LOCK = threading.RLock()
 _CHAT_LOCKS_LOCK = threading.Lock()
 _CHAT_LOCKS = {}
 _PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 5
+_PERMISSION_POLL_INTERVAL_SECONDS = 5
+_PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS = 3
+_PERMISSION_ANCESTRY_MAX_DEPTH = 8
 _TEST_COMMAND = re.compile(
     r"\b(?:pytest|tox|nox|unittest|cargo\s+test|go\s+test|"
     r"npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|"
@@ -48,6 +51,9 @@ _TEST_COMMAND = re.compile(
 _GH_CLI_COMMAND = re.compile(
     r"\bgh\s+(?:api|auth|issue|pr|repo|run|workflow|release|label|search|gist|secret|variable)\b",
     re.IGNORECASE,
+)
+_PERMISSION_SECRET = re.compile(
+    r"(?i)\b(token|password|secret|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,;]+)"
 )
 _TOOL_PROGRESS_LABELS = {
     "bash": "Command",
@@ -276,6 +282,92 @@ def _event_progress_stage(
     return f"{label} {suffix}"
 
 
+def _safe_permission_scope(value):
+    if not isinstance(value, str):
+        return "scope details unavailable"
+    value = " ".join(value.split())
+    if value.startswith(("http://", "https://")):
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            host = parsed.hostname or ""
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            value = urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+        except ValueError:
+            value = "web resource"
+    else:
+        value = _PERMISSION_SECRET.sub(r"\1\2[redacted]", value)
+    if len(value) > 120:
+        value = value[:117] + "..."
+    return value or "scope details unavailable"
+
+
+def _format_permission_prompt(permissions):
+    lines = ["OpenCode is waiting for permission:"]
+    permissions = sorted(permissions, key=lambda request: request.get("id", ""))
+    for index, permission in enumerate(permissions[:5], start=1):
+        name = permission.get("permission")
+        name = name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", name) else "tool action"
+        patterns = permission.get("patterns")
+        patterns = patterns if isinstance(patterns, list) else []
+        scopes = [_safe_permission_scope(pattern) for pattern in patterns[:3]]
+        if len(patterns) > 3:
+            scopes.append(f"and {len(patterns) - 3} more")
+        scope_text = ", ".join(scopes) if scopes else "scope details unavailable"
+        always_patterns = permission.get("always")
+        rememberable = isinstance(always_patterns, list) and bool(always_patterns)
+        if rememberable:
+            remember_scopes = [_safe_permission_scope(pattern) for pattern in always_patterns[:3]]
+            if len(always_patterns) > 3:
+                remember_scopes.append(f"and {len(always_patterns) - 3} more")
+            scope_text = f"{scope_text} (remember scope: {', '.join(remember_scopes)})"
+        lines.append(f"{index}. {name}: {scope_text}")
+    if len(permissions) == 1:
+        permission = permissions[0]
+        always_patterns = permission.get("always") if isinstance(permission, dict) else None
+        if isinstance(always_patterns, list) and always_patterns:
+            lines.append("Reply /allow to allow once, /allow always to remember, or /deny to reject.")
+        else:
+            lines.append("Reply /allow to allow once or /deny to reject.")
+    else:
+        lines.append("Reply /allow <number> [always] or /deny <number>.")
+    if len(permissions) > 5:
+        lines.append(
+            f"{len(permissions) - 5} more are pending; use the remote TUI to inspect those."
+        )
+    return "\n".join(lines)
+
+
+def _permission_signature(permissions):
+    entries = [
+        (permission["id"], permission.get("permission"))
+        for permission in permissions
+        if isinstance(permission, dict) and isinstance(permission.get("id"), str)
+    ]
+    return tuple(sorted(entries, key=lambda entry: entry[0]))
+
+
+def _permission_belongs_to_session_tree(session_id, root_session_id, known_session_ids):
+    """Check bounded session ancestry so child-agent prompts stay with their request."""
+    current_session_id = session_id
+    traversed = []
+    for _ in range(_PERMISSION_ANCESTRY_MAX_DEPTH):
+        if current_session_id == root_session_id or current_session_id in known_session_ids:
+            known_session_ids.update(traversed)
+            known_session_ids.add(current_session_id)
+            return True
+        details = opencode_api.session_details(
+            current_session_id,
+            timeout=_PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS,
+        )
+        parent_session_id = details.get("parentID")
+        if not isinstance(parent_session_id, str) or not parent_session_id:
+            return False
+        traversed.append(current_session_id)
+        current_session_id = parent_session_id
+    return False
+
+
 def _watch_events(session_id, reference, events, stop):
     error_reported = False
     while not stop.is_set():
@@ -330,6 +422,52 @@ def _retryable_status_error(error):
     )
 
 
+def _assistant_activity_signature(messages):
+    """Describe observable message changes without retaining message text."""
+    signature = []
+    for message in messages:
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict):
+            continue
+        message_time = info.get("time")
+        message_time = message_time if isinstance(message_time, dict) else {}
+        tokens = info.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        parts_signature = []
+        parts = message.get("parts")
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                state = part.get("state")
+                state = state if isinstance(state, dict) else {}
+                text = part.get("text")
+                output = state.get("output")
+                parts_signature.append(
+                    (
+                        part.get("type"),
+                        part.get("tool"),
+                        state.get("status"),
+                        len(text) if isinstance(text, str) else None,
+                        len(output) if isinstance(output, str) else None,
+                    )
+                )
+        error = info.get("error")
+        signature.append(
+            (
+                info.get("id"),
+                info.get("finish"),
+                message_time.get("completed"),
+                error.get("name") if isinstance(error, dict) else None,
+                info.get("cost"),
+                tokens.get("input"),
+                tokens.get("output"),
+                tuple(parts_signature),
+            )
+        )
+    return tuple(signature)
+
+
 @dataclass(frozen=True)
 class _MonitorSnapshot:
     """One consistent status/history sample from OpenCode."""
@@ -337,6 +475,7 @@ class _MonitorSnapshot:
     busy: bool
     prompt_found: bool
     correlated_messages: list[dict]
+    pending_permissions: list[dict]
 
 
 class _AsyncRequestMonitor:
@@ -377,6 +516,17 @@ class _AsyncRequestMonitor:
         self.reported_stage = None
         self.reported_cost = None
         self.last_progress_at = time.monotonic()
+        self.last_opencode_activity_at = self.monitor_started_at
+        self.last_api_success_at = self.monitor_started_at
+        self.last_activity_signature = None
+        self.last_snapshot = _MonitorSnapshot(True, False, [], [])
+        self.pending_permissions = []
+        self.related_permission_sessions = {session_id}
+        self.unrelated_permission_sessions = set()
+        self.last_permission_poll_at = self.monitor_started_at - _PERMISSION_POLL_INTERVAL_SECONDS
+        self.reported_permission_signature = ()
+        self.reported_permission_error = False
+        self.reported_permission_session_error = False
 
     def run(self, set_phase, progress):
         """Poll until completion or an OpenCode stop is confirmed."""
@@ -390,6 +540,7 @@ class _AsyncRequestMonitor:
                     snapshot = self._read_snapshot()
                 except Exception as error:
                     self._handle_read_error(error)
+                    self._report_progress(self.last_snapshot, progress, api_responding=False)
                     bridge_runtime.wait(1)
                     continue
 
@@ -453,7 +604,76 @@ class _AsyncRequestMonitor:
             messages,
             self.prompt_message_id,
         )
-        return _MonitorSnapshot(busy, prompt_found, correlated)
+        self._poll_pending_permissions()
+        now = time.monotonic()
+        self.last_api_success_at = now
+        activity_signature = _assistant_activity_signature(correlated)
+        if activity_signature != self.last_activity_signature:
+            self.last_activity_signature = activity_signature
+            self.last_opencode_activity_at = now
+        snapshot = _MonitorSnapshot(busy, prompt_found, correlated, list(self.pending_permissions))
+        self.last_snapshot = snapshot
+        return snapshot
+
+    def _poll_pending_permissions(self):
+        """Refresh permission prompts for this request's session at a bounded cadence."""
+        now = time.monotonic()
+        if now - self.last_permission_poll_at < _PERMISSION_POLL_INTERVAL_SECONDS:
+            return
+        self.last_permission_poll_at = now
+        try:
+            requests = opencode_api.pending_permissions(timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+        except Exception as error:
+            if not self.reported_permission_error:
+                print(
+                    f"opencode_permission_poll_failed ref={self.reference} "
+                    f"error_type={type(error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.reported_permission_error = True
+            return
+
+        self.reported_permission_error = False
+        previous = self.pending_permissions
+        related = []
+        session_lookup_failed = False
+        for request in requests:
+            if not isinstance(request, dict):
+                continue
+            request_session_id = request.get("sessionID")
+            if not isinstance(request_session_id, str):
+                continue
+            if request_session_id in self.unrelated_permission_sessions:
+                continue
+            try:
+                belongs_to_request = _permission_belongs_to_session_tree(
+                    request_session_id,
+                    self.session_id,
+                    self.related_permission_sessions,
+                )
+            except Exception as error:
+                if not self.reported_permission_session_error:
+                    print(
+                        f"permission_session_lookup_failed ref={self.reference} "
+                        f"error_type={type(error).__name__}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self.reported_permission_session_error = True
+                session_lookup_failed = True
+                continue
+            if belongs_to_request:
+                related.append(request)
+            else:
+                self.unrelated_permission_sessions.add(request_session_id)
+        self.pending_permissions = related
+        if not session_lookup_failed:
+            self.reported_permission_session_error = False
+        if _permission_signature(previous) != _permission_signature(self.pending_permissions):
+            self.last_opencode_activity_at = time.monotonic()
+        if previous and not self.pending_permissions:
+            self.current_stage = "Permission decision submitted; OpenCode is resuming"
 
     def _handle_read_error(self, error):
         """Log polling failures safely and mark unconfirmed stop states."""
@@ -514,6 +734,7 @@ class _AsyncRequestMonitor:
                 return
             if event_message_id not in assistant_ids:
                 continue
+            self.last_opencode_activity_at = time.monotonic()
             stage = _event_progress_stage(
                 part_type,
                 tool_name,
@@ -621,19 +842,26 @@ class _AsyncRequestMonitor:
             request_store.update(self.reference, state="uncertain", detail="submission_unconfirmed")
             self.reconcile_reported = True
 
-    def _report_progress(self, snapshot, progress):
+    def _report_progress(self, snapshot, progress, api_responding=True):
         """Send throttled stage, heartbeat, and observed-cost updates."""
         correlated = snapshot.correlated_messages
+        now = time.monotonic()
+        permission_signature = _permission_signature(snapshot.pending_permissions)
         observed_cost = cost_reporting.format_observed_cost(correlated)
         stage_pending = self.current_stage is not None and self.current_stage != self.reported_stage
         cost_pending = observed_cost is not None and observed_cost != self.reported_cost
-        interval_elapsed = time.monotonic() - self.last_progress_at
+        permission_pending = permission_signature != self.reported_permission_signature
+        interval_elapsed = now - self.last_progress_at
         heartbeat_due = interval_elapsed >= OPENCODE_PROGRESS_INTERVAL_SECONDS
-        first_update = self.reported_stage is None and self.reported_cost is None
-        change_due = (stage_pending or cost_pending) and (
+        first_update = (
+            self.reported_stage is None
+            and self.reported_cost is None
+            and not self.reported_permission_signature
+        )
+        change_due = (stage_pending or cost_pending or permission_pending) and (
             first_update or interval_elapsed >= _PROGRESS_EVENT_MIN_INTERVAL_SECONDS
         )
-        response_finishing = (
+        response_finishing = api_responding and (
             correlated
             and _assistant_response_complete(correlated[-1])
             and not snapshot.busy
@@ -641,8 +869,20 @@ class _AsyncRequestMonitor:
         if not (change_due or heartbeat_due) or response_finishing:
             return
 
-        elapsed = int(time.monotonic() - self.monitor_started_at)
-        text = f"{self.current_stage or 'OpenCode is working on your request'} ({elapsed}s elapsed)."
+        elapsed = int(now - self.monitor_started_at)
+        activity_age = int(now - self.last_opencode_activity_at)
+        api_age = int(now - self.last_api_success_at)
+        if snapshot.pending_permissions:
+            text = _format_permission_prompt(snapshot.pending_permissions)
+            text = f"{text}\nRequest elapsed: {elapsed}s."
+        else:
+            text = f"{self.current_stage or 'OpenCode is working on your request'} ({elapsed}s elapsed)."
+        api_heartbeat = (
+            f"API heartbeat: {api_age}s ago"
+            if api_responding
+            else f"API last responded: {api_age}s ago"
+        )
+        text = f"{text}\nOpenCode activity: {activity_age}s ago; {api_heartbeat}."
         cost_line = observed_cost or self.reported_cost
         if cost_line:
             text = f"{text}\n{cost_line}"
@@ -650,6 +890,7 @@ class _AsyncRequestMonitor:
         self.reported_stage = self.current_stage
         if observed_cost is not None:
             self.reported_cost = observed_cost
+        self.reported_permission_signature = permission_signature
         self.last_progress_at = time.monotonic()
 
 
@@ -825,6 +1066,116 @@ def _control_reference(prompt, command):
     return words[1].upper()
 
 
+def _permission_selection(prompt, command):
+    """Parse a short permission command; request IDs stay inside the bridge."""
+    index = None
+    response = "once"
+    for argument in prompt.split()[1:]:
+        normalized = argument.lower()
+        if normalized.isdecimal() and index is None:
+            index = int(normalized)
+        elif command == "/allow" and normalized in ("once", "always"):
+            response = normalized
+        else:
+            usage = "/allow [number] [once|always]" if command == "/allow" else "/deny [number]"
+            raise ValueError(f"Usage: {usage}")
+    return index, response
+
+
+def permission_reply_response(chat_id, prompt, command):
+    """Apply an explicit Telegram decision to a pending permission for the active request."""
+    index, response = _permission_selection(prompt, command)
+    active = request_store.active_for_chat(chat_id)
+    if not active:
+        return "No active request has a pending permission."
+    if len(active) != 1:
+        return "Multiple active requests found; use the remote TUI to manage permissions."
+    if active[0]["state"] == "cancellation_requested":
+        return "The active request is stopping; no permission will be granted."
+    session_id = active[0].get("session_id")
+    reference = active[0]["reference"]
+    if not session_id:
+        return "The active request has not reached OpenCode yet."
+
+    try:
+        pending_requests = opencode_api.pending_permissions(timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+    except Exception as error:
+        print(
+            f"permission_lookup_failed ref={reference} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return "Could not check pending permissions. Use the remote TUI or /cancel."
+    pending = []
+    known_sessions = {session_id}
+    unrelated_sessions = set()
+    for permission in pending_requests:
+        if not isinstance(permission, dict):
+            continue
+        permission_session_id = permission.get("sessionID")
+        if not isinstance(permission_session_id, str) or permission_session_id in unrelated_sessions:
+            continue
+        try:
+            belongs_to_request = _permission_belongs_to_session_tree(
+                permission_session_id,
+                session_id,
+                known_sessions,
+            )
+        except Exception as error:
+            print(
+                f"permission_session_lookup_failed ref={reference} error_type={type(error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return "Could not verify which task owns that permission. Use the remote TUI."
+        if belongs_to_request:
+            pending.append(permission)
+        else:
+            unrelated_sessions.add(permission_session_id)
+    pending.sort(key=lambda request: request.get("id", ""))
+    if not pending:
+        return "No pending permission for the active request."
+    if index is None:
+        if len(pending) != 1:
+            return "Multiple permissions are pending. Use /allow <number> or /deny <number>."
+        index = 1
+    if index < 1 or index > len(pending):
+        return f"No permission numbered {index} is pending."
+    if index > 5:
+        return "That permission is not shown here; use the remote TUI to inspect it."
+
+    selected_permission = pending[index - 1]
+    if response == "always":
+        always_patterns = selected_permission.get("always")
+        if not isinstance(always_patterns, list) or not always_patterns:
+            return f"Permission {index} cannot be remembered; use /allow for a one-time approval."
+    permission_id = selected_permission.get("id")
+    if not isinstance(permission_id, str):
+        return "The pending permission is invalid; use the remote TUI or /cancel."
+    decision = "reject" if command == "/deny" else response
+    try:
+        confirmed = opencode_api.respond_to_permission(
+            selected_permission["sessionID"],
+            permission_id,
+            decision,
+            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        print(
+            f"permission_reply_failed ref={reference} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return "Could not send that permission decision. Use the remote TUI or /cancel."
+    if not confirmed:
+        return "OpenCode did not confirm the permission decision. Use the remote TUI or /cancel."
+    if command == "/deny":
+        return f"Permission {index} denied. OpenCode can handle the rejection."
+    if decision == "always":
+        return f"Permission {index} allowed and remembered for matching requests."
+    return f"Permission {index} allowed once. OpenCode can continue."
+
+
 def _request_status_text(state):
     return {
         "acknowledging": "being acknowledged",
@@ -983,6 +1334,8 @@ def authorized_response(chat_id, prompt, sessions):
         if reference is None:
             return cancel_request_response(chat_id)
         return cancel_request_response(chat_id, reference)
+    if command in ("/allow", "/deny"):
+        return permission_reply_response(chat_id, prompt, command)
     if command is not None:
         return "Unknown command. Use /help to list the available commands."
     return answer(chat_id, prompt, sessions)
@@ -1009,6 +1362,8 @@ def help_response():
             "/cost — show cost and usage for this chat's current session",
             "/status [reference] — inspect the active or a previous request",
             "/cancel [reference] — stop the active request or one identified by reference",
+            "/allow [number] [always] — approve an active permission (once by default)",
+            "/deny [number] — reject an active permission",
         )
     )
 
@@ -1493,17 +1848,20 @@ def handle_update(update, sessions):
         return
     update_id = update.get("update_id", "unknown")
     command = _command_name(prompt)
-    if command in ("/status", "/cancel"):
+    if command in ("/status", "/cancel", "/allow", "/deny"):
         if not request_store.claim_update(update_id):
             return
         try:
-            reference = _control_reference(prompt, command)
-            if command == "/status":
-                response = request_status_response(chat_id, reference)
-            elif reference is None:
-                response = cancel_request_response(chat_id)
+            if command in ("/allow", "/deny"):
+                response = permission_reply_response(chat_id, prompt, command)
             else:
-                response = cancel_request_response(chat_id, reference)
+                reference = _control_reference(prompt, command)
+                if command == "/status":
+                    response = request_status_response(chat_id, reference)
+                elif reference is None:
+                    response = cancel_request_response(chat_id)
+                else:
+                    response = cancel_request_response(chat_id, reference)
             send(chat_id, response)
         except ValueError as error:
             send(chat_id, str(error))

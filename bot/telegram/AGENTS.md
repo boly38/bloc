@@ -46,6 +46,11 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
 - Keep progress updates deterministic and sanitized: report analysis/tool/test stages and safe
   tool names, never raw reasoning text, tool inputs, or tool output. Include the request reference
   and remind users that `/status` and `/cancel` target the active request by default.
+- Show the age of the last correlated OpenCode activity separately from successful API polling;
+  API reachability alone does not prove agent progress.
+- Surface permission requests for the active request's session tree and require an explicit `/allow` or
+  `/deny` decision; `/allow` is one-time by default. Never auto-approve. Interactive questions
+  are not currently bridged to Telegram.
 - At exchange completion, report a deduplicated list of tool names, including recognized CLI names
   such as `gh`; never include command arguments or tool output.
 - Report only OpenCode usage already observed for the active exchange, marked as partial; do not
