@@ -177,11 +177,17 @@ class RequestPresentation:
 
     def _render_active(self):
         self.expire_statuses()
-        lines = [
-            self.progress,
-            f"Ref: {self.reference}",
-            "Use /status or /abort (/cancel); buttons below control this request.",
+        progress_lines = self.progress.splitlines()
+        cost_lines = [
+            line for line in progress_lines if line.startswith(("Cost observed so far:", "Final cost:", "Cost:"))
         ]
+        tool_lines = [line for line in progress_lines if line.startswith("Tools used:")]
+        action_lines = [
+            line
+            for line in progress_lines
+            if line not in cost_lines and line not in tool_lines
+        ]
+        lines = [f"Ref: {self.reference}", *cost_lines, *tool_lines, *action_lines]
         if self.status_entries:
             lines.extend(("", "Status checks:", *(entry["text"] for entry in self.status_entries)))
         if self.permissions:

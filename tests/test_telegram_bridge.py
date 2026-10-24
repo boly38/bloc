@@ -191,6 +191,26 @@ class TelegramBridgeTests(unittest.TestCase):
 
         self.assertEqual(presentation.permissions_by_letter(), {"B": second})
 
+    def test_active_card_orders_reference_cost_tools_and_action_without_command_hints(self):
+        presentation = RequestPresentation(123, 456, "REF12345")
+        presentation.set_progress(
+            "Working on the request.\n"
+            "OpenCode activity: 2s ago; API heartbeat: 1s ago.\n"
+            "Cost observed so far: $0.125000 (partial)\n"
+            "Tools used: read, bash"
+        )
+
+        text, keyboard = presentation.edit_payload()
+        lines = text.splitlines()
+
+        self.assertEqual(lines[0], "Ref: REF12345")
+        self.assertEqual(lines[1], "Cost observed so far: $0.125000 (partial)")
+        self.assertEqual(lines[2], "Tools used: read, bash")
+        self.assertEqual(lines[3], "Working on the request.")
+        self.assertNotIn("/cancel", text)
+        self.assertNotIn("/abort", text)
+        self.assertEqual([button["text"] for button in keyboard["inline_keyboard"][0]], ["Status", "Abort"])
+
     def test_http_requests_do_not_add_basic_authentication(self):
         for url in (bridge_config.OC + "/global/health", bridge_config.TG + "getMe"):
             with self.subTest(url=url):
@@ -223,7 +243,7 @@ class TelegramBridgeTests(unittest.TestCase):
                     with patch.object(session_state, "save_sessions") as save:
                         result = bridge.answer(123, "Hi", {})
 
-        self.assertEqual(result, "Hello\n\nCost: $0.100000 (build: $0.100000)")
+        self.assertEqual(result, "Hello\n\nCost: $0.100000")
         title.assert_called_once_with()
         request.assert_has_calls(
             [
@@ -285,8 +305,8 @@ class TelegramBridgeTests(unittest.TestCase):
 
         send.assert_called_once()
         self.assertIn("Ref:", send.call_args.args[1])
-        self.assertIn("/status", send.call_args.args[1])
-        self.assertIn("/abort", send.call_args.args[1])
+        self.assertNotIn("/status", send.call_args.args[1])
+        self.assertNotIn("/abort", send.call_args.args[1])
         keyboard = send.call_args.kwargs["reply_markup"]["inline_keyboard"]
         self.assertEqual([button["text"] for button in keyboard[0]], ["Status", "Abort"])
         submit.assert_called_once()
@@ -476,8 +496,7 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(
             progress,
             [
-                "Analysis in progress (0s elapsed).\n"
-                "OpenCode activity: 0s ago; API heartbeat: 0s ago."
+                "Analysis in progress (0s elapsed)."
             ],
         )
         self.assertNotIn("private reasoning content", " ".join(progress))
@@ -926,15 +945,15 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertIn("$0.000000", report)
         history.assert_called_once_with("new-session")
 
-    def test_worker_does_not_forward_unknown_slash_commands_to_the_llm(self):
+    def test_command_worker_does_not_forward_unknown_slash_commands_to_the_llm(self):
         with patch.object(bridge, "authorized_response", return_value="Use /help") as respond:
             with patch.object(bridge, "answer_async") as answer:
-                with patch.object(bridge, "edit_reply"):
-                    with patch.object(bridge, "send"):
-                        bridge._request_worker(123, "/unknown", {}, 991, "REF12345", 657)
+                with patch.object(bridge, "send") as send:
+                    bridge._command_worker(123, "/unknown", {}, 991)
 
         respond.assert_called_once_with(123, "/unknown", {})
         answer.assert_not_called()
+        send.assert_called_once_with(123, "Use /help")
 
     def test_health_command_reports_only_sanitized_status_without_a_model_call(self):
         with patch.object(http_api, "http", return_value={"healthy": True}) as request:

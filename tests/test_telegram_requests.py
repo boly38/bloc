@@ -86,6 +86,24 @@ class TelegramRequestTests(unittest.TestCase):
         send.assert_called_once()
         submit.assert_called_once()
 
+    def test_non_model_command_sends_only_its_result_without_a_request_card(self):
+        update = {"update_id": 1031, "message": {"chat": {"id": 123}, "text": "/start"}}
+        with patch.object(bridge, "send") as send:
+            with patch.object(bridge._REQUEST_EXECUTOR, "submit") as submit:
+                with patch.object(bridge, "_REQUEST_SLOTS") as slots:
+                    slots.acquire.return_value = True
+                    bridge.handle_update(update, {})
+                    worker, *args = submit.call_args.args
+                    worker(*args)
+
+        self.assertEqual(submit.call_args.args[0], bridge._run_with_slot)
+        self.assertEqual(submit.call_args.args[1], bridge._command_worker)
+        self.assertEqual(send.call_count, 1)
+        self.assertIn("Welcome!", send.call_args.args[1])
+        self.assertNotIn("Ref:", send.call_args.args[1])
+        self.assertNotIn("reply_markup", send.call_args.kwargs)
+        self.assertIsNone(request_store.get_by_update_id(1031))
+
     def test_status_is_private_to_the_chat_and_does_not_expose_session_ids(self):
         request, _ = request_store.create("C" * 16, 123, 104, state="running")
         request_store.update(
@@ -114,7 +132,8 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertEqual(edit.call_count, 1)
         self.assertIn("Status checks:", edit.call_args.args[2])
         self.assertRegex(edit.call_args.args[2], r"\[\d\d:\d\d:\d\d UTC\] Request .+: running in OpenCode\.")
-        self.assertIn("/status or /abort", edit.call_args.args[2])
+        self.assertNotIn("/cancel", edit.call_args.args[2])
+        self.assertNotIn("/abort", edit.call_args.args[2])
         self.assertEqual(edit.call_args.kwargs["reply_markup"]["inline_keyboard"][0][0]["text"], "Status")
         bridge._forget_request_presentation(request["reference"])
 
@@ -503,7 +522,7 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertIn("Final cost: unavailable", edit.call_args.args[2])
         self.assertEqual(
             send.call_args.args[1],
-            "Recovered result\n\nCost: unavailable\n\nTools used: none\nTool calls: 0\n\nRef: 2222222222222222",
+            "Recovered result\n\nCost: unavailable\n\nTools used: none\nTool calls: 0",
         )
         self.assertEqual(request_store.get(request["reference"])["state"], "completed")
         submit.assert_not_called()
@@ -525,9 +544,9 @@ class TelegramRequestTests(unittest.TestCase):
 
         self.assertIn("Final cost: $0.250000", edit.call_args.args[2])
         self.assertIn(request["reference"], edit.call_args.args[2])
-        self.assertIn("Tools used: 0 distinct; 0 calls", edit.call_args.args[2])
+        self.assertIn("Tools used: none; 0 calls", edit.call_args.args[2])
         self.assertEqual(edit.call_args.kwargs["reply_markup"], {"inline_keyboard": []})
-        self.assertEqual(send.call_args.args[1], f"Done\n\nCost: $0.250000\n\nRef: {request['reference']}")
+        self.assertEqual(send.call_args.args[1], "Done\n\nCost: $0.250000")
 
     def test_recovery_does_not_replay_an_unconfirmed_submission(self):
         request, _ = request_store.create("4" * 16, 123, 111, state="running")
@@ -658,7 +677,7 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertEqual(request_store.get(request["reference"])["state"], "timed_out")
         self.assertIn("timed out and stopped", bridge.request_status_response(123, request["reference"]))
         self.assertIn("Status: timed out and stopped", edit.call_args.args[2])
-        self.assertIn("Tools used: 2 distinct; 1 calls", edit.call_args.args[2])
+        self.assertIn("Tools used: bash, gh; 1 calls", edit.call_args.args[2])
         self.assertIn("reached the configured 5-day limit", send.call_args.args[1])
         self.assertIn("Tools used: bash, gh", send.call_args.args[1])
 
