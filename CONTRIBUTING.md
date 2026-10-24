@@ -25,9 +25,10 @@ git diff --check
 The dependency-free bridge lives in the `bloc_bridge` package under `bot/telegram`:
 
 - `__main__.py` is the `python -m bloc_bridge` entry point used by Docker.
-- `bridge.py` orchestrates commands, sessions, and replies.
+- `bridge.py` handles Telegram commands, request admission, acknowledgements, and replies.
+- `opencode/exchange.py` submits, monitors, correlates, and recovers OpenCode requests.
 - `telegram/` contains polling, Markdown rendering, and the formatting smoke test.
-- `opencode/` contains API helpers and cost reporting.
+- `opencode/` contains API helpers, cost reporting, and shared tool metadata.
 - `bridge_config.py`, `bridge_runtime.py`, `http_api.py`, `session_state.py`, and
   `request_store.py` provide configuration, worker lifecycle, HTTP transport, and persistence.
 

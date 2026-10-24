@@ -9,7 +9,7 @@ duplicating them in the root guide.
 The package is `bloc_bridge`; use package-relative imports, not flat module imports.
 Docker runs `python -m bloc_bridge`. Its Dockerfile copies the entire package.
 
-- `bridge.py`: command routing, acknowledgement, admission, OpenCode exchange, and replies.
+- `bridge.py`: Telegram command routing, acknowledgement, admission, exchange composition, and replies.
   Keep `main()` focused on startup, supervision, signals, and cleanup. OpenCode exchange
   submission, monitoring, correlation, and recovery live in `opencode/exchange.py`.
 - `telegram/polling.py`: the single Telegram poller, update offsets, and retry backoff.
