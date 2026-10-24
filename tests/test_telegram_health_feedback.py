@@ -5,6 +5,7 @@ import os
 import runpy
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -16,7 +17,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot", "telegram"))
 with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_ALLOWED_CHAT_IDS": "123"}):
-    from bloc_bridge import bridge, bridge_runtime, http_api, opper_health
+    from bloc_bridge import bridge, bridge_runtime, http_api, opper_health, request_store
     from bloc_bridge.opencode import api as opencode_api
 
 
@@ -152,19 +153,40 @@ class OpperHealthTests(unittest.TestCase):
 
 class RequestFeedbackTests(unittest.TestCase):
     def setUp(self):
+        self.request_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.request_directory.cleanup)
         self.clock = 0
         self.progress = []
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(
+            patch.object(
+                request_store,
+                "REQUESTS_PATH",
+                os.path.join(self.request_directory.name, "requests.sqlite3"),
+            )
+        )
+        request_store.initialize()
+        self.stack.enter_context(patch.object(bridge, "OPENCODE_REQUEST_MAX_DURATION_SECONDS", 300))
         self.stack.enter_context(patch.object(bridge.time, "monotonic", side_effect=lambda: self.clock))
         self.stack.enter_context(patch.object(bridge_runtime, "wait", side_effect=self.advance))
         self.stack.enter_context(patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt")))
         self.stack.enter_context(patch.object(opencode_api, "session_tree_messages", return_value=[]))
         self.stack.enter_context(patch.object(opencode_api, "submit_async"))
+        self.permissions = self.stack.enter_context(
+            patch.object(opencode_api, "pending_permissions", return_value=[])
+        )
         self.stack.enter_context(patch.object(bridge, "_watch_events"))
         self.probe = self.stack.enter_context(patch.object(opper_health, "health_status"))
         self.status = self.stack.enter_context(patch.object(opencode_api, "session_status", return_value={}))
-        self.messages = self.stack.enter_context(patch.object(opencode_api, "session_messages", return_value=[]))
+        self.messages = self.stack.enter_context(
+            patch.object(
+                opencode_api,
+                "session_messages",
+                return_value=[{"info": {"id": "msg_prompt", "role": "user"}}],
+            )
+        )
+        self.abort = self.stack.enter_context(patch.object(opencode_api, "abort_session", return_value=False))
 
     def advance(self, seconds):
         self.clock += seconds
@@ -185,7 +207,10 @@ class RequestFeedbackTests(unittest.TestCase):
         }
 
     def test_silent_request_emits_periodic_feedback_and_succeeds_near_deadline(self):
-        self.messages.side_effect = lambda *_args, **_kwargs: [self.completed()] if self.clock >= 299 else []
+        prompt = {"info": {"id": "msg_prompt", "role": "user"}}
+        self.messages.side_effect = lambda *_args, **_kwargs: (
+            [prompt, self.completed()] if self.clock >= 299 else [prompt]
+        )
         result = self.answer()
         self.assertIn("Done", result)
         self.assertEqual(self.clock, 299)
@@ -193,16 +218,42 @@ class RequestFeedbackTests(unittest.TestCase):
         self.assertIn("270s elapsed", self.progress[-1][1])
         self.probe.assert_not_called()
 
+    def test_request_can_complete_after_five_minutes(self):
+        with patch.object(bridge, "OPENCODE_REQUEST_MAX_DURATION_SECONDS", 600):
+            prompt = {"info": {"id": "msg_prompt", "role": "user"}}
+            self.messages.side_effect = lambda *_args, **_kwargs: (
+                [prompt, self.completed()] if self.clock >= 400 else [prompt]
+            )
+            result = self.answer()
+
+        self.assertIn("Done", result)
+        self.assertEqual(self.clock, 400)
+        self.abort.assert_not_called()
+
+    def test_transient_status_http_timeout_is_retried(self):
+        self.status.side_effect = [urllib.error.URLError(TimeoutError()), {}, {}]
+        self.messages.side_effect = [
+            [{"info": {"id": "msg_prompt", "role": "user"}}, self.completed()],
+            [{"info": {"id": "msg_prompt", "role": "user"}}, self.completed()],
+        ]
+
+        result = self.answer()
+
+        self.assertIn("Done", result)
+        self.assertEqual(self.clock, 2)
+        self.abort.assert_not_called()
+
     def test_heartbeat_and_delivery_time_never_reset_deadline(self):
         def slow_progress(text):
             self.progress.append((self.clock, text))
             self.advance(5)
 
-        with self.assertRaises(bridge.OpenCodeRequestTimeout):
+        with self.assertRaises(bridge.OpenCodeRequestStopped):
             self.answer(slow_progress)
         self.assertEqual(self.clock, 300)
         self.assertGreater(len(self.progress), 1)
         self.assertTrue(all(when < 300 for when, _ in self.progress))
+        self.abort.assert_not_called()
         self.probe.assert_not_called()
         self.assertTrue(all(0 < item.args[0] <= 10 for item in self.status.call_args_list))
 
@@ -214,13 +265,16 @@ class RequestFeedbackTests(unittest.TestCase):
 
         def statuses(_timeout):
             if event_queues:
-                event_queues[0].put(("assistant", "reasoning" if self.clock % 2 else "tool"))
-            return {"private-session": {"type": "busy"}}
+                event_queues[0].put(("assistant", "tool", "bash", "running", False, False))
+            return {"private-session": {"type": "busy"}} if self.clock < 330 else {}
 
-        self.messages.return_value = [{
-            "info": {"role": "assistant", "id": "assistant", "parentID": "msg_prompt"},
-            "parts": [],
-        }]
+        self.messages.return_value = [
+            {"info": {"id": "msg_prompt", "role": "user"}},
+            {
+                "info": {"role": "assistant", "id": "assistant", "parentID": "msg_prompt"},
+                "parts": [],
+            },
+        ]
         self.status.side_effect = statuses
         # Run the watcher synchronously so event ordering is deterministic.
         thread = Mock()
@@ -229,26 +283,123 @@ class RequestFeedbackTests(unittest.TestCase):
                 kwargs = create_thread.call_args.kwargs
                 watch(*kwargs["args"])
             thread.start.side_effect = start
-            with self.assertRaises(bridge.OpenCodeRequestTimeout):
+            with self.assertRaises(bridge.OpenCodeRequestStopped):
                 self.answer()
 
-        self.assertEqual(self.clock, 300)
-        self.assertEqual([when for when, _ in self.progress], list(range(0, 300, 30)))
-        self.assertTrue(all("OpenCode is" in text for _, text in self.progress))
+        self.assertEqual(self.clock, 331)
+        self.assertEqual([when for when, _ in self.progress], list(range(0, 331, 30)))
+        self.assertTrue(all("Command in progress" in text for _, text in self.progress))
         self.assertEqual(len({text for _, text in self.progress}), len(self.progress))
+        self.abort.assert_called_once_with("private-session", timeout=10)
+
+    def test_progress_includes_cost_reported_for_completed_model_calls(self):
+        prompt = {"info": {"id": "msg_prompt", "role": "user"}}
+        assistant = {
+            "info": {
+                "role": "assistant",
+                "id": "assistant",
+                "parentID": "msg_prompt",
+                "time": {"completed": 123},
+                "cost": 0.000123,
+            },
+            "parts": [{"type": "text", "text": "Continuing"}],
+        }
+        self.messages.return_value = [prompt, assistant]
+        self.status.side_effect = [{"private-session": {"type": "busy"}}, {}, {}]
+
+        result = self.answer()
+
+        self.assertIn("Continuing", result)
+        self.assertTrue(self.progress)
+        self.assertIn("Cost observed so far: $0.000123 (partial)", self.progress[0][1])
+
+    def test_progress_distinguishes_stale_agent_activity_from_live_api_heartbeat(self):
+        prompt = {"info": {"id": "msg_prompt", "role": "user"}}
+        self.messages.side_effect = lambda *_args, **_kwargs: (
+            [prompt, self.completed()] if self.clock >= 70 else [prompt]
+        )
+        self.status.side_effect = lambda _timeout: (
+            {"private-session": {"type": "busy"}} if self.clock < 70 else {}
+        )
+
+        self.answer()
+
+        self.assertEqual([when for when, _ in self.progress], [30, 60])
+        self.assertIn("OpenCode activity: 30s ago; API heartbeat: 0s ago.", self.progress[0][1])
+        self.assertIn("OpenCode activity: 60s ago; API heartbeat: 0s ago.", self.progress[1][1])
+
+    def test_progress_reports_age_of_last_api_response_during_polling_errors(self):
+        prompt = {"info": {"id": "msg_prompt", "role": "user"}}
+
+        def statuses(_timeout):
+            if self.clock == 0:
+                return {"private-session": {"type": "busy"}}
+            if self.clock < 61:
+                raise urllib.error.URLError(TimeoutError())
+            return {}
+
+        self.status.side_effect = statuses
+        self.messages.side_effect = lambda *_args, **_kwargs: (
+            [prompt, self.completed()] if self.clock >= 61 else [prompt]
+        )
+
+        self.answer()
+
+        self.assertEqual([when for when, _ in self.progress], [30, 60])
+        self.assertIn("OpenCode activity: 30s ago; API last responded: 30s ago.", self.progress[0][1])
+        self.assertIn("API last responded: 60s ago", self.progress[1][1])
+
+    def test_monitor_surfaces_pending_permission_with_explicit_commands(self):
+        reference = "FEDCBA9876543210"
+        permission = {
+            "id": "private-permission-id",
+            "sessionID": "private-session",
+            "permission": "webfetch",
+            "patterns": ["https://docs.example.test/config"],
+            "always": ["*"],
+        }
+        self.permissions.return_value = [permission]
+        presentation = bridge._request_presentation(reference, 123, 509)
+        monitor = bridge._AsyncRequestMonitor(
+            "private-session",
+            "msg_prompt",
+            reference,
+            bridge.time.time(),
+        )
+        with patch.object(opencode_api, "session_status", return_value={"private-session": {"type": "busy"}}):
+            with patch.object(
+                opencode_api,
+                "session_messages",
+                return_value=[{"info": {"id": "msg_prompt", "role": "user"}}],
+            ):
+                with patch.object(opencode_api, "respond_to_permission") as respond:
+                    snapshot = monitor._read_snapshot()
+        monitor._report_progress(snapshot, presentation.set_progress)
+        text, keyboard = presentation.edit_payload()
+
+        self.assertIn("OpenCode is waiting for 1 permission", text)
+        self.assertIn("/allow A", text)
+        self.assertIn("/allowAll A", text)
+        self.assertIn("/deny A", text)
+        self.assertIn("Always A", [button["text"] for row in keyboard["inline_keyboard"] for button in row])
+        respond.assert_not_called()
+        bridge._forget_request_presentation(reference)
 
     def test_correlated_provider_failure_surfaces_before_completion_or_idle(self):
         self.status.return_value = {"private-session": {"type": "busy"}}
-        self.messages.return_value = [{
-            "info": {
-                "role": "assistant", "id": "assistant", "parentID": "msg_prompt",
-                "error": {"name": "APIError", "data": {
-                    "statusCode": 503, "message": "private credentials and prompt",
-                    "responseBody": "private response",
-                }},
+        self.messages.return_value = [
+            {"info": {"id": "msg_prompt", "role": "user"}},
+            {
+                "info": {
+                    "role": "assistant", "id": "assistant", "parentID": "msg_prompt",
+                    "error": {"name": "APIError", "data": {
+                        "statusCode": 503, "message": "private credentials and prompt",
+                        "responseBody": "private response",
+                    }},
+                },
+                "parts": [],
             },
-            "parts": [],
-        }]
+        ]
         with self.assertRaises(opencode_api.OpenCodeResponseError) as caught:
             self.answer()
         self.assertEqual(self.clock, 0)
@@ -285,9 +436,10 @@ class RequestFeedbackTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch.object(bridge, "answer_async", side_effect=error), \
                      patch.object(bridge, "edit_reply") as edit, \
+                     patch.object(bridge, "send") as send, \
                      patch("sys.stderr", output):
                     bridge._request_worker(123, "private-prompt", {}, 123, "REF12345", 456)
-                reply = edit.call_args.args[2]
+                reply = send.call_args.args[1]
                 self.assertIn(expected, reply)
                 self.assertIn("REF12345", reply)
                 self.assertNotIn("private", reply)
@@ -301,10 +453,14 @@ class RequestFeedbackTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(bridge, "answer_async", side_effect=exchange), \
              patch.object(bridge, "edit_reply") as edit, \
+             patch.object(bridge, "send") as send, \
              patch("sys.stderr", output):
             bridge._request_worker(123, "Hi", {}, 123, "REF12345", 456)
         self.assertEqual(edit.call_count, 2)
-        self.assertIn("timed out", edit.call_args.args[2])
+        self.assertIn("/status", edit.call_args_list[0].args[2])
+        self.assertIn("/abort", edit.call_args_list[0].args[2])
+        self.assertIn("REF12345", edit.call_args_list[0].args[2])
+        self.assertIn("timed out", send.call_args.args[1])
         self.assertIn("phase=response_wait", output.getvalue())
 
 

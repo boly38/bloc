@@ -8,20 +8,28 @@ start
 note right
   Unauthorized messages are ignored.
 end note
-:Send an acknowledgement;
-:Queue the request;
-note right
-  If capacity is reached, ask the user
-  to retry later instead of queuing.
-end note
-
-if (Slash command?) then (yes)
-  :Handle the command\nwithout calling the model;
+if (/status or /cancel?) then (yes)
+  :Check request ownership and report status\nor ask OpenCode to abort;
 else (no)
-  :Reuse or create this chat's\nOpenCode session;
-  :Submit the prompt to OpenCode\nand wait for its response;
+  if (Another request active in chat?) then (yes)
+    :Refuse prompt with active reference\nand /status /cancel guidance;
+  else (no)
+    :Persist private request reference\nand Telegram update ID;
+    :Send acknowledgement and persist its message ID;
+    :Queue the request;
+    if (Other slash command?) then (yes)
+      :Handle without calling the model;
+    else (no)
+      :Reuse or create this chat's\nOpenCode session;
+      :Persist session and prompt correlation IDs;
+      :Submit once and monitor for up to 5 days;
+      :Retry temporary status/history HTTP timeouts;
+      :Report deterministic progress and observed partial cost;
+      :Abort on cancellation or maximum duration;
+      :Confirm OpenCode is idle before releasing the chat;
+    endif
+    :Format final reply and update\nthe Telegram acknowledgement;
+  endif
 endif
-
-:Format the reply and update\nthe Telegram acknowledgement;
 stop
 @enduml

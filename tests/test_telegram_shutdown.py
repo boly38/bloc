@@ -25,14 +25,17 @@ with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "unit-test-token", "TELEGRAM_
 
 SCENARIO = textwrap.dedent("""
     import runpy
+    import os
     import socket
     import sys
     import threading
     from unittest.mock import patch
 
-    from bloc_bridge import bridge, http_api, session_state
+    from bloc_bridge import bridge, http_api, request_store, session_state
     from bloc_bridge.opencode import api as opencode_api
     from bloc_bridge.bridge_config import TG
+
+    request_store.REQUESTS_PATH = os.environ["TELEGRAM_TEST_REQUESTS_PATH"]
 
     scenario = sys.argv[1]
     blocked = threading.Event()
@@ -117,6 +120,7 @@ class TelegramShutdownTests(unittest.TestCase):
                 self.assert_clean_shutdown(scenario)
 
     def assert_clean_shutdown(self, scenario):
+        request_directory = tempfile.TemporaryDirectory()
         environment = dict(
             os.environ,
             PYTHONPATH=str(BRIDGE),
@@ -124,6 +128,7 @@ class TelegramShutdownTests(unittest.TestCase):
             TELEGRAM_ALLOWED_CHAT_IDS="123",
             NO_PROXY="127.0.0.1",
             no_proxy="127.0.0.1",
+            TELEGRAM_TEST_REQUESTS_PATH=str(Path(request_directory.name) / "requests.sqlite3"),
         )
         process = subprocess.Popen(
             [sys.executable, "-u", "-c", SCENARIO, scenario],
@@ -153,11 +158,12 @@ class TelegramShutdownTests(unittest.TestCase):
             else:
                 self.assertNotIn("request_completed", stderr)
             if scenario == "queued":
-                self.assertEqual(stderr.count("request_accepted"), 8)
+                self.assertEqual(stderr.count("request_accepted"), 1)
         finally:
             if process.poll() is None:
                 process.kill()
             process.communicate()
+            request_directory.cleanup()
 
     def test_polling_preserves_offset_and_does_not_dispatch_updates_after_shutdown(self):
         stop = threading.Event()
@@ -167,6 +173,7 @@ class TelegramShutdownTests(unittest.TestCase):
 
         def poll(method, payload):
             self.assertEqual(method, "getUpdates")
+            self.assertEqual(payload["allowed_updates"], ["message", "callback_query"])
             offsets.append(payload["offset"])
             if len(offsets) == 2:
                 stop.set()

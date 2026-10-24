@@ -3,6 +3,7 @@
 import json
 import queue
 import re
+import secrets
 import signal
 import sys
 import threading
@@ -10,11 +11,13 @@ import time
 import urllib.error
 import urllib.parse
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import bridge_runtime, http_api, opper_health, session_state
+from . import bridge_runtime, http_api, opper_health, request_store, session_state
 from .opencode import cost_reporting, api as opencode_api
 from .telegram import markdown_renderer, polling as telegram_polling
+from .telegram.request_presentation import RequestPresentation
 from .bridge_config import (
     ALLOWED,
     HEALTH_OPPER_ENABLED,
@@ -23,6 +26,7 @@ from .bridge_config import (
     OPENCODE_HTTP_TIMEOUT_SECONDS,
     OPENCODE_STATUS_TIMEOUT_SECONDS,
     OPENCODE_PROGRESS_INTERVAL_SECONDS,
+    OPENCODE_REQUEST_MAX_DURATION_SECONDS,
     SYSTEM,
     TELEGRAM_HTTP_TIMEOUT_SECONDS,
     TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
@@ -35,16 +39,147 @@ _REQUEST_SLOTS = threading.BoundedSemaphore(32)
 _SESSIONS_LOCK = threading.RLock()
 _CHAT_LOCKS_LOCK = threading.Lock()
 _CHAT_LOCKS = {}
+_REQUEST_PRESENTATIONS_LOCK = threading.RLock()
+_REQUEST_PRESENTATIONS = {}
+_MAX_REQUEST_PRESENTATIONS = 256
+_PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 5
+_PERMISSION_POLL_INTERVAL_SECONDS = 5
+_PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS = 3
+_PERMISSION_ANCESTRY_MAX_DEPTH = 8
+_TEST_COMMAND = re.compile(
+    r"\b(?:pytest|tox|nox|unittest|cargo\s+test|go\s+test|"
+    r"npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|"
+    r"bun\s+(?:run\s+)?test|mvn\s+test|gradle\s+test|make\s+test)\b",
+    re.IGNORECASE,
+)
+_GH_CLI_COMMAND = re.compile(
+    r"\bgh\s+(?:api|auth|issue|pr|repo|run|workflow|release|label|search|gist|secret|variable)\b",
+    re.IGNORECASE,
+)
+_TOOL_PROGRESS_LABELS = {
+    "bash": "Command",
+    "edit": "File edit",
+    "glob": "File search",
+    "grep": "File search",
+    "read": "File read",
+    "task": "Subtask",
+    "webfetch": "Documentation fetch",
+    "write": "File write",
+}
 
 
 class OpenCodeRequestTimeout(TimeoutError):
     """The overall time allowed for one OpenCode exchange elapsed."""
 
 
+class OpenCodeRequestStopped(RuntimeError):
+    """OpenCode confirmed that an active request stopped."""
+
+    def __init__(self, state, tool_names=(), tool_call_count=0):
+        self.state = state
+        self.tool_names = tuple(tool_names)
+        self.tool_call_count = tool_call_count
+        super().__init__("OpenCode request stopped")
+
+
+class OpenCodeSubmissionUnconfirmed(RuntimeError):
+    """OpenCode is idle but the submitted prompt cannot be found in its history."""
+
+
 def _chat_lock(chat_id):
     key = str(chat_id)
     with _CHAT_LOCKS_LOCK:
         return _CHAT_LOCKS.setdefault(key, threading.Lock())
+
+
+def _request_presentation(reference, chat_id=None, acknowledgement_id=None):
+    with _REQUEST_PRESENTATIONS_LOCK:
+        presentation = _REQUEST_PRESENTATIONS.get(reference)
+        if presentation is not None:
+            if chat_id is not None and str(presentation.chat_id) != str(chat_id):
+                return None
+            return presentation
+        if chat_id is None or acknowledgement_id is None:
+            request = request_store.get(reference)
+            if request is not None:
+                if request.get("state") in request_store.TERMINAL_STATES:
+                    return None
+                chat_id = request.get("chat_id") if chat_id is None else chat_id
+                acknowledgement_id = (
+                    request.get("acknowledgement_id") if acknowledgement_id is None else acknowledgement_id
+                )
+        if chat_id is None or acknowledgement_id is None:
+            return None
+        presentation = RequestPresentation(chat_id, acknowledgement_id, reference)
+        _REQUEST_PRESENTATIONS[reference] = presentation
+        _prune_request_presentations()
+        return presentation
+
+
+def _register_request_presentation(presentation):
+    with _REQUEST_PRESENTATIONS_LOCK:
+        _REQUEST_PRESENTATIONS[presentation.reference] = presentation
+        _prune_request_presentations()
+        _prune_request_presentations()
+
+
+def _prune_request_presentations():
+    while len(_REQUEST_PRESENTATIONS) > _MAX_REQUEST_PRESENTATIONS:
+        for reference, presentation in list(_REQUEST_PRESENTATIONS.items()):
+            with presentation.lock:
+                finished = presentation.final_text is not None
+            if finished:
+                _REQUEST_PRESENTATIONS.pop(reference, None)
+                break
+        else:
+            return
+
+
+def _request_presentation_for_request(request):
+    return _request_presentation(
+        request["reference"],
+        request.get("chat_id"),
+        request.get("acknowledgement_id"),
+    )
+
+
+def _edit_request_presentation(presentation):
+    if presentation is None:
+        return
+    with presentation.lock:
+        text, reply_markup = presentation.edit_payload()
+        edit_reply(
+            presentation.chat_id,
+            presentation.message_id,
+            text,
+            reply_markup=reply_markup,
+        )
+
+
+def _forget_request_presentation(reference):
+    with _REQUEST_PRESENTATIONS_LOCK:
+        _REQUEST_PRESENTATIONS.pop(reference, None)
+
+
+def _append_request_status(chat_id, reference, status_text):
+    request = request_store.get_for_chat(reference, chat_id)
+    if request is None:
+        return False
+    presentation = _request_presentation_for_request(request)
+    if presentation is None:
+        return False
+    presentation.append_status(status_text)
+    _edit_request_presentation(presentation)
+    return True
+
+
+def _finish_request_presentation(request, summary):
+    presentation = _request_presentation_for_request(request)
+    if presentation is None:
+        return False
+    presentation.finish(summary)
+    _edit_request_presentation(presentation)
+    return True
 
 
 def _assistant_message_key(entry):
@@ -68,6 +203,58 @@ def _new_assistant_messages(messages, previous_ids):
         for entry in messages
         if (key := _assistant_message_key(entry)) is not None and key not in previous_ids
     ]
+
+
+def _tool_names(messages):
+    """Return unique tool and recognized CLI names, without inputs or outputs."""
+    names = []
+    seen = set()
+    for entry in messages:
+        message = entry.get("message") if isinstance(entry, dict) else None
+        if not isinstance(message, dict):
+            message = entry if isinstance(entry, dict) else {}
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "tool":
+                continue
+            tool_name = part.get("tool")
+            if isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", tool_name):
+                normalized = tool_name.lower()
+                if normalized not in seen:
+                    names.append(normalized)
+                    seen.add(normalized)
+            state = part.get("state")
+            state = state if isinstance(state, dict) else {}
+            tool_input = state.get("input")
+            command = tool_input.get("command") if isinstance(tool_input, dict) else None
+            if tool_name == "bash" and isinstance(command, str) and _GH_CLI_COMMAND.search(command):
+                if "gh" not in seen:
+                    names.append("gh")
+                    seen.add("gh")
+    return names
+
+
+def _tool_call_count(messages):
+    count = 0
+    for entry in messages:
+        message = entry.get("message") if isinstance(entry, dict) else None
+        if not isinstance(message, dict):
+            message = entry if isinstance(entry, dict) else {}
+        parts = message.get("parts")
+        if isinstance(parts, list):
+            count += sum(1 for part in parts if isinstance(part, dict) and part.get("type") == "tool")
+    return count
+
+
+def _format_tool_usage(tool_names):
+    safe_names = [
+        name.lower()
+        for name in tool_names
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", name)
+    ]
+    return f"Tools used: {', '.join(dict.fromkeys(safe_names)) if safe_names else 'none'}"
 
 
 def _record_exchange_diagnostics(messages, response):
@@ -161,7 +348,87 @@ def _event_details(event):
     session_id = properties.get("sessionID") or part.get("sessionID")
     message_id = properties.get("messageID") or part.get("messageID")
     part_type = part.get("type")
-    return session_id, message_id, part_type
+    tool_name = part.get("tool") if part_type == "tool" else None
+    tool_state = part.get("state") if part_type == "tool" else None
+    tool_state = tool_state if isinstance(tool_state, dict) else {}
+    tool_status = tool_state.get("status")
+    tool_input = tool_state.get("input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    is_test_command = tool_name == "bash" and isinstance(command, str) and bool(_TEST_COMMAND.search(command))
+    is_gh_command = tool_name == "bash" and isinstance(command, str) and bool(_GH_CLI_COMMAND.search(command))
+    return session_id, message_id, part_type, tool_name, tool_status, is_test_command, is_gh_command
+
+
+def _event_progress_stage(
+    part_type,
+    tool_name=None,
+    tool_status=None,
+    is_test_command=False,
+    is_gh_command=False,
+):
+    if part_type == "reasoning":
+        return "Analysis in progress"
+    if part_type != "tool":
+        return None
+
+    if is_test_command:
+        label = "Tests"
+    elif is_gh_command:
+        label = "GitHub CLI"
+    elif isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", tool_name):
+        label = _TOOL_PROGRESS_LABELS.get(tool_name.lower(), f"Tool {tool_name}")
+    else:
+        label = "Tool"
+    suffix = {
+        "completed": "complete",
+        "error": "failed",
+    }.get(tool_status, "in progress")
+    return f"{label} {suffix}"
+
+
+def _permission_signature(permissions):
+    entries = [
+        (permission["id"], permission.get("permission"))
+        for permission in permissions
+        if isinstance(permission, dict) and isinstance(permission.get("id"), str)
+    ]
+    return tuple(sorted(entries, key=lambda entry: entry[0]))
+
+
+def _permission_belongs_to_session_tree(session_id, root_session_id, known_session_ids):
+    """Check bounded session ancestry so child-agent prompts stay with their request."""
+    current_session_id = session_id
+    traversed = []
+    for _ in range(_PERMISSION_ANCESTRY_MAX_DEPTH):
+        if current_session_id == root_session_id or current_session_id in known_session_ids:
+            known_session_ids.update(traversed)
+            known_session_ids.add(current_session_id)
+            return True
+        details = opencode_api.session_details(
+            current_session_id,
+            timeout=_PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS,
+        )
+        parent_session_id = details.get("parentID")
+        if not isinstance(parent_session_id, str) or not parent_session_id:
+            return False
+        traversed.append(current_session_id)
+        current_session_id = parent_session_id
+    return False
+
+
+def _permissions_in_session_tree(root_session_id, requests, related_sessions, unrelated_sessions):
+    matches = []
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        session_id = request.get("sessionID")
+        if not isinstance(session_id, str) or session_id in unrelated_sessions:
+            continue
+        if _permission_belongs_to_session_tree(session_id, root_session_id, related_sessions):
+            matches.append(request)
+        else:
+            unrelated_sessions.add(session_id)
+    return sorted(matches, key=lambda request: request.get("id", ""))
 
 
 def _watch_events(session_id, reference, events, stop):
@@ -174,10 +441,20 @@ def _watch_events(session_id, reference, events, stop):
                 details = _event_details(event)
                 if details is None:
                     continue
-                event_session, message_id, part_type = details
+                (
+                    event_session,
+                    message_id,
+                    part_type,
+                    tool_name,
+                    tool_status,
+                    is_test_command,
+                    is_gh_command,
+                ) = details
                 if event_session == session_id and message_id:
                     try:
-                        events.put_nowait((message_id, part_type))
+                        events.put_nowait(
+                            (message_id, part_type, tool_name, tool_status, is_test_command, is_gh_command)
+                        )
                     except queue.Full:
                         pass
             if not stop.is_set():
@@ -198,6 +475,519 @@ def _log_event_stream_error(reference, error):
         f"error_type={type(error).__name__} detail={detail}",
         file=sys.stderr,
         flush=True,
+    )
+
+
+def _retryable_status_error(error):
+    return isinstance(error, (TimeoutError, urllib.error.URLError)) or (
+        isinstance(error, http_api.OpenCodeHTTPError)
+        and (error.status in (408, 429) or error.status >= 500)
+    )
+
+
+def _assistant_activity_signature(messages):
+    """Describe observable message changes without retaining message text."""
+    signature = []
+    for message in messages:
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict):
+            continue
+        message_time = info.get("time")
+        message_time = message_time if isinstance(message_time, dict) else {}
+        tokens = info.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        parts_signature = []
+        parts = message.get("parts")
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                state = part.get("state")
+                state = state if isinstance(state, dict) else {}
+                text = part.get("text")
+                output = state.get("output")
+                parts_signature.append(
+                    (
+                        part.get("type"),
+                        part.get("tool"),
+                        state.get("status"),
+                        len(text) if isinstance(text, str) else None,
+                        len(output) if isinstance(output, str) else None,
+                    )
+                )
+        error = info.get("error")
+        signature.append(
+            (
+                info.get("id"),
+                info.get("finish"),
+                message_time.get("completed"),
+                error.get("name") if isinstance(error, dict) else None,
+                info.get("cost"),
+                tokens.get("input"),
+                tokens.get("output"),
+                tuple(parts_signature),
+            )
+        )
+    return tuple(signature)
+
+
+@dataclass(frozen=True)
+class _MonitorSnapshot:
+    """One consistent status/history sample from OpenCode."""
+
+    busy: bool
+    prompt_found: bool
+    correlated_messages: list[dict]
+    pending_permissions: list[dict]
+
+
+class _AsyncRequestMonitor:
+    """Own the state and lifecycle for monitoring one submitted OpenCode prompt."""
+
+    def __init__(self, session_id, prompt_message_id, reference, started_at):
+        self.session_id = session_id
+        self.prompt_message_id = prompt_message_id
+        self.reference = reference
+        self.started_at = started_at
+        self.events_to_stop = threading.Event()
+        self.events = queue.Queue(maxsize=128)
+        self.event_thread = threading.Thread(
+            target=_watch_events,
+            args=(session_id, reference, self.events, self.events_to_stop),
+            name=f"opencode-events-{reference}",
+            daemon=True,
+        )
+
+        self.monitor_started_at = time.monotonic()
+        # Use the persisted wall clock across restarts, then a monotonic deadline locally.
+        elapsed_duration = max(0, time.time() - started_at)
+        remaining_duration = max(0, OPENCODE_REQUEST_MAX_DURATION_SECONDS - elapsed_duration)
+        self.deadline = self.monitor_started_at + remaining_duration
+        self.prompt_reconcile_deadline = self.monitor_started_at + 10
+
+        self.abort_reason = None
+        self.abort_deadline = None
+        self.abort_sent = False
+        self.abort_unavailable = False
+        self.next_abort_at = 0
+        self.reconcile_deadline = None
+        self.reconcile_reported = False
+        self.idle_samples = 0
+        self.reported_read_error = False
+
+        self.current_stage = None
+        self.reported_stage = None
+        self.reported_cost = None
+        self.last_progress_at = time.monotonic()
+        self.last_opencode_activity_at = self.monitor_started_at
+        self.last_api_success_at = self.monitor_started_at
+        self.last_activity_signature = None
+        self.last_snapshot = _MonitorSnapshot(True, False, [], [])
+        self.pending_permissions = []
+        self.related_permission_sessions = {session_id}
+        self.unrelated_permission_sessions = set()
+        self.last_permission_poll_at = self.monitor_started_at - _PERMISSION_POLL_INTERVAL_SECONDS
+        self.reported_permission_signature = ()
+        self.reported_permission_error = False
+        self.reported_permission_session_error = False
+
+    def run(self, set_phase, progress):
+        """Poll until completion or an OpenCode stop is confirmed."""
+        self.event_thread.start()
+        try:
+            set_phase("response_wait")
+            while True:
+                bridge_runtime.check_shutdown()
+                self._update_stop_reason()
+                try:
+                    snapshot = self._read_snapshot()
+                except Exception as error:
+                    self._handle_read_error(error)
+                    self._report_progress(self.last_snapshot, progress, api_responding=False)
+                    bridge_runtime.wait(1)
+                    continue
+
+                self._raise_correlated_response_error(snapshot)
+                self._update_progress_stage(snapshot.correlated_messages)
+                if self._is_request_complete(snapshot):
+                    return snapshot.correlated_messages
+
+                self._request_abort(snapshot)
+                self._resolve_stop_outcome(snapshot)
+                self._reconcile_missing_prompt(snapshot)
+                self._update_stop_deadlines(snapshot)
+                self._report_progress(snapshot, progress)
+                bridge_runtime.wait(1)
+        finally:
+            self.events_to_stop.set()
+
+    def _update_stop_reason(self):
+        """Apply user cancellation or the request deadline to monitor state."""
+        request = request_store.get(self.reference) if self.reference else None
+        cancellation_pending = request and (
+            request["state"] == "cancellation_requested"
+            or (request["state"] == "recovering" and request.get("detail") == "user_cancelled")
+        )
+        if cancellation_pending and request.get("detail") == "user_cancelled":
+            if self.abort_reason != "user_cancelled":
+                self.abort_reason = "user_cancelled"
+                self.abort_sent = False
+                self.abort_unavailable = False
+                self.next_abort_at = time.monotonic()
+        elif cancellation_pending and self.abort_reason is None:
+            self.abort_reason = request.get("detail") or "cancelled"
+
+        if self.abort_reason is None and time.monotonic() >= self.deadline:
+            self.abort_reason = "timed_out"
+        if self.abort_reason is not None and self.reconcile_deadline is None:
+            self.reconcile_deadline = time.monotonic() + 60
+            request_store.update(
+                self.reference,
+                state="cancellation_requested",
+                detail=self.abort_reason,
+            )
+
+    def _read_snapshot(self):
+        """Read session activity and history, then correlate the active prompt."""
+        statuses = opencode_api.session_status(OPENCODE_STATUS_TIMEOUT_SECONDS)
+        busy = _session_is_busy(statuses.get(self.session_id))
+        messages = opencode_api.session_messages(
+            self.session_id,
+            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        self.idle_samples = 0 if busy else self.idle_samples + 1
+        prompt_found = any(
+            isinstance(message, dict)
+            and isinstance(message.get("info"), dict)
+            and message["info"].get("id") == self.prompt_message_id
+            and message["info"].get("role") == "user"
+            for message in messages
+        )
+        correlated = opencode_api.assistant_messages_for_prompt(
+            messages,
+            self.prompt_message_id,
+        )
+        self._poll_pending_permissions()
+        now = time.monotonic()
+        self.last_api_success_at = now
+        activity_signature = _assistant_activity_signature(correlated)
+        if activity_signature != self.last_activity_signature:
+            self.last_activity_signature = activity_signature
+            self.last_opencode_activity_at = now
+        snapshot = _MonitorSnapshot(busy, prompt_found, correlated, list(self.pending_permissions))
+        self.last_snapshot = snapshot
+        return snapshot
+
+    def _poll_pending_permissions(self):
+        """Refresh permission prompts for this request's session at a bounded cadence."""
+        now = time.monotonic()
+        if now - self.last_permission_poll_at < _PERMISSION_POLL_INTERVAL_SECONDS:
+            return
+        self.last_permission_poll_at = now
+        try:
+            requests = opencode_api.pending_permissions(timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+        except Exception as error:
+            if not self.reported_permission_error:
+                print(
+                    f"opencode_permission_poll_failed ref={self.reference} "
+                    f"error_type={type(error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.reported_permission_error = True
+            return
+
+        self.reported_permission_error = False
+        previous = self.pending_permissions
+        try:
+            self.pending_permissions = _permissions_in_session_tree(
+                self.session_id,
+                requests,
+                self.related_permission_sessions,
+                self.unrelated_permission_sessions,
+            )
+        except Exception as error:
+            if not self.reported_permission_session_error:
+                print(
+                    f"permission_session_lookup_failed ref={self.reference} "
+                    f"error_type={type(error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.reported_permission_session_error = True
+            return
+        else:
+            self.reported_permission_session_error = False
+        if _permission_signature(previous) != _permission_signature(self.pending_permissions):
+            self.last_opencode_activity_at = time.monotonic()
+        if previous and not self.pending_permissions:
+            self.current_stage = "Permission decision submitted; OpenCode is resuming"
+        presentation = _request_presentation(self.reference)
+        if presentation is not None:
+            presentation.sync_permissions(self.pending_permissions)
+
+    def _handle_read_error(self, error):
+        """Log polling failures safely and mark unconfirmed stop states."""
+        if not self.reported_read_error:
+            diagnostic = (
+                "opencode_status_retry"
+                if _retryable_status_error(error)
+                else "opencode_status_unavailable"
+            )
+            print(
+                f"{diagnostic} ref={self.reference} error_type={type(error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.reported_read_error = True
+        if not _retryable_status_error(error):
+            request_store.update(self.reference, state="uncertain", detail="status_unavailable")
+
+        now = time.monotonic()
+        if self.abort_deadline is not None and now >= self.abort_deadline:
+            request_store.update(self.reference, state="uncertain", detail="stop_unconfirmed")
+            self.abort_deadline = None
+            self.abort_sent = False
+            self.next_abort_at = now + 30
+        self._report_unconfirmed_reconciliation(now)
+
+    def _raise_correlated_response_error(self, snapshot):
+        """Surface provider errors unless a timeout or cancellation is stopping work."""
+        # An abort may itself be recorded as an assistant error. Once stopping
+        # was requested, the confirmed stop reason takes precedence.
+        if self.abort_reason is not None:
+            return
+        try:
+            for message in snapshot.correlated_messages:
+                opencode_api.raise_response_error(message)
+        except opencode_api.OpenCodeResponseError as error:
+            error.tool_names = _tool_names(snapshot.correlated_messages)
+            error.tool_call_count = _tool_call_count(snapshot.correlated_messages)
+            raise
+
+    def _update_progress_stage(self, correlated_messages):
+        """Consume relevant SSE events and retain the latest deterministic stage."""
+        assistant_ids = {
+            message.get("info", {}).get("id")
+            for message in correlated_messages
+            if message.get("info", {}).get("id")
+        }
+        while True:
+            try:
+                (
+                    event_message_id,
+                    part_type,
+                    tool_name,
+                    tool_status,
+                    is_test_command,
+                    is_gh_command,
+                ) = self.events.get_nowait()
+            except queue.Empty:
+                return
+            if event_message_id not in assistant_ids:
+                continue
+            self.last_opencode_activity_at = time.monotonic()
+            stage = _event_progress_stage(
+                part_type,
+                tool_name,
+                tool_status,
+                is_test_command,
+                is_gh_command,
+            )
+            if stage:
+                self.current_stage = stage
+
+    def _is_request_complete(self, snapshot):
+        return (
+            self.abort_reason is None
+            and snapshot.correlated_messages
+            and _assistant_response_complete(snapshot.correlated_messages[-1])
+            and not snapshot.busy
+            and self.idle_samples >= 2
+        )
+
+    def _request_abort(self, snapshot):
+        """Abort only after the submitted prompt is visible in the busy session."""
+        if not (
+            self.abort_reason is not None
+            and snapshot.prompt_found
+            and snapshot.busy
+            and not self.abort_sent
+            and not self.abort_unavailable
+            and time.monotonic() >= self.next_abort_at
+        ):
+            return
+
+        try:
+            # Abort is session-wide, so require this job's prompt in history first.
+            self.abort_sent = opencode_api.abort_session(
+                self.session_id,
+                timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+            )
+            if self.abort_sent:
+                self.abort_deadline = time.monotonic() + 60
+            else:
+                self.next_abort_at = time.monotonic() + 30
+        except Exception as error:
+            request_store.update(self.reference, state="uncertain", detail="abort_unconfirmed")
+            if _retryable_status_error(error):
+                self.next_abort_at = time.monotonic() + 30
+            else:
+                self.abort_unavailable = True
+
+    def _resolve_stop_outcome(self, snapshot):
+        """Resolve a requested stop, or fail if the submitted prompt is unconfirmed."""
+        if self.abort_reason is None or snapshot.busy or self.idle_samples < 2:
+            return
+        if snapshot.prompt_found or self.abort_sent:
+            raise OpenCodeRequestStopped(
+                self.abort_reason,
+                _tool_names(snapshot.correlated_messages),
+                _tool_call_count(snapshot.correlated_messages),
+            )
+        request_store.update(
+            self.reference,
+            state="failed",
+            detail="submission_unconfirmed",
+            completed_at=time.time(),
+        )
+        raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
+
+    def _reconcile_missing_prompt(self, snapshot):
+        """Fail safely when OpenCode is idle but never confirms the submitted prompt."""
+        if not (
+            self.abort_reason is None
+            and not snapshot.prompt_found
+            and not snapshot.busy
+            and self.idle_samples >= 2
+            and time.monotonic() >= self.prompt_reconcile_deadline
+        ):
+            return
+        request_store.update(
+            self.reference,
+            state="failed",
+            detail="submission_unconfirmed",
+            completed_at=time.time(),
+        )
+        raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
+
+    def _update_stop_deadlines(self, snapshot):
+        """Mark abort or submission reconciliation as uncertain when its grace period ends."""
+        now = time.monotonic()
+        if (
+            self.reconcile_deadline is not None
+            and not snapshot.prompt_found
+            and not self.reconcile_reported
+            and now >= self.reconcile_deadline
+        ):
+            request_store.update(self.reference, state="uncertain", detail="submission_unconfirmed")
+            self.reconcile_reported = True
+        if self.abort_deadline is not None and now >= self.abort_deadline:
+            request_store.update(self.reference, state="uncertain", detail="stop_unconfirmed")
+            self.abort_deadline = None
+            self.abort_sent = False
+            self.next_abort_at = now + 30
+
+    def _report_unconfirmed_reconciliation(self, now):
+        """Record a submission that remains unconfirmed during a polling failure."""
+        if (
+            self.reconcile_deadline is not None
+            and not self.reconcile_reported
+            and now >= self.reconcile_deadline
+        ):
+            request_store.update(self.reference, state="uncertain", detail="submission_unconfirmed")
+            self.reconcile_reported = True
+
+    def _report_progress(self, snapshot, progress, api_responding=True):
+        """Send throttled stage, heartbeat, and observed-cost updates."""
+        correlated = snapshot.correlated_messages
+        now = time.monotonic()
+        permission_signature = _permission_signature(snapshot.pending_permissions)
+        observed_cost = cost_reporting.format_observed_cost(correlated)
+        stage_pending = self.current_stage is not None and self.current_stage != self.reported_stage
+        cost_pending = observed_cost is not None and observed_cost != self.reported_cost
+        permission_pending = permission_signature != self.reported_permission_signature
+        interval_elapsed = now - self.last_progress_at
+        heartbeat_due = interval_elapsed >= OPENCODE_PROGRESS_INTERVAL_SECONDS
+        first_update = (
+            self.reported_stage is None
+            and self.reported_cost is None
+            and not self.reported_permission_signature
+        )
+        change_due = (stage_pending or cost_pending or permission_pending) and (
+            first_update or interval_elapsed >= _PROGRESS_EVENT_MIN_INTERVAL_SECONDS
+        )
+        response_finishing = api_responding and (
+            correlated
+            and _assistant_response_complete(correlated[-1])
+            and not snapshot.busy
+        )
+        if not (change_due or heartbeat_due) or response_finishing:
+            return
+
+        elapsed = int(now - self.monitor_started_at)
+        activity_age = int(now - self.last_opencode_activity_at)
+        api_age = int(now - self.last_api_success_at)
+        if snapshot.pending_permissions:
+            count = len(snapshot.pending_permissions)
+            permission_label = "permission" if count == 1 else "permissions"
+            text = f"OpenCode is waiting for {count} {permission_label} ({elapsed}s elapsed)."
+        else:
+            text = f"{self.current_stage or 'OpenCode is working on your request'} ({elapsed}s elapsed)."
+        api_heartbeat = (
+            f"API heartbeat: {api_age}s ago"
+            if api_responding
+            else f"API last responded: {api_age}s ago"
+        )
+        text = f"{text}\nOpenCode activity: {activity_age}s ago; {api_heartbeat}."
+        cost_line = observed_cost or self.reported_cost
+        if cost_line:
+            text = f"{text}\n{cost_line}"
+        progress(text)
+        self.reported_stage = self.current_stage
+        if observed_cost is not None:
+            self.reported_cost = observed_cost
+        self.reported_permission_signature = permission_signature
+        self.last_progress_at = time.monotonic()
+
+
+def _monitor_async_request(session_id, prompt_message_id, reference, set_phase, progress, started_at):
+    """Monitor one submitted prompt until it completes or OpenCode confirms it stopped."""
+    monitor = _AsyncRequestMonitor(session_id, prompt_message_id, reference, started_at)
+    return monitor.run(set_phase, progress)
+
+
+def _format_async_result(session_id, correlated, previous_ids, reference):
+    response = correlated[-1] if correlated else None
+    if response is None:
+        raise RuntimeError("OpenCode completed without a correlated assistant response")
+
+    new_messages = []
+    if previous_ids is not None:
+        try:
+            new_messages = _new_assistant_messages(
+                opencode_api.session_tree_messages(session_id),
+                previous_ids,
+            )
+        except Exception as error:
+            print(
+                f"opencode_history_read_failed ref={reference} phase=after error_type={type(error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+    if not new_messages:
+        new_messages = [{"message": message} for message in correlated]
+
+    _record_exchange_diagnostics(new_messages, response)
+    text = opencode_api.text_from_response(response)
+    cost_footer = (
+        "\n\nCost: unavailable"
+        if previous_ids is None
+        else cost_reporting.format_exchange_footer([entry["message"] for entry in new_messages])
+    )
+    return (
+        f"{text}{cost_footer}\n\n{_format_tool_usage(_tool_names(new_messages))}"
+        f"\nTool calls: {_tool_call_count(new_messages)}"
     )
 
 
@@ -229,121 +1019,510 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
     request_body = {"system": SYSTEM, "parts": [{"type": "text", "text": prompt}]}
     _model_options(request_body)
     prompt_message_id = f"msg_{uuid.uuid4().hex}"
-    stop_events = threading.Event()
-    event_queue = queue.Queue(maxsize=128)
-    event_thread = threading.Thread(
-        target=_watch_events,
-        args=(session_id, reference, event_queue, stop_events),
-        name=f"opencode-events-{reference}",
-        daemon=True,
+    started_at = time.time()
+    # Persist correlation before submission so recovery monitors instead of replaying the prompt.
+    submission = request_store.update_if_state(
+        reference,
+        ("queued", "recovering", "uncertain", "submitting"),
+        state="submitting",
+        session_id=session_id,
+        prompt_message_id=prompt_message_id,
+        started_at=started_at,
+        detail=None,
     )
-    event_thread.start()
-
-    deadline = time.monotonic() + OPENCODE_HTTP_TIMEOUT_SECONDS
+    if submission is not None and submission["state"] != "submitting":
+        raise OpenCodeRequestStopped("user_cancelled")
+    set_phase("prompt_submit")
     try:
-        set_phase("prompt_submit")
+        current = request_store.get(reference)
+        if current is not None and current["state"] == "cancellation_requested":
+            raise OpenCodeRequestStopped("user_cancelled")
         opencode_api.submit_async(
             session_id,
             prompt_message_id,
             request_body,
-            OPENCODE_HTTP_TIMEOUT_SECONDS,
+            OPENCODE_STATUS_TIMEOUT_SECONDS,
         )
+        request_store.update_if_state(reference, ("submitting",), state="running", detail=None)
+    except Exception:
+        current = request_store.get(reference)
+        if current is None or current["state"] != "cancellation_requested":
+            request_store.update(reference, state="uncertain", detail="submission_unconfirmed")
+        raise
 
-        set_phase("response_wait")
-        idle_samples = 0
-        last_progress = None
-        last_progress_at = time.monotonic()
-        response_messages = []
-        while True:
-            bridge_runtime.check_shutdown()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise OpenCodeRequestTimeout("OpenCode response deadline exceeded")
+    correlated = _monitor_async_request(
+        session_id,
+        prompt_message_id,
+        reference,
+        set_phase,
+        progress,
+        started_at,
+    )
+    set_phase("history_after")
+    return _format_async_result(session_id, correlated, previous_ids, reference)
 
-            timeout = min(OPENCODE_STATUS_TIMEOUT_SECONDS, remaining)
-            statuses = opencode_api.session_status(timeout)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise OpenCodeRequestTimeout("OpenCode response deadline exceeded")
 
-            busy = _session_is_busy(statuses.get(session_id))
-            idle_samples = 0 if busy else idle_samples + 1
-            history_timeout = min(OPENCODE_STATUS_TIMEOUT_SECONDS, remaining)
-            response_messages = opencode_api.session_messages(session_id, timeout=history_timeout)
-            if time.monotonic() >= deadline:
-                raise OpenCodeRequestTimeout("OpenCode response deadline exceeded")
-            correlated = opencode_api.assistant_messages_for_prompt(response_messages, prompt_message_id)
-            for message in correlated:
-                opencode_api.raise_response_error(message)
-            assistant_ids = {
-                message.get("info", {}).get("id")
-                for message in correlated
-                if message.get("info", {}).get("id")
-            }
-            stage = None
-            while True:
-                try:
-                    event_message_id, part_type = event_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if event_message_id not in assistant_ids:
-                    continue
-                event_stage = {
-                    "reasoning": "OpenCode is thinking…",
-                    "tool": "OpenCode is working with a tool…",
-                }.get(part_type)
-                if event_stage:
-                    stage = event_stage
+def resume_async_request(request, set_phase, progress):
+    """Resume monitoring a submitted OpenCode prompt without resubmitting it."""
+    session_id = request.get("session_id")
+    prompt_message_id = request.get("prompt_message_id")
+    reference = request["reference"]
+    started_at = request.get("started_at") or request["created_at"]
+    if not session_id or not prompt_message_id:
+        request_store.update(
+            reference,
+            state="failed",
+            detail="submission_unconfirmed",
+            completed_at=time.time(),
+        )
+        raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
 
-            if (
-                correlated
-                and _assistant_response_complete(correlated[-1])
-                and not busy
-                and idle_samples >= 2
-            ):
-                break
-            now = time.monotonic()
-            if (
-                (stage and last_progress is None)
-                or now - last_progress_at >= OPENCODE_PROGRESS_INTERVAL_SECONDS
-            ):
-                elapsed = int(now - (deadline - OPENCODE_HTTP_TIMEOUT_SECONDS))
-                text = stage or "Still waiting for OpenCode"
-                if last_progress is not None or stage is None:
-                    text = f"{text} ({elapsed}s elapsed)."
-                progress(text)
-                last_progress = stage or "waiting"
-                last_progress_at = time.monotonic()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise OpenCodeRequestTimeout("OpenCode response deadline exceeded")
-            bridge_runtime.wait(min(1, max(0, remaining)))
+    set_phase("recovery_check")
+    try:
+        statuses = opencode_api.session_status(OPENCODE_STATUS_TIMEOUT_SECONDS)
+        messages = opencode_api.session_messages(
+            session_id,
+            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        if not _retryable_status_error(error):
+            request_store.update(reference, state="uncertain", detail="recovery_unavailable")
+            raise
+        statuses = None
+        messages = None
 
-        set_phase("history_after")
-        new_messages = []
-        if previous_ids is not None:
-            try:
-                new_messages = _new_assistant_messages(
-                    opencode_api.session_tree_messages(session_id),
-                    previous_ids,
-                )
-            except Exception as error:
-                print(
-                    f"opencode_history_read_failed ref={reference} phase=after error_type={type(error).__name__}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+    prompt_found = messages is not None and any(
+        isinstance(message, dict)
+        and isinstance(message.get("info"), dict)
+        and message["info"].get("id") == prompt_message_id
+        and message["info"].get("role") == "user"
+        for message in messages
+    )
+    busy = statuses is None or _session_is_busy(statuses.get(session_id))
+    if not prompt_found and not busy:
+        request_store.update(reference, state="failed", detail="submission_unconfirmed", completed_at=time.time())
+        raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
 
-        response = correlated[-1] if correlated else None
-        if response is None:
-            raise RuntimeError("OpenCode completed without a correlated assistant response")
-        _record_exchange_diagnostics(new_messages, response)
-        text = opencode_api.text_from_response(response)
-        if previous_ids is None:
-            return text + "\n\nCost: unavailable"
-        return text + cost_reporting.format_exchange_footer([entry["message"] for entry in new_messages])
-    finally:
-        stop_events.set()
+    if not (request["state"] == "recovering" and request.get("detail") == "user_cancelled"):
+        request_store.update(reference, state="running", detail=None)
+    correlated = _monitor_async_request(
+        session_id,
+        prompt_message_id,
+        reference,
+        set_phase,
+        progress,
+        started_at,
+    )
+    set_phase("history_after")
+    return _format_async_result(session_id, correlated, None, reference)
+
+
+def _control_reference(prompt, command):
+    words = prompt.split()
+    if len(words) == 1:
+        return None
+    if len(words) != 2 or not re.fullmatch(r"[A-Fa-f0-9]{16}", words[1]):
+        raise ValueError(f"Usage: {command} [request-reference]")
+    return words[1].upper()
+
+
+def _permission_selection(prompt, command):
+    """Parse a short permission command; request IDs stay inside the bridge."""
+    letter = None
+    response = "reject" if command == "/deny" else "always" if command == "/allowall" else "once"
+    for argument in prompt.split()[1:]:
+        normalized = argument.lower()
+        if len(normalized) == 1 and "a" <= normalized <= "z" and letter is None:
+            letter = normalized.upper()
+        elif command == "/allow" and normalized == "always":
+            response = normalized
+        else:
+            usage = {
+                "/allow": "Usage: /allow [letter] [always]",
+                "/allowall": "Usage: /allowAll <letter>",
+                "/deny": "Usage: /deny [letter]",
+            }.get(command, "Invalid permission command")
+            raise ValueError(f"Usage: {usage}")
+    return letter, response
+
+
+def permission_reply_response(chat_id, prompt, command, reference=None):
+    """Apply an explicit Telegram permission command to the active request."""
+    letter, decision = _permission_selection(prompt, command)
+    if reference is None:
+        active = request_store.active_for_chat(chat_id)
+        if not active:
+            return "No active request has a pending permission."
+        if len(active) != 1:
+            return "Multiple active requests found; use the remote TUI to manage permissions."
+        reference = active[0]["reference"]
+    return _respond_to_permission(chat_id, reference, letter, decision)
+
+
+def _respond_to_permission(chat_id, reference, letter, decision, expected_permission_id=None):
+    """Revalidate a displayed permission before applying a human decision."""
+    request = request_store.get_for_chat(reference, chat_id)
+    if request is None or request["state"] not in request_store.ACTIVE_STATES:
+        return "No active request has a pending permission."
+    if request["state"] == "cancellation_requested":
+        return "The active request is stopping; no permission will be granted."
+    session_id = request.get("session_id")
+    if not session_id:
+        return "The active request has not reached OpenCode yet."
+
+    try:
+        pending_requests = opencode_api.pending_permissions(timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+    except Exception as error:
+        print(
+            f"permission_lookup_failed ref={reference} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return "Could not check pending permissions. Use the remote TUI or /cancel."
+    known_sessions = {session_id}
+    unrelated_sessions = set()
+    try:
+        pending = _permissions_in_session_tree(
+            session_id,
+            pending_requests,
+            known_sessions,
+            unrelated_sessions,
+        )
+    except Exception as error:
+        print(
+            f"permission_session_lookup_failed ref={reference} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return "Could not verify which task owns that permission. Use the remote TUI."
+    if not pending:
+        return "No pending permission for the active request."
+    presentation = _request_presentation_for_request(request)
+    if presentation is not None:
+        presentation.sync_permissions(pending)
+    if expected_permission_id is not None:
+        selected_permission = next(
+            (permission for permission in pending if permission.get("id") == expected_permission_id),
+            None,
+        )
+        if selected_permission is None:
+            return f"Permission {letter or ''} is no longer pending. Use /status to refresh the request."
+        alias = None
+        if presentation is not None:
+            alias = next(
+                (
+                    current_letter
+                    for current_letter, permission in presentation.permissions_by_letter().items()
+                    if permission.get("id") == expected_permission_id
+                ),
+                None,
+            )
+        if letter is not None and alias != letter:
+            return f"Permission {letter} changed. Use the current request card to decide."
+        letter = alias or letter
+    elif letter is None:
+        if len(pending) != 1:
+            return "Multiple permissions are pending; use the letter shown beside each request."
+        selected_permission = pending[0]
+        aliases = presentation.permissions_by_letter() if presentation is not None else {}
+        letter = next(
+            (
+                alias
+                for alias, permission in aliases.items()
+                if permission.get("id") == selected_permission.get("id")
+            ),
+            "A",
+        )
+    else:
+        selected_permission = presentation.permission_for_letter(letter) if presentation is not None else None
+        if selected_permission is None:
+            return f"Permission {letter} is no longer pending. Use /status to refresh the request."
+        if not any(item.get("id") == selected_permission.get("id") for item in pending):
+            return f"Permission {letter} is no longer pending. Use /status to refresh the request."
+    if decision == "always":
+        always_patterns = selected_permission.get("always")
+        if not isinstance(always_patterns, list) or not always_patterns:
+            return f"Permission {letter} cannot be remembered; use /allow {letter} for a one-time approval."
+    permission_id = selected_permission.get("id")
+    if not isinstance(permission_id, str):
+        return "The pending permission is invalid; use the remote TUI or /cancel."
+    try:
+        confirmed = opencode_api.respond_to_permission(
+            selected_permission["sessionID"],
+            permission_id,
+            decision,
+            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        print(
+            f"permission_reply_failed ref={reference} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return "Could not send that permission decision. Use the remote TUI or /cancel."
+    if not confirmed:
+        return "OpenCode did not confirm the permission decision. Use the remote TUI or /cancel."
+    if presentation is not None:
+        presentation.resolve_permission(permission_id)
+    if decision == "reject":
+        response_text = f"Permission {letter} denied. OpenCode can handle the rejection."
+    elif decision == "always":
+        response_text = f"Permission {letter} allowed and remembered for matching requests."
+    else:
+        response_text = f"Permission {letter} allowed once. OpenCode can continue."
+    return response_text
+
+
+def _request_status_text(state):
+    return {
+        "acknowledging": "being acknowledged",
+        "queued": "queued and waiting to start",
+        "submitting": "submission is being verified",
+        "running": "running in OpenCode",
+        "cancellation_requested": "stopping; cancellation is being verified",
+        "recovering": "being recovered after a bridge restart",
+        "uncertain": "may still be running; check before retrying",
+        "delivering": "finished; reply delivery is being finalized",
+        "completed": "completed",
+        "failed": "failed",
+        "timed_out": "timed out and stopped",
+        "cancelled": "cancelled",
+        "rejected": "not started because another request was active",
+        "interrupted": "interrupted before it was submitted to OpenCode",
+        "acknowledgement_unknown": "not started; acknowledgement delivery could not be confirmed",
+        "delivery_unknown": "finished, but reply delivery could not be confirmed",
+    }.get(state, "status unavailable")
+
+
+def _format_elapsed(seconds):
+    remaining = max(0, int(seconds))
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, seconds = divmod(remaining, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def _response_tools(response):
+    for line in reversed(response.splitlines()):
+        if line.startswith("Tools used:"):
+            names = line.split(":", 1)[1].strip()
+            return [] if names == "none" else [name.strip() for name in names.split(",") if name.strip()]
+    return None
+
+
+def _response_cost(response):
+    for line in reversed(response.splitlines()):
+        if line.startswith("Cost:"):
+            return line.split(":", 1)[1].strip()
+    return "unavailable"
+
+
+def _response_tool_call_count(response):
+    for line in reversed(response.splitlines()):
+        if line.startswith("Tool calls:"):
+            count = line.split(":", 1)[1].strip()
+            return count if count.isdecimal() else "unknown"
+    return "unknown"
+
+
+def _request_record(reference, chat_id, acknowledgement_id):
+    return request_store.get(reference) or {
+        "reference": reference,
+        "chat_id": chat_id,
+        "acknowledgement_id": acknowledgement_id,
+        "created_at": time.time(),
+    }
+
+
+def _terminal_request_summary(request, state, response=None, error=None):
+    if response is not None:
+        cost_label = f"Final cost: {_response_cost(response)}"
+        tool_names = _response_tools(response)
+        if tool_names is None:
+            tool_names = []
+        tool_call_count = _response_tool_call_count(response)
+        if tool_call_count == "unknown":
+            tool_call_count = 0
+    else:
+        presentation = _request_presentation(request["reference"])
+        observed_cost = presentation.observed_cost if presentation is not None else None
+        cost_label = f"Observed cost: {observed_cost}" if observed_cost else "Final cost: unavailable"
+        if isinstance(error, OpenCodeSubmissionUnconfirmed):
+            tool_names = []
+            tool_call_count = 0
+        else:
+            tool_names = getattr(error, "tool_names", None)
+            tool_call_count = getattr(error, "tool_call_count", "unknown")
+    tool_count = len(tool_names) if tool_names is not None else "unknown"
+    elapsed = time.time() - request.get("created_at", time.time())
+    return "\n".join(
+        (
+            f"Request {request['reference']}",
+            f"Status: {_request_status_text(state)}",
+            cost_label,
+            f"Duration: {_format_elapsed(elapsed)}",
+            f"Tools used: {tool_count} distinct; {tool_call_count} calls",
+        )
+    )
+
+
+def _finalize_request_presentation(request, state, response=None, error=None):
+    summary = _terminal_request_summary(request, state, response, error)
+    presentation = _request_presentation_for_request(request)
+    if presentation is None:
+        edit_reply(
+            request["chat_id"],
+            request.get("acknowledgement_id"),
+            summary,
+            reply_markup={"inline_keyboard": []},
+        )
+        return
+    presentation.finish(summary)
+    _edit_request_presentation(presentation)
+
+
+def _append_request_status(chat_id, reference, text):
+    request = request_store.get_for_chat(reference, chat_id)
+    if request is None:
+        return False
+    presentation = _request_presentation_for_request(request)
+    if presentation is None:
+        return False
+    with presentation.lock:
+        if presentation.final_text is not None:
+            return False
+    presentation.append_status(text)
+    _edit_request_presentation(presentation)
+    return True
+
+
+def _show_request_status(chat_id, reference=None):
+    response = request_status_response(chat_id, reference)
+    if reference is None:
+        active = request_store.active_for_chat(chat_id)
+        reference = active[0]["reference"] if active else None
+    if reference is not None and _append_request_status(chat_id, reference, response):
+        return True
+    send(chat_id, response)
+    return False
+
+
+def _record_control_result(chat_id, reference, response):
+    request = request_store.get_for_chat(reference, chat_id) if reference else None
+    if request is None:
+        send(chat_id, response)
+        return
+    if request["state"] in request_store.TERMINAL_STATES:
+        presentation = _request_presentation_for_request(request)
+        if request["state"] == "cancelled" and presentation is not None and presentation.final_text is None:
+            error = OpenCodeRequestStopped("user_cancelled")
+            _finalize_request_presentation(request, request["state"], error=error)
+            _forget_request_presentation(reference)
+        else:
+            send(chat_id, response)
+        return
+    if not _append_request_status(chat_id, reference, response):
+        send(chat_id, response)
+
+
+def request_status_response(chat_id, reference=None):
+    if reference is None:
+        active = request_store.active_for_chat(chat_id)
+        if active:
+            request = active[0]
+        else:
+            return "No active request. Use /status <reference> to inspect a previous request."
+    else:
+        request = request_store.get_for_chat(reference, chat_id)
+        if request is None:
+            return "No request with that reference was found for this chat."
+    return f"Request {request['reference']}: {_request_status_text(request['state'])}."
+
+
+def cancel_request_response(chat_id, reference=None):
+    if reference is None:
+        active = request_store.active_for_chat(chat_id)
+        if not active:
+            return "No active request to cancel."
+        if len(active) > 1:
+            return "Multiple requests are active. Use /cancel <reference> to choose one."
+        request = active[0]
+        reference = request["reference"]
+    else:
+        request = request_store.get_for_chat(reference, chat_id)
+        if request is None:
+            return "No request with that reference was found for this chat."
+    if request["state"] not in request_store.ACTIVE_STATES:
+        return f"Request {reference}: {_request_status_text(request['state'])}; it is not active."
+    if request["state"] in ("acknowledging", "queued"):
+        cancelled = request_store.update_if_state(
+            reference,
+            ("acknowledging", "queued"),
+            state="cancelled",
+            detail="cancelled_before_submission",
+            completed_at=time.time(),
+        )
+        if cancelled is not None and cancelled["state"] == "cancelled":
+            return f"Request {reference} was cancelled before it started."
+        request = cancelled
+        if request is None or request["state"] not in request_store.ACTIVE_STATES:
+            return f"Request {reference} is no longer active. Use /status {reference}."
+
+    cancellable_states = {
+        "submitting",
+        "running",
+        "cancellation_requested",
+        "recovering",
+        "uncertain",
+    }
+    if request["state"] not in cancellable_states:
+        return f"Request {reference} is finishing. Use /status {reference} to check its result."
+    requested = request_store.update_if_state(
+        reference,
+        (request["state"],),
+        state="cancellation_requested",
+        detail="user_cancelled",
+    )
+    if requested is None:
+        return f"No request with that reference was found for this chat."
+    if requested["state"] != "cancellation_requested":
+        return f"Request {reference}: {_request_status_text(requested['state'])}."
+    request = requested
+    session_id = request.get("session_id")
+    prompt_message_id = request.get("prompt_message_id")
+    if not session_id or not prompt_message_id:
+        return f"Cancellation recorded for {reference}. OpenCode has not confirmed the stop yet; use /status."
+    try:
+        messages = opencode_api.session_messages(
+            session_id,
+            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        if not any(
+            isinstance(message, dict)
+            and isinstance(message.get("info"), dict)
+            and message["info"].get("id") == prompt_message_id
+            and message["info"].get("role") == "user"
+            for message in messages
+        ):
+            return f"Cancellation recorded for {reference}; OpenCode has not confirmed submission yet. Use /status."
+        aborted = opencode_api.abort_session(
+            session_id,
+            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return f"Request {reference}: cancellation could not be confirmed. It may still be running; use /status."
+    if aborted:
+        return f"Cancellation requested for {reference}. Use /status {reference} to confirm it has stopped."
+    return f"OpenCode did not confirm cancellation for {reference}. Use /status before retrying."
 
 
 def authorized_response(chat_id, prompt, sessions):
@@ -362,6 +1541,22 @@ def authorized_response(chat_id, prompt, sessions):
         if not session_id:
             return "No OpenCode session or cost data yet."
         return cost_reporting.cost_report(session_id)
+    if command == "/status":
+        try:
+            reference = _control_reference(prompt, command)
+        except ValueError as error:
+            return str(error)
+        return request_status_response(chat_id, reference)
+    if command in ("/cancel", "/abort"):
+        try:
+            reference = _control_reference(prompt, command)
+        except ValueError as error:
+            return str(error)
+        if reference is None:
+            return cancel_request_response(chat_id)
+        return cancel_request_response(chat_id, reference)
+    if command in ("/allow", "/allowall", "/deny"):
+        return permission_reply_response(chat_id, prompt, command)
     if command is not None:
         return "Unknown command. Use /help to list the available commands."
     return answer(chat_id, prompt, sessions)
@@ -386,6 +1581,12 @@ def help_response():
             "/new — start a new session; the previous session is kept",
             "/health — check bridge, OpenCode API, session, and optional provider reachability",
             "/cost — show cost and usage for this chat's current session",
+            "/status [reference] — inspect the active or a previous request",
+            "/abort — stop the active request; alias for /cancel",
+            "/cancel [reference] — stop the active request or one identified by reference",
+            "/allow [letter] — approve that permission once (default when one is pending)",
+            "/allowAll <letter> — remember an eligible permission rule",
+            "/deny [letter] — reject that permission",
         )
     )
 
@@ -442,18 +1643,23 @@ def health_response(chat_id, sessions):
     return "\n".join(lines)
 
 
-def send(chat_id, text):
+def send(chat_id, text, reply_markup=None):
     result = None
     for message in markdown_renderer.render_markdown(text):
         payload = {"chat_id": chat_id, "text": message.html, "parse_mode": "HTML"}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         try:
             result = http_api.telegram("sendMessage", payload)
         except http_api.TelegramFormattingError:
-            result = http_api.telegram("sendMessage", {"chat_id": chat_id, "text": message.plain})
+            fallback = {"chat_id": chat_id, "text": message.plain}
+            if reply_markup is not None:
+                fallback["reply_markup"] = reply_markup
+            result = http_api.telegram("sendMessage", fallback)
     return result
 
 
-def edit_reply(chat_id, message_id, text):
+def edit_reply(chat_id, message_id, text, reply_markup=None):
     chunks = markdown_renderer.render_markdown(text)
     if not chunks:
         chunks = markdown_renderer.render_markdown(" ")
@@ -464,13 +1670,15 @@ def edit_reply(chat_id, message_id, text):
         "text": first.html,
         "parse_mode": "HTML",
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         http_api.telegram("editMessageText", payload)
     except http_api.TelegramFormattingError:
-        http_api.telegram(
-            "editMessageText",
-            {"chat_id": chat_id, "message_id": message_id, "text": first.plain},
-        )
+        fallback = {"chat_id": chat_id, "message_id": message_id, "text": first.plain}
+        if reply_markup is not None:
+            fallback["reply_markup"] = reply_markup
+        http_api.telegram("editMessageText", fallback)
     for chunk in chunks[1:]:
         try:
             http_api.telegram(
@@ -483,7 +1691,7 @@ def edit_reply(chat_id, message_id, text):
 
 def _safe_error_detail(error):
     if isinstance(error, OpenCodeRequestTimeout):
-        return f"deadline_exceeded_s={OPENCODE_HTTP_TIMEOUT_SECONDS}"
+        return f"deadline_exceeded_s={OPENCODE_REQUEST_MAX_DURATION_SECONDS}"
     if isinstance(error, http_api.OpenCodeHTTPError):
         details = [f"http_status={error.status}"]
         for key, value in (("error_name", error.error_name), ("error_code", error.error_code)):
@@ -584,7 +1792,7 @@ def _log_request_error(reference, update_id, phase, started, error):
     timeout = (
         TELEGRAM_HTTP_TIMEOUT_SECONDS
         if client == "telegram"
-        else OPENCODE_HTTP_TIMEOUT_SECONDS
+        else OPENCODE_REQUEST_MAX_DURATION_SECONDS
         if client == "opencode"
         else None
     )
@@ -605,7 +1813,7 @@ def _log_request_error(reference, update_id, phase, started, error):
     )
 
 
-def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledgement_id):
+def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledgement_id, resume=False):
     """Run a queued request and update its Telegram acknowledgement with progress or a result."""
     started = time.monotonic()
     state = {"phase": "response"}
@@ -618,7 +1826,12 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
     def progress(text):
         set_phase("telegram_progress_edit")
         try:
-            edit_reply(chat_id, acknowledgement_id, f"{text}\n\nRef: {reference}")
+            presentation = _request_presentation(reference, chat_id, acknowledgement_id)
+            if presentation is None:
+                edit_reply(chat_id, acknowledgement_id, f"{text}\n\nRef: {reference}")
+            else:
+                presentation.set_progress(text)
+                _edit_request_presentation(presentation)
         except Exception as error:
             _log_request_error(reference, update_id, state["phase"], started, error)
         finally:
@@ -627,8 +1840,14 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
     try:
         with lock:
             bridge_runtime.check_shutdown()
-            command = _command_name(prompt)
-            if command is not None:
+            stored = request_store.get(reference)
+            if stored is not None and stored["state"] == "cancelled":
+                return
+            command = _command_name(prompt) if prompt is not None else None
+            if resume:
+                set_phase("recovery_check")
+                response = resume_async_request(stored, set_phase, progress)
+            elif command is not None:
                 if command == "/new":
                     set_phase("session_create")
                 elif command in ("/cost", "/health"):
@@ -639,8 +1858,15 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
             else:
                 set_phase("opencode_request")
                 response = answer_async(chat_id, prompt, sessions, reference, set_phase, progress)
-            set_phase("telegram_final_edit")
-            edit_reply(chat_id, acknowledgement_id, response)
+            response = f"{response.rstrip()}\n\nRef: {reference}"
+            request_store.update(reference, state="delivering", detail="completed")
+            set_phase("telegram_final_send")
+            send(chat_id, response)
+            request_store.update(reference, state="completed", detail=None, completed_at=time.time())
+            completed = _request_record(reference, chat_id, acknowledgement_id)
+            set_phase("telegram_terminal_summary_edit")
+            _finalize_request_presentation(completed, "completed", response=response)
+            _forget_request_presentation(reference)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         print(
             f"request_completed ref={reference} update_id={update_id} elapsed_ms={elapsed_ms}",
@@ -657,10 +1883,53 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
     except Exception as error:
         failed_phase = state["phase"]
         _log_request_error(reference, update_id, state["phase"], started, error)
+        stored = request_store.get(reference)
         if failed_phase.startswith("telegram_"):
+            if stored is not None and stored["state"] == "delivering":
+                request_store.update(
+                    reference,
+                    state="delivery_unknown",
+                    detail=stored.get("detail"),
+                    completed_at=time.time(),
+                )
+                _finalize_request_presentation(
+                    _request_record(reference, chat_id, acknowledgement_id),
+                    "delivery_unknown",
+                    response=response if "response" in locals() else None,
+                )
+                _forget_request_presentation(reference)
+            elif stored is not None and stored["state"] in request_store.TERMINAL_STATES:
+                _forget_request_presentation(reference)
             return
-        try:
-            set_phase("telegram_error_edit")
+        if isinstance(error, OpenCodeSubmissionUnconfirmed):
+            terminal_state = "failed"
+            error_text = (
+                f"OpenCode did not confirm request {reference}; it is idle and no matching prompt was found. "
+                "Please check /status before retrying."
+            )
+            request_store.update(reference, state="delivering", detail=terminal_state)
+        elif isinstance(error, OpenCodeRequestStopped):
+            terminal_state = "cancelled" if error.state == "user_cancelled" else "timed_out"
+            limit_seconds = OPENCODE_REQUEST_MAX_DURATION_SECONDS
+            if limit_seconds % 86400 == 0:
+                limit = f"{limit_seconds // 86400}-day limit"
+            elif limit_seconds % 3600 == 0:
+                limit = f"{limit_seconds // 3600}-hour limit"
+            elif limit_seconds % 60 == 0:
+                limit = f"{limit_seconds // 60}-minute limit"
+            else:
+                limit = f"{limit_seconds}-second limit"
+            error_text = (
+                f"Request {reference} was cancelled and OpenCode confirmed it stopped."
+                if terminal_state == "cancelled"
+                else f"Request {reference} reached the configured {limit}; OpenCode confirmed it stopped."
+            )
+            request_store.update(reference, state="delivering", detail=terminal_state)
+        elif stored is not None and stored["state"] == "uncertain":
+            terminal_state = "uncertain"
+            error_text = _opencode_failure_text(error, reference)
+        else:
+            terminal_state = "failed"
             if failed_phase.startswith("opencode") or failed_phase in (
                 "session_lookup",
                 "session_create",
@@ -668,28 +1937,240 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                 "prompt_submit",
                 "response_wait",
                 "history_after",
+                "recovery_check",
             ):
                 error_text = _opencode_failure_text(error, reference)
             else:
                 error_text = f"Request failed. Please share this reference with the operator: {reference}"
-            edit_reply(
-                chat_id,
-                acknowledgement_id,
-                error_text,
+            request_store.update(reference, state="delivering", detail=terminal_state)
+        tool_names = getattr(error, "tool_names", None)
+        if tool_names is not None:
+            error_text = f"{error_text}\n\n{_format_tool_usage(tool_names)}"
+        try:
+            if terminal_state == "uncertain":
+                request_store.update(reference, state="uncertain", detail="stop_unconfirmed")
+                if not _append_request_status(chat_id, reference, error_text):
+                    send(chat_id, error_text)
+                return
+
+            set_phase("telegram_error_send")
+            request_store.update(reference, state="delivering", detail=terminal_state)
+            _finalize_request_presentation(
+                _request_record(reference, chat_id, acknowledgement_id),
+                terminal_state,
+                error=error,
             )
+            request_store.update(
+                reference,
+                state=terminal_state,
+                detail=None,
+                completed_at=time.time(),
+            )
+            send(chat_id, error_text)
+            _forget_request_presentation(reference)
         except Exception as delivery_error:
+            request_store.update(
+                reference,
+                state="delivery_unknown",
+                detail=terminal_state,
+                completed_at=time.time(),
+            )
+            try:
+                _finalize_request_presentation(
+                    _request_record(reference, chat_id, acknowledgement_id),
+                    "delivery_unknown",
+                    error=error,
+                )
+            except Exception as summary_error:
+                _log_request_error(reference, update_id, "telegram_terminal_summary_edit", started, summary_error)
+            _forget_request_presentation(reference)
             _log_request_error(reference, update_id, state["phase"], started, delivery_error)
 
 
 def _request_worker_with_slot(*args):
+    _run_with_slot(_request_worker, *args)
+
+
+def _run_with_slot(function, *args):
     try:
-        _request_worker(*args)
+        function(*args)
     finally:
         _REQUEST_SLOTS.release()
 
 
+def _recovery_notice_worker(chat_id, update_id, reference, acknowledgement_id):
+    try:
+        edit_reply(
+            chat_id,
+            acknowledgement_id,
+            f"Request {reference} was interrupted before OpenCode received it. Please send it again.",
+        )
+    except Exception as error:
+        _log_request_error(
+            reference,
+            update_id,
+            "telegram_error_edit",
+            time.monotonic(),
+            error,
+        )
+
+
+def _recover_pending_requests(sessions):
+    """Recover submitted requests and safely close work that never reached OpenCode."""
+    for request in request_store.active_requests():
+        reference = request["reference"]
+        chat_id = request["chat_id"]
+        state = request["state"]
+        acknowledgement_id = request.get("acknowledgement_id")
+        if state == "acknowledging":
+            request_store.update(
+                reference,
+                state="acknowledgement_unknown",
+                detail="bridge_restarted_during_acknowledgement",
+                completed_at=time.time(),
+            )
+            continue
+        if state == "queued":
+            request_store.update(
+                reference,
+                state="interrupted",
+                detail="bridge_restarted_before_submission",
+                completed_at=time.time(),
+            )
+            if acknowledgement_id is not None and _REQUEST_SLOTS.acquire(blocking=False):
+                try:
+                    _REQUEST_EXECUTOR.submit(
+                        _run_with_slot,
+                        _recovery_notice_worker,
+                        chat_id,
+                        request["update_id"],
+                        reference,
+                        acknowledgement_id,
+                    )
+                except Exception:
+                    _REQUEST_SLOTS.release()
+            continue
+        if state == "delivering":
+            # Telegram may have applied the edit before a crash prevented recording success.
+            request_store.update(
+                reference,
+                state="delivery_unknown",
+                detail=request.get("detail"),
+                completed_at=time.time(),
+            )
+            continue
+        if not request.get("session_id") or not request.get("prompt_message_id"):
+            request_store.update(
+                reference,
+                state="interrupted",
+                detail="submission_unconfirmed",
+                completed_at=time.time(),
+            )
+            continue
+        recovery_detail = request.get("detail") if state == "cancellation_requested" else None
+        request_store.update(reference, state="recovering", detail=recovery_detail)
+        if not _REQUEST_SLOTS.acquire(blocking=False):
+            request_store.update(reference, state="uncertain", detail="recovery_queue_full")
+            continue
+        try:
+            _REQUEST_EXECUTOR.submit(
+                _request_worker_with_slot,
+                chat_id,
+                None,
+                sessions,
+                request["update_id"],
+                reference,
+                acknowledgement_id,
+                True,
+            )
+        except Exception:
+            _REQUEST_SLOTS.release()
+            request_store.update(reference, state="uncertain", detail="recovery_enqueue_failed")
+
+
+def _poll_with_recovery(stop, sessions):
+    _recover_pending_requests(sessions)
+    telegram_polling.poll_updates(stop, handle_update, sessions)
+
+
+def _answer_callback_query(callback_query_id, text=None):
+    if not callback_query_id:
+        return
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text[:180]
+    try:
+        http_api.telegram("answerCallbackQuery", payload)
+    except Exception as error:
+        print(
+            f"telegram_callback_answer_failed error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _handle_callback_update(update):
+    callback = update.get("callback_query")
+    message = callback.get("message") if isinstance(callback, dict) else None
+    chat_id = message.get("chat", {}).get("id") if isinstance(message, dict) else None
+    callback_id = callback.get("id") if isinstance(callback, dict) else None
+    data = callback.get("data") if isinstance(callback, dict) else None
+    if chat_id is None or str(chat_id) not in ALLOWED:
+        _answer_callback_query(callback_id, "This chat is not authorized.")
+        return
+    if not request_store.claim_update(update.get("update_id", "unknown")):
+        _answer_callback_query(callback_id, "This action was already handled.")
+        return
+    if not isinstance(data, str):
+        _answer_callback_query(callback_id, "This action is invalid.")
+        return
+
+    parts = data.split(":")
+    if len(parts) < 2 or not re.fullmatch(r"[A-Fa-f0-9]{16}", parts[1]):
+        _answer_callback_query(callback_id, "This action is invalid.")
+        return
+    reference = parts[1].upper()
+    request = request_store.get_for_chat(reference, chat_id)
+    if request is None:
+        _answer_callback_query(callback_id, "This request is no longer available.")
+        return
+
+    if parts[0] == "status" and len(parts) == 2:
+        _show_request_status(chat_id, reference)
+        _answer_callback_query(callback_id, "Status added to the request message.")
+        return
+    if parts[0] == "abort" and len(parts) == 2:
+        _answer_callback_query(callback_id, "Requesting abort.")
+        response = cancel_request_response(chat_id, reference)
+        _record_control_result(chat_id, reference, response)
+        return
+    if parts[0] == "p" and len(parts) in (4, 5):
+        letter, action = parts[2], parts[3]
+        decisions = {"o": "once", "a": "always", "d": "reject"}
+        if not re.fullmatch(r"[A-Z]", letter) or action not in decisions:
+            _answer_callback_query(callback_id, "This permission action is invalid.")
+            return
+        decision = decisions[action]
+        permission_id = parts[4] if len(parts) == 5 else None
+        _answer_callback_query(callback_id, "Applying permission decision.")
+        response = _respond_to_permission(
+            chat_id,
+            reference,
+            letter,
+            decision,
+            expected_permission_id=permission_id,
+        )
+        _record_control_result(chat_id, reference, response)
+        return
+
+    _answer_callback_query(callback_id, "This action is invalid.")
+
+
 def handle_update(update, sessions):
     """Validate an incoming Telegram update before handing it to the request flow."""
+    if isinstance(update, dict) and isinstance(update.get("callback_query"), dict):
+        _handle_callback_update(update)
+        return
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     prompt = message.get("text", "").strip()
@@ -699,17 +2180,89 @@ def handle_update(update, sessions):
         print(f"Rejected message for chat_id={chat_id}", file=sys.stderr, flush=True)
         return
     update_id = update.get("update_id", "unknown")
+    command = _command_name(prompt)
+    if command in ("/status", "/cancel", "/abort", "/allow", "/allowall", "/deny"):
+        if not request_store.claim_update(update_id):
+            return
+        try:
+            if command == "/status":
+                reference = _control_reference(prompt, command)
+                _show_request_status(chat_id, reference)
+            elif command in ("/cancel", "/abort"):
+                reference = _control_reference(prompt, command)
+                if reference is None:
+                    active = request_store.active_for_chat(chat_id)
+                    target = active[0] if active else None
+                else:
+                    target = request_store.get_for_chat(reference, chat_id)
+                response = cancel_request_response(chat_id, reference)
+                if target is None:
+                    send(chat_id, response)
+                else:
+                    _record_control_result(chat_id, target["reference"], response)
+            else:
+                response = permission_reply_response(chat_id, prompt, command)
+                active = request_store.active_for_chat(chat_id)
+                if len(active) == 1:
+                    _record_control_result(chat_id, active[0]["reference"], response)
+                else:
+                    send(chat_id, response)
+        except ValueError as error:
+            send(chat_id, str(error))
+        except Exception as error:
+            print(
+                f"request_control_failed command={command[1:]} error_type={type(error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+            send(chat_id, "The request control command failed. Use /status to check the request.")
+        return
     _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id)
 
 
 def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
     """Acknowledge an authorized message and queue its background worker."""
-    reference = uuid.uuid4().hex[:8].upper()
+    existing = request_store.get_by_update_id(update_id)
+    if existing is not None:
+        return
+
+    active = request_store.active_for_chat(chat_id)
+    reference = secrets.token_hex(8).upper()
+    if active:
+        request_store.create(
+            reference,
+            chat_id,
+            update_id,
+            state="rejected",
+            detail=f"active:{active[0]['reference']}",
+        )
+        try:
+            send(
+                chat_id,
+                f"This chat already has an active request ({active[0]['reference']}). "
+                "Use the request card or /status and /abort to control it.",
+            )
+        except Exception as error:
+            _log_request_error(active[0]["reference"], update_id, "telegram_acknowledgement", time.monotonic(), error)
+        return
+
+    # Record the update before Telegram I/O so redelivery cannot enqueue it twice.
+    _, created = request_store.create(reference, chat_id, update_id)
+    if not created:
+        return
     started = time.monotonic()
+    presentation = RequestPresentation(chat_id, None, reference)
+    acknowledgement_text, acknowledgement_markup = presentation.edit_payload()
     try:
         # Acknowledge before queuing so users get an immediate response.
-        acknowledgement = send(chat_id, f"Request received. Ref: {reference}")
+        acknowledgement = send(chat_id, acknowledgement_text, reply_markup=acknowledgement_markup)
     except Exception as error:
+        request_store.update(
+            reference,
+            state="acknowledgement_unknown",
+            detail="delivery_unconfirmed",
+            completed_at=time.time(),
+        )
         _log_request_error(reference, update_id, "telegram_acknowledgement", started, error)
         # Telegram may have accepted the send despite a transport timeout. Consume the update
         # rather than retrying it and potentially creating a duplicate acknowledgement.
@@ -717,6 +2270,12 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
 
     acknowledgement_id = acknowledgement.get("message_id") if isinstance(acknowledgement, dict) else None
     if acknowledgement_id is None:
+        request_store.update(
+            reference,
+            state="acknowledgement_unknown",
+            detail="missing_message_id",
+            completed_at=time.time(),
+        )
         print(
             f"request_failed ref={reference} update_id={update_id} client=telegram "
             "phase=telegram_acknowledgement error_type=MissingMessageId detail=redacted",
@@ -724,6 +2283,9 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
             flush=True,
         )
         return
+    presentation.message_id = acknowledgement_id
+    _register_request_presentation(presentation)
+    request_store.update(reference, state="queued", acknowledgement_id=acknowledgement_id)
     print(
         f"request_accepted ref={reference} update_id={update_id}",
         file=sys.stderr,
@@ -731,16 +2293,18 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
     )
     # Bound queued work before submitting to the executor.
     if not _REQUEST_SLOTS.acquire(blocking=False):
+        request_store.update(reference, state="rejected", detail="bridge_queue_full", completed_at=time.time())
         print(
             f"request_rejected ref={reference} update_id={update_id} reason=bridge_queue_full",
             file=sys.stderr,
             flush=True,
         )
         try:
-            edit_reply(
-                chat_id,
-                acknowledgement_id,
-                f"The bridge is busy. Please retry later. Ref: {reference}",
+            request = request_store.get(reference)
+            _finalize_request_presentation(
+                request,
+                "rejected",
+                "The bridge is busy. Please retry later.",
             )
         except Exception as error:
             _log_request_error(reference, update_id, "telegram_error_edit", started, error)
@@ -760,6 +2324,7 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
         raise
     except Exception as error:
         _REQUEST_SLOTS.release()
+        request_store.update(reference, state="failed", detail="enqueue_failed", completed_at=time.time())
         _log_request_error(reference, update_id, "request_enqueue", started, error)
         try:
             edit_reply(
@@ -788,10 +2353,11 @@ def main(stop_event=None):
         polling_lock = http_api.acquire_polling_lock(stop_event)
         if polling_lock is None:
             return
+        request_store.initialize()
         sessions = session_state.load_sessions()
         _log_timeout_configuration()
         bridge_runtime.run_until_stopped(
-            stop_event, telegram_polling.poll_updates, stop_event, handle_update, sessions,
+            stop_event, _poll_with_recovery, stop_event, sessions,
         )
     finally:
         stop_event.set()
@@ -809,7 +2375,7 @@ def main(stop_event=None):
 def _log_timeout_configuration():
     print(
         "HTTP timeouts: "
-        f"OpenCode={OPENCODE_HTTP_TIMEOUT_SECONDS}s "
+        f"OpenCode request max={OPENCODE_REQUEST_MAX_DURATION_SECONDS}s "
         f"(status={OPENCODE_STATUS_TIMEOUT_SECONDS}s, events={OPENCODE_EVENT_TIMEOUT_SECONDS}s); "
         f"Telegram={TELEGRAM_HTTP_TIMEOUT_SECONDS}s "
         f"(getUpdates long poll={TELEGRAM_LONG_POLL_TIMEOUT_SECONDS}s).",

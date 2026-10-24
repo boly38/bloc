@@ -204,6 +204,20 @@ def format_cost(cost):
     return f"${cost:.6f}"
 
 
+def format_observed_cost(messages):
+    """Format the cost already reported for messages in an active exchange."""
+    assistant_infos = [
+        info
+        for entry in messages
+        if (info := _assistant_info(_entry_message(entry))) is not None
+    ]
+    costs = [_valid_cost(info) for info in assistant_infos]
+    observed = [cost for cost in costs if cost is not None]
+    if not observed:
+        return None
+    return f"Cost observed so far: {format_cost(sum(observed))} (partial)"
+
+
 def format_exchange_footer(messages):
     usage = usage_summary(messages)
     if usage["message_count"] == 0 or usage["cost"] is None:

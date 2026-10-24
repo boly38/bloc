@@ -28,15 +28,15 @@ The dependency-free bridge lives in the `bloc_bridge` package under `bot/telegra
 - `bridge.py` orchestrates commands, sessions, and replies.
 - `telegram/` contains polling, Markdown rendering, and the formatting smoke test.
 - `opencode/` contains API helpers and cost reporting.
-- `bridge_config.py`, `bridge_runtime.py`, `http_api.py`, and `session_state.py` provide
-  shared configuration, worker lifecycle, HTTP transport, and persistence.
+- `bridge_config.py`, `bridge_runtime.py`, `http_api.py`, `session_state.py`, and
+  `request_store.py` provide configuration, worker lifecycle, HTTP transport, and persistence.
 
 Use package-relative imports inside the bridge. Docker copies the complete package;
 `make format-test` runs `python -m bloc_bridge.telegram.format_test` in the container.
 
 Start with the PlantUML [bridge overview](docs/diagrams/bloc_bridge-overview.puml) for the
 high-level message flow. The [message lifecycle and shutdown](docs/diagrams/bloc_bridge-exchanges.puml)
-diagram provides the technical details of the asynchronous path.
+diagram shows the technical interactions.
 Open the `.puml` files with a local PlantUML viewer to render them.
 
 ## Manual checks

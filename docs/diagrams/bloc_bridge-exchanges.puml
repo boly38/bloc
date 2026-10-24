@@ -9,14 +9,14 @@ participant "Main thread\nbridge.main + bridge_runtime" as main
 participant "Polling thread\ntelegram.polling + handle_update" as poll
 queue "Request queue" as tasks
 participant "Request worker\nbridge._request_worker" as worker
-database "Session mapping\nsession_state + volume" as state
+database "Session mapping + request metadata\nSQLite and JSON in volume" as state
 participant "OpenCode API\nvia opencode.api" as oc
 participant "Event watcher\nDaemon thread" as events
 participant "Opper API\noptional, no credentials" as opper
 
 note over poll,oc
   Network calls use http_api; Telegram replies use telegram.markdown_renderer.
-  Startup loads the session mapping and acquires an exclusive polling lock.
+  Startup loads the session mapping, acquires the polling lock, and recovers durable requests.
 end note
 main -> poll : Start single daemon poller
 user -> tg : Send message
@@ -26,63 +26,92 @@ tg --> poll : Updates
 alt Empty/non-text message or chat not allowed
     poll -> poll : Ignore update; log rejected chat if applicable
 else Allowed text message
-    poll -> tg : sendMessage("Request received. Ref: ...")
-    tg --> poll : Acknowledgement message_id
-    alt No usable acknowledgement
-        poll -> poll : Log failure; consume update without retrying
-    else Request capacity reached
-        poll -> tg : Edit acknowledgement: bridge busy
-    else Capacity available
-        poll -> tasks : Enqueue request (32 admitted maximum)
-        tasks -> worker : One of 4 daemon workers
-        worker -> worker : Acquire per-chat lock
-        alt Slash command
-            worker -> worker : Route /start, /help or unknown command locally
-            opt /new, /health or /cost
-                worker -> oc : Session creation, health or history API
-                oc --> worker : API result (no model prompt)
-                opt /new
-                    worker -> state : Persist selected session
-                end
-                opt /health and TELEGRAM_HEALTH_OPPER_ENABLED=true
-                    worker -> opper : GET /v3/compat/models (5 s socket timeout)
-                    opper --> worker : Reachability only; no inference
-                end
-            end
-        else Regular prompt
-            opt No session for this chat
-                worker -> oc : POST /session
-                oc --> worker : Session ID
-                worker -> state : Persist chat-to-session mapping
-            end
-            worker -> oc : Read session tree history (cost baseline)
-            worker -> events : Start SSE watcher for this exchange
-            events -> oc : GET /event
-            worker -> oc : POST /session/{id}/prompt_async\nwith generated messageID
-            oc --> worker : Submission accepted
-            loop Until correlated completion and two idle samples, or 300 s deadline
-                worker -> oc : GET /session/status
-                oc --> worker : Busy / retry / idle
-                worker -> oc : GET /session/{id}/message
-                oc --> worker : History; filter assistant chain by parentID
-                opt Correlated reasoning/tool event available
-                    oc --> events : SSE event
-                    events -> worker : Bounded event queue (128)
-                    worker -> worker : Select safe progress stage
-                end
-                opt Assistant error in correlated history
-                    worker -> worker : Fail promptly with sanitized status + reference
-                end
-                opt First progress event or 30 s since last progress
-                    worker -> tg : Edit acknowledgement with safe progress or elapsed wait\nKeep original deadline
-                end
-            end
-            worker -> oc : Read session tree history
-            worker -> worker : Build response + cost footer
-            worker -> events : Set watcher stop event
+    alt /status or /cancel
+        poll -> state : Check request reference and chat ownership
+        opt /cancel for submitted request
+            poll -> oc : POST /session/{id}/abort
+            oc --> poll : Abort accepted / not confirmed
         end
-        worker -> tg : Edit acknowledgement with final response\nSend extra rendered chunks if needed
-        worker -> worker : Release per-chat lock and request slot
+        poll -> tg : Send sanitized status or cancellation feedback
+    else Another request is active in this chat
+        poll -> tg : Refuse new prompt; include active reference and control commands
+    else New request
+        poll -> state : Insert request row keyed by reference and Telegram update_id
+        poll -> tg : sendMessage("Request received. Ref: ...")
+        tg --> poll : Acknowledgement message_id
+        poll -> state : Persist acknowledgement message_id
+        alt No usable acknowledgement
+            poll -> state : Mark acknowledgement delivery unknown; do not submit
+        else Request capacity reached
+            poll -> state : Mark request rejected
+            poll -> tg : Edit acknowledgement: bridge busy
+        else Capacity available
+            poll -> tasks : Enqueue request (32 admitted maximum)
+            tasks -> worker : One of 4 daemon workers
+            worker -> worker : Acquire per-chat lock
+            alt Slash command other than /status or /cancel
+                worker -> worker : Route /start, /help or unknown command locally
+                opt /new, /health or /cost
+                    worker -> oc : Session creation, health or history API
+                    oc --> worker : API result (no model prompt)
+                    opt /new
+                        worker -> state : Persist selected session
+                    end
+                    opt /health and TELEGRAM_HEALTH_OPPER_ENABLED=true
+                        worker -> opper : GET /v3/compat/models (5 s socket timeout)
+                        opper --> worker : Reachability only; no inference
+                    end
+                end
+            else Regular prompt
+                opt No session for this chat
+                    worker -> oc : POST /session
+                    oc --> worker : Session ID
+                    worker -> state : Persist chat-to-session mapping
+                end
+                worker -> oc : Read session tree history (cost baseline)
+                worker -> state : Persist session ID and generated prompt message ID
+                worker -> events : Start SSE watcher for this exchange
+                events -> oc : GET /event
+                worker -> oc : POST /session/{id}/prompt_async
+                oc --> worker : Submission accepted
+                worker -> state : Mark request running
+                loop Until correlated completion and two idle samples, or 5 days maximum
+                    worker -> oc : GET /session/status (10 s HTTP timeout)
+                    oc --> worker : Busy / retry / idle
+                    worker -> oc : GET /session/{id}/message (10 s HTTP timeout)
+                    oc --> worker : History; filter assistant chain by parentID
+                    opt Transient HTTP timeout
+                        worker -> worker : Retry status/history; keep request active
+                    end
+                    opt Correlated reasoning/tool event available
+                        oc --> events : SSE event
+                        events -> worker : Bounded event queue (128)
+                        worker -> worker : Select deterministic safe stage and tool label
+                    end
+                    opt OpenCode has reported correlated usage
+                        worker -> worker : Recompute partial cost from assistant history
+                        worker -> tg : Edit progress with observed cost, controls, and reference
+                    end
+                    opt Assistant error in correlated history outside a stop request
+                        worker -> worker : Fail promptly with sanitized status + reference
+                    end
+                    opt First progress event or 30 s since last progress
+                        worker -> tg : Edit acknowledgement with safe progress
+                    end
+                end
+                opt User cancellation or 5 days limit
+                    worker -> oc : POST /session/{id}/abort
+                    oc --> worker : Abort result
+                    worker -> worker : Keep chat active until OpenCode is confirmed idle
+                end
+                worker -> oc : Read session tree history
+                worker -> worker : Build response + cost and tool-name footers
+                worker -> events : Set watcher stop event
+            end
+            worker -> state : Mark delivery pending
+            worker -> tg : Edit acknowledgement with final response
+            worker -> state : Mark terminal state
+        end
     end
 end
 poll -> poll : Advance offset after handling the update
@@ -94,7 +123,9 @@ note over main,events
   Cooperative checks prevent further work after blocked HTTP calls return.
   Running sockets need not return: polling, request and SSE threads are daemon threads.
   The supervisor joins the polling thread for at most 0.2 s, then main cleans up and exits.
-  Replies and queued work may be lost; OpenCode work already submitted is not cancelled.
+  Queued but unsubmitted work is marked interrupted on restart, never replayed.
+  Submitted work is recovered by session/prompt message IDs and monitored without resubmission.
+  Ambiguous delivery or OpenCode state is exposed through /status; work is never replayed blindly.
 end note
 main -> main : Release polling lock; restore signal handlers; exit
 @enduml
