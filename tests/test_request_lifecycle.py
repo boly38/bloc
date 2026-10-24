@@ -46,3 +46,16 @@ class RequestLifecycleTests(unittest.TestCase):
         request_store.update("D" * 16, state="queued")
         with self.assertRaises(request_store.InvalidTransition):
             request_store.update("D" * 16, state="completed")
+
+    def test_existing_command_and_recovery_paths_are_valid(self):
+        request_store.create("E" * 16, 123, 5)
+        request_store.transition("E" * 16, "queued")
+        request_store.transition("E" * 16, "delivering")
+        request_store.transition("E" * 16, "completed")
+
+        request_store.create("F" * 16, 123, 6)
+        request_store.transition("F" * 16, "queued")
+        request_store.transition("F" * 16, "submitting")
+        request_store.transition("F" * 16, "running")
+        request_store.transition("F" * 16, "recovering")
+        request_store.transition("F" * 16, "failed")
