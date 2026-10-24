@@ -23,8 +23,12 @@ The Telegram commands are:
   data.
 - `/status [reference]` shows the active request, or the state of a request with the given
   reference. A reference can only be inspected from the chat that owns it.
+- `/abort` asks OpenCode to stop the active request; it is an alias for `/cancel`.
 - `/cancel [reference]` asks OpenCode to abort the active request, or the identified request.
   The command reports whether the stop was confirmed; use `/status` to check the final state.
+- `/allow [letter]` approves the matching permission once. `/allowAll <letter>` remembers an
+  eligible rule, and `/deny [letter]` rejects it. The active request card shows the available
+  letter and clickable buttons; no permission is approved automatically.
 
 An unknown slash command returns an error directing you to `/help`; it is not sent to the
 model. Normal messages are still sent to OpenCode. `/health` and `/cost` do not send a
@@ -43,22 +47,23 @@ running; check before retrying. Failures include a reference and, when OpenCode 
 structured error, distinguish provider authentication/access, rate/quota limits, and
 provider service errors.
 
-Progress updates retain the request reference and can be controlled without copying it:
-use `/status` to inspect the active request or `/cancel` to ask OpenCode to stop it.
-Updates show deterministic analysis/tool/test stages and any cost OpenCode has reported so
-far; the cost is partial while the request is running and may be unavailable.
-The final Telegram reply also lists the tool names used, including recognized command-line
-tools such as `gh`; it does not include their arguments or output.
+The initial Telegram acknowledgement remains as a request card. It has status and abort
+buttons while the request is active. `/status` appends a timestamped entry to that card, and
+permission decisions appear there with letter aliases and action buttons. The card shows
+deterministic analysis/tool/test stages, observed partial cost, and time since OpenCode's last
+activity separately from the API heartbeat.
+
+When the request ends, the card is replaced with a terminal summary containing status, cost,
+duration, request reference, distinct tool count, and total tool-call count. The model's final answer is sent as a
+separate Telegram message and lists tool names only, not arguments or output.
 
 OpenCode permission requests for the active request's session tree are forwarded to the
-progress message.
-Use `/allow` to approve once, `/allow always` to remember a matching permission when that
-option is offered, or `/deny` to reject it. Number an argument when multiple permissions are
-pending. No permission is approved automatically. Interactive questions are not yet forwarded
-to Telegram; answer them in the remote TUI or use `/cancel` to stop the active request.
+request card. When several are pending, use the displayed letter in `/allow A`,
+`/allowAll A`, or `/deny A`. Interactive questions are not yet forwarded to Telegram; answer
+them in the remote TUI or use `/abort` to stop the active request.
 
 Only one request at a time is admitted per chat. A new prompt while one is active is refused
-with the active request's reference. Use `/status` or `/cancel` to manage it. References do
+with the active request's reference. Use the card buttons or `/status` and `/abort` to manage it. References do
 not expose OpenCode session IDs or prompt content.
 The final reply retains its reference so the request can still be inspected afterward.
 

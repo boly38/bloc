@@ -350,6 +350,7 @@ class RequestFeedbackTests(unittest.TestCase):
         self.assertIn("API last responded: 60s ago", self.progress[1][1])
 
     def test_monitor_surfaces_pending_permission_with_explicit_commands(self):
+        reference = "FEDCBA9876543210"
         permission = {
             "id": "private-permission-id",
             "sessionID": "private-session",
@@ -358,10 +359,11 @@ class RequestFeedbackTests(unittest.TestCase):
             "always": ["*"],
         }
         self.permissions.return_value = [permission]
+        presentation = bridge._request_presentation(reference, 123, 509)
         monitor = bridge._AsyncRequestMonitor(
             "private-session",
             "msg_prompt",
-            "REF12345",
+            reference,
             bridge.time.time(),
         )
         with patch.object(opencode_api, "session_status", return_value={"private-session": {"type": "busy"}}):
@@ -372,16 +374,16 @@ class RequestFeedbackTests(unittest.TestCase):
             ):
                 with patch.object(opencode_api, "respond_to_permission") as respond:
                     snapshot = monitor._read_snapshot()
-                    progress = []
-                    monitor._report_progress(snapshot, progress.append)
+        monitor._report_progress(snapshot, presentation.set_progress)
+        text, keyboard = presentation.edit_payload()
 
-        self.assertEqual(len(progress), 1)
-        self.assertIn("OpenCode is waiting for permission", progress[0])
-        self.assertIn("/allow to allow once", progress[0])
-        self.assertIn("/allow always", progress[0])
-        self.assertIn("/deny", progress[0])
-        self.assertNotIn("private-permission-id", progress[0])
+        self.assertIn("OpenCode is waiting for 1 permission", text)
+        self.assertIn("/allow A", text)
+        self.assertIn("/allowAll A", text)
+        self.assertIn("/deny A", text)
+        self.assertIn("Always A", [button["text"] for row in keyboard["inline_keyboard"] for button in row])
         respond.assert_not_called()
+        bridge._forget_request_presentation(reference)
 
     def test_correlated_provider_failure_surfaces_before_completion_or_idle(self):
         self.status.return_value = {"private-session": {"type": "busy"}}
@@ -434,9 +436,10 @@ class RequestFeedbackTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch.object(bridge, "answer_async", side_effect=error), \
                      patch.object(bridge, "edit_reply") as edit, \
+                     patch.object(bridge, "send") as send, \
                      patch("sys.stderr", output):
                     bridge._request_worker(123, "private-prompt", {}, 123, "REF12345", 456)
-                reply = edit.call_args.args[2]
+                reply = send.call_args.args[1]
                 self.assertIn(expected, reply)
                 self.assertIn("REF12345", reply)
                 self.assertNotIn("private", reply)
@@ -450,13 +453,14 @@ class RequestFeedbackTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(bridge, "answer_async", side_effect=exchange), \
              patch.object(bridge, "edit_reply") as edit, \
+             patch.object(bridge, "send") as send, \
              patch("sys.stderr", output):
             bridge._request_worker(123, "Hi", {}, 123, "REF12345", 456)
         self.assertEqual(edit.call_count, 2)
         self.assertIn("/status", edit.call_args_list[0].args[2])
-        self.assertIn("/cancel", edit.call_args_list[0].args[2])
+        self.assertIn("/abort", edit.call_args_list[0].args[2])
         self.assertIn("REF12345", edit.call_args_list[0].args[2])
-        self.assertIn("timed out", edit.call_args.args[2])
+        self.assertIn("timed out", send.call_args.args[1])
         self.assertIn("phase=response_wait", output.getvalue())
 
 

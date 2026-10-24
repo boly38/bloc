@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot", "telegram"))
 with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_ALLOWED_CHAT_IDS": "123"}):
-    from bloc_bridge import bridge, request_store
+    from bloc_bridge import bridge, http_api, request_store
     from bloc_bridge.opencode import api as opencode_api
 
 
@@ -100,6 +100,47 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertNotIn("private-session-id", bridge.request_status_response(123, request["reference"]))
         self.assertNotIn("private-prompt-id", bridge.request_status_response(123, request["reference"]))
 
+    def test_status_command_appends_timestamped_update_to_request_card(self):
+        request, _ = request_store.create("C" * 16, 123, 1041, state="running")
+        request_store.update(request["reference"], acknowledgement_id=541)
+        presentation = bridge._request_presentation(request["reference"], 123, 541)
+        presentation.set_progress("Analysis in progress")
+        update = {"update_id": 1042, "message": {"chat": {"id": 123}, "text": "/status"}}
+        with patch.object(bridge, "edit_reply") as edit:
+            with patch.object(bridge, "send") as send:
+                bridge.handle_update(update, {})
+
+        send.assert_not_called()
+        self.assertEqual(edit.call_count, 1)
+        self.assertIn("Status checks:", edit.call_args.args[2])
+        self.assertRegex(edit.call_args.args[2], r"\[\d\d:\d\d:\d\d UTC\] Request .+: running in OpenCode\.")
+        self.assertIn("/status or /abort", edit.call_args.args[2])
+        self.assertEqual(edit.call_args.kwargs["reply_markup"]["inline_keyboard"][0][0]["text"], "Status")
+        bridge._forget_request_presentation(request["reference"])
+
+    def test_status_inline_button_updates_same_request_card(self):
+        request, _ = request_store.create("C" * 16, 123, 1043, state="running")
+        request_store.update(request["reference"], acknowledgement_id=542)
+        bridge._request_presentation(request["reference"], 123, 542)
+        update = {
+            "update_id": 1044,
+            "callback_query": {
+                "id": "callback-status",
+                "data": f"status:{request['reference']}",
+                "message": {"message_id": 542, "chat": {"id": 123}},
+            },
+        }
+        with patch.object(bridge, "edit_reply") as edit:
+            with patch.object(http_api, "telegram") as telegram:
+                bridge.handle_update(update, {})
+
+        self.assertIn("Status checks:", edit.call_args.args[2])
+        telegram.assert_called_once_with(
+            "answerCallbackQuery",
+            {"callback_query_id": "callback-status", "text": "Status added to the request message."},
+        )
+        bridge._forget_request_presentation(request["reference"])
+
     def test_cancel_requests_real_opencode_abort_and_reports_confirmation(self):
         request, _ = request_store.create("D" * 16, 123, 105, state="running")
         request_store.update(
@@ -145,6 +186,42 @@ class TelegramRequestTests(unittest.TestCase):
         )
         self.assertIn(request["reference"], send.call_args.args[1])
         self.assertEqual(request_store.get(request["reference"])["state"], "cancellation_requested")
+
+    def test_permission_inline_button_applies_the_lettered_decision(self):
+        request, _ = request_store.create("B" * 16, 123, 1057, state="running")
+        request_store.update(request["reference"], session_id="active-session", acknowledgement_id=511)
+        permission = {
+            "id": "per1",
+            "sessionID": "active-session",
+            "permission": "webfetch",
+            "patterns": ["https://docs.example.test"],
+        }
+        presentation = bridge._request_presentation(request["reference"], 123, 511)
+        presentation.sync_permissions([permission])
+        update = {
+            "update_id": 1058,
+            "callback_query": {
+                "id": "permission-callback",
+                "data": f"p:{request['reference']}:A:o:per1",
+                "message": {"message_id": 511, "chat": {"id": 123}},
+            },
+        }
+
+        with patch.object(opencode_api, "pending_permissions", return_value=[permission]):
+            with patch.object(opencode_api, "respond_to_permission", return_value=True) as respond:
+                with patch.object(bridge, "edit_reply") as edit:
+                    with patch.object(bridge.http_api, "telegram") as telegram:
+                        bridge.handle_update(update, {})
+
+        respond.assert_called_once_with(
+            "active-session",
+            "per1",
+            "once",
+            timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+        self.assertIn("Permission A allowed once", edit.call_args.args[2])
+        self.assertNotIn("Permissions waiting for a decision", edit.call_args.args[2])
+        self.assertEqual(telegram.call_args.args[0], "answerCallbackQuery")
 
     def test_opencode_abort_uses_session_abort_endpoint(self):
         with patch.object(opencode_api, "http", return_value=True) as request:
@@ -268,7 +345,7 @@ class TelegramRequestTests(unittest.TestCase):
             "reject",
             timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
         )
-        self.assertIn("Permission 1 denied", response)
+        self.assertIn("Permission A denied", response)
 
     def test_permission_reply_includes_descendant_agent_sessions(self):
         request, _ = request_store.create("C" * 16, 123, 1055, state="running")
@@ -369,23 +446,25 @@ class TelegramRequestTests(unittest.TestCase):
         with patch.object(opencode_api, "session_status", return_value={}):
             with patch.object(opencode_api, "session_messages", return_value=[prompt, assistant]):
                 with patch.object(opencode_api, "submit_async") as submit:
-                    with patch.object(bridge, "_watch_events"):
-                        with patch.object(bridge.bridge_runtime, "wait"):
-                            with patch.object(bridge, "edit_reply") as edit:
-                                bridge._request_worker(
-                                    123,
-                                    None,
-                                    {},
-                                    "109",
-                                    request["reference"],
-                                    509,
-                                    True,
-                                )
+                        with patch.object(bridge, "_watch_events"):
+                            with patch.object(bridge.bridge_runtime, "wait"):
+                                with patch.object(bridge, "edit_reply") as edit:
+                                    with patch.object(bridge, "send") as send:
+                                        bridge._request_worker(
+                                            123,
+                                            None,
+                                            {},
+                                            "109",
+                                            request["reference"],
+                                            509,
+                                            True,
+                                        )
 
-        edit.assert_called_once_with(
-            123,
-            509,
-            "Recovered result\n\nCost: unavailable\n\nTools used: none\n\nRef: 2222222222222222",
+        self.assertIn("Status: completed", edit.call_args.args[2])
+        self.assertIn("Final cost: unavailable", edit.call_args.args[2])
+        self.assertEqual(
+            send.call_args.args[1],
+            "Recovered result\n\nCost: unavailable\n\nTools used: none\nTool calls: 0\n\nRef: 2222222222222222",
         )
         self.assertEqual(request_store.get(request["reference"])["state"], "completed")
         submit.assert_not_called()
@@ -395,17 +474,21 @@ class TelegramRequestTests(unittest.TestCase):
         request_store.update(request["reference"], acknowledgement_id=510)
         with patch.object(bridge, "answer_async", return_value="Done\n\nCost: $0.250000"):
             with patch.object(bridge, "edit_reply") as edit:
-                bridge._request_worker(
-                    123,
-                    "Calculate this",
-                    {},
-                    "112",
-                    request["reference"],
-                    510,
-                )
+                with patch.object(bridge, "send") as send:
+                    bridge._request_worker(
+                        123,
+                        "Calculate this",
+                        {},
+                        "112",
+                        request["reference"],
+                        510,
+                    )
 
-        self.assertIn("Cost: $0.250000", edit.call_args.args[2])
+        self.assertIn("Final cost: $0.250000", edit.call_args.args[2])
         self.assertIn(request["reference"], edit.call_args.args[2])
+        self.assertIn("Tools used: 0 distinct; 0 calls", edit.call_args.args[2])
+        self.assertEqual(edit.call_args.kwargs["reply_markup"], {"inline_keyboard": []})
+        self.assertEqual(send.call_args.args[1], f"Done\n\nCost: $0.250000\n\nRef: {request['reference']}")
 
     def test_recovery_does_not_replay_an_unconfirmed_submission(self):
         request, _ = request_store.create("4" * 16, 123, 111, state="running")
@@ -523,19 +606,22 @@ class TelegramRequestTests(unittest.TestCase):
 
         with patch.object(bridge, "answer_async", side_effect=stopped.exception):
             with patch.object(bridge, "edit_reply") as edit:
-                bridge._request_worker(
-                    123,
-                    "Prepare a pull request",
-                    {},
-                    109,
-                    request["reference"],
-                    500,
-                )
+                with patch.object(bridge, "send") as send:
+                    bridge._request_worker(
+                        123,
+                        "Prepare a pull request",
+                        {},
+                        109,
+                        request["reference"],
+                        500,
+                    )
 
         self.assertEqual(request_store.get(request["reference"])["state"], "timed_out")
         self.assertIn("timed out and stopped", bridge.request_status_response(123, request["reference"]))
-        self.assertIn("reached the configured 5-day limit", edit.call_args.args[2])
-        self.assertIn("Tools used: bash, gh", edit.call_args.args[2])
+        self.assertIn("Status: timed out and stopped", edit.call_args.args[2])
+        self.assertIn("Tools used: 2 distinct; 1 calls", edit.call_args.args[2])
+        self.assertIn("reached the configured 5-day limit", send.call_args.args[1])
+        self.assertIn("Tools used: bash, gh", send.call_args.args[1])
 
 
 if __name__ == "__main__":
