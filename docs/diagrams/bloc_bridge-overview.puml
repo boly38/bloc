@@ -20,9 +20,9 @@ else (no)
     if (Other slash command?) then (yes)
       :Handle without calling the model;
     else (no)
-      :Reuse or create this chat's\nOpenCode session;
+      :Reuse or create this chat's\nOpenCode session via opencode.exchange;
       :Persist session and prompt correlation IDs;
-      :Submit once and monitor for up to 5 days;
+      :Submit once and monitor via opencode.exchange\nfor up to 5 days;
       :Retry temporary status/history HTTP timeouts;
       :Report deterministic progress and observed partial cost;
       :Abort on cancellation or maximum duration;

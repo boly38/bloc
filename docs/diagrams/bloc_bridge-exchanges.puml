@@ -9,6 +9,7 @@ participant "Main thread\nbridge.main + bridge_runtime" as main
 participant "Polling thread\ntelegram.polling + handle_update" as poll
 queue "Request queue" as tasks
 participant "Request worker\nbridge._request_worker" as worker
+participant "OpenCode exchange\nopencode.exchange" as exchange
 database "Session mapping + request metadata\nSQLite and JSON in volume" as state
 participant "OpenCode API\nvia opencode.api" as oc
 participant "Event watcher\nDaemon thread" as events
@@ -17,6 +18,10 @@ participant "Opper API\noptional, no credentials" as opper
 note over poll,oc
   Network calls use http_api; Telegram replies use telegram.markdown_renderer.
   Startup loads the session mapping, acquires the polling lock, and recovers durable requests.
+end note
+note over worker,exchange
+  bridge.py routes requests and owns Telegram presentation.
+  opencode.exchange owns OpenCode submission, monitoring, correlation, and recovery.
 end note
 main -> poll : Start single daemon poller
 user -> tg : Send message
@@ -63,50 +68,54 @@ else Allowed text message
                     end
                 end
             else Regular prompt
+                worker -> exchange : Submit or resume exchange
                 opt No session for this chat
-                    worker -> oc : POST /session
-                    oc --> worker : Session ID
-                    worker -> state : Persist chat-to-session mapping
+                    exchange -> oc : POST /session
+                    oc --> exchange : Session ID
+                    exchange -> state : Persist chat-to-session mapping
                 end
-                worker -> oc : Read session tree history (cost baseline)
-                worker -> state : Persist session ID and generated prompt message ID
-                worker -> events : Start SSE watcher for this exchange
+                exchange -> oc : Read session tree history (cost baseline)
+                exchange -> state : Persist session ID and generated prompt message ID
+                exchange -> events : Start SSE watcher for this exchange
                 events -> oc : GET /event
-                worker -> oc : POST /session/{id}/prompt_async
-                oc --> worker : Submission accepted
-                worker -> state : Mark request running
+                exchange -> oc : POST /session/{id}/prompt_async
+                oc --> exchange : Submission accepted
+                exchange -> state : Mark request running
                 loop Until correlated completion and two idle samples, or 5 days maximum
-                    worker -> oc : GET /session/status (10 s HTTP timeout)
-                    oc --> worker : Busy / retry / idle
-                    worker -> oc : GET /session/{id}/message (10 s HTTP timeout)
-                    oc --> worker : History; filter assistant chain by parentID
+                    exchange -> oc : GET /session/status (10 s HTTP timeout)
+                    oc --> exchange : Busy / retry / idle
+                    exchange -> oc : GET /session/{id}/message (10 s HTTP timeout)
+                    oc --> exchange : History; filter assistant chain by parentID
                     opt Transient HTTP timeout
-                        worker -> worker : Retry status/history; keep request active
+                        exchange -> exchange : Retry status/history; keep request active
                     end
                     opt Correlated reasoning/tool event available
                         oc --> events : SSE event
-                        events -> worker : Bounded event queue (128)
-                        worker -> worker : Select deterministic safe stage and tool label
+                        events -> exchange : Bounded event queue (128)
+                        exchange -> exchange : Select deterministic safe stage and tool label
                     end
                     opt OpenCode has reported correlated usage
-                        worker -> worker : Recompute partial cost from assistant history
+                        exchange -> exchange : Recompute partial cost from assistant history
+                        exchange -> worker : Invoke progress callback
                         worker -> tg : Edit progress with observed cost, controls, and reference
                     end
                     opt Assistant error in correlated history outside a stop request
-                        worker -> worker : Fail promptly with sanitized status + reference
+                        exchange -> exchange : Fail promptly with sanitized status + reference
                     end
                     opt First progress event or 30 s since last progress
+                        exchange -> worker : Invoke progress callback
                         worker -> tg : Edit acknowledgement with safe progress
                     end
                 end
                 opt User cancellation or 5 days limit
-                    worker -> oc : POST /session/{id}/abort
-                    oc --> worker : Abort result
-                    worker -> worker : Keep chat active until OpenCode is confirmed idle
+                    exchange -> oc : POST /session/{id}/abort
+                    oc --> exchange : Abort result
+                    exchange -> exchange : Keep chat active until OpenCode is confirmed idle
                 end
-                worker -> oc : Read session tree history
-                worker -> worker : Build response + cost and tool-name footers
-                worker -> events : Set watcher stop event
+                exchange -> oc : Read session tree history
+                exchange -> exchange : Build response + cost and tool-name footers
+                exchange -> events : Set watcher stop event
+                exchange --> worker : Return final response
             end
             worker -> state : Mark delivery pending
             worker -> tg : Edit acknowledgement with final response
