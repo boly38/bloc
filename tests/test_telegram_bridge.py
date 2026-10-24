@@ -126,6 +126,16 @@ class TelegramBridgeTests(unittest.TestCase):
                         },
                         {"type": "tool", "tool": "read", "state": {"status": "completed"}},
                         {"type": "tool", "tool": "read", "state": {"status": "completed"}},
+                        {
+                            "type": "tool",
+                            "tool": "apply_patch",
+                            "state": {"status": "completed", "input": {"patch": "private patch"}},
+                        },
+                        {
+                            "type": "tool",
+                            "tool": "todowrite",
+                            "state": {"status": "completed", "input": {"todos": ["private task"]}},
+                        },
                     ]
                 }
             }
@@ -134,9 +144,15 @@ class TelegramBridgeTests(unittest.TestCase):
         names = bridge._tool_names(messages)
         report = bridge._format_tool_usage(names)
 
-        self.assertEqual(names, ["bash", "gh", "read"])
-        self.assertEqual(report, "Tools used: bash, gh, read")
+        self.assertEqual(names, ["bash", "gh", "read", "apply_patch", "todowrite"])
+        self.assertEqual(report, "Tools used: bash, gh, read, apply_patch, todowrite")
         self.assertNotIn("private command output", report)
+        self.assertNotIn("private patch", report)
+        self.assertNotIn("private task", report)
+
+    def test_tool_progress_has_labels_for_patch_and_todo_tools(self):
+        self.assertEqual(bridge._event_progress_stage("tool", "apply_patch", "running"), "File patch in progress")
+        self.assertEqual(bridge._event_progress_stage("tool", "todowrite", "completed"), "Task tracking complete")
 
     def test_permission_prompt_shows_sanitized_scope_and_explicit_choices(self):
         presentation = RequestPresentation(123, 456, "REF12345")

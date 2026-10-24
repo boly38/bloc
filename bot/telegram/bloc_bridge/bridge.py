@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from . import bridge_runtime, http_api, opper_health, request_store, session_state
-from .opencode import cost_reporting, api as opencode_api, exchange
+from .opencode import cost_reporting, api as opencode_api, exchange, tooling
 from .telegram import markdown_renderer, polling as telegram_polling
 from .telegram.request_presentation import RequestPresentation
 from .bridge_config import (
@@ -46,28 +46,6 @@ _PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 5
 _PERMISSION_POLL_INTERVAL_SECONDS = 5
 _PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS = 3
 _PERMISSION_ANCESTRY_MAX_DEPTH = 8
-_TEST_COMMAND = re.compile(
-    r"\b(?:pytest|tox|nox|unittest|cargo\s+test|go\s+test|"
-    r"npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|"
-    r"bun\s+(?:run\s+)?test|mvn\s+test|gradle\s+test|make\s+test)\b",
-    re.IGNORECASE,
-)
-_GH_CLI_COMMAND = re.compile(
-    r"\bgh\s+(?:api|auth|issue|pr|repo|run|workflow|release|label|search|gist|secret|variable)\b",
-    re.IGNORECASE,
-)
-_TOOL_PROGRESS_LABELS = {
-    "bash": "Command",
-    "edit": "File edit",
-    "glob": "File search",
-    "grep": "File search",
-    "read": "File read",
-    "task": "Subtask",
-    "webfetch": "Documentation fetch",
-    "write": "File write",
-}
-
-
 def _chat_lock(chat_id):
     key = str(chat_id)
     with _CHAT_LOCKS_LOCK:
@@ -218,9 +196,9 @@ _event_progress_stage = exchange._event_progress_stage
 _session_is_busy = exchange._session_is_busy
 _permissions_in_session_tree = exchange._permissions_in_session_tree
 _watch_events = exchange._watch_events
-_tool_names = exchange._tool_names
-_tool_call_count = exchange._tool_call_count
-_format_tool_usage = exchange._format_tool_usage
+_tool_names = tooling.tool_names
+_tool_call_count = tooling.tool_call_count
+_format_tool_usage = tooling.format_tool_usage
 
 
 def _new_telegram_session_title():

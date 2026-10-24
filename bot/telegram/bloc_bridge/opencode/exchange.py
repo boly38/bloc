@@ -2,7 +2,6 @@
 
 import json
 import queue
-import re
 import sys
 import threading
 import time
@@ -24,6 +23,7 @@ from ..bridge_config import (
 )
 from . import api as opencode_api
 from . import cost_reporting
+from . import tooling
 
 
 _SESSIONS_LOCK = threading.RLock()
@@ -31,28 +31,6 @@ _PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 5
 _PERMISSION_POLL_INTERVAL_SECONDS = 5
 _PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS = 3
 _PERMISSION_ANCESTRY_MAX_DEPTH = 8
-_TEST_COMMAND = re.compile(
-    r"\b(?:pytest|tox|nox|unittest|cargo\s+test|go\s+test|"
-    r"npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|"
-    r"bun\s+(?:run\s+)?test|mvn\s+test|gradle\s+test|make\s+test)\b",
-    re.IGNORECASE,
-)
-_GH_CLI_COMMAND = re.compile(
-    r"\bgh\s+(?:api|auth|issue|pr|repo|run|workflow|release|label|search|gist|secret|variable)\b",
-    re.IGNORECASE,
-)
-_TOOL_PROGRESS_LABELS = {
-    "bash": "Command",
-    "edit": "File edit",
-    "glob": "File search",
-    "grep": "File search",
-    "read": "File read",
-    "task": "Subtask",
-    "webfetch": "Documentation fetch",
-    "write": "File write",
-}
-
-
 class OpenCodeRequestTimeout(TimeoutError):
     """The overall time allowed for one OpenCode exchange elapsed."""
 
@@ -113,56 +91,9 @@ def _new_assistant_messages(messages, previous_ids):
     ]
 
 
-def _tool_names(messages):
-    """Return unique tool and recognized CLI names, without inputs or outputs."""
-    names = []
-    seen = set()
-    for entry in messages:
-        message = entry.get("message") if isinstance(entry, dict) else None
-        if not isinstance(message, dict):
-            message = entry if isinstance(entry, dict) else {}
-        parts = message.get("parts")
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if not isinstance(part, dict) or part.get("type") != "tool":
-                continue
-            tool_name = part.get("tool")
-            if isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", tool_name):
-                normalized = tool_name.lower()
-                if normalized not in seen:
-                    names.append(normalized)
-                    seen.add(normalized)
-            state = part.get("state")
-            state = state if isinstance(state, dict) else {}
-            tool_input = state.get("input")
-            command = tool_input.get("command") if isinstance(tool_input, dict) else None
-            if tool_name == "bash" and isinstance(command, str) and _GH_CLI_COMMAND.search(command):
-                if "gh" not in seen:
-                    names.append("gh")
-                    seen.add("gh")
-    return names
-
-
-def _tool_call_count(messages):
-    count = 0
-    for entry in messages:
-        message = entry.get("message") if isinstance(entry, dict) else None
-        if not isinstance(message, dict):
-            message = entry if isinstance(entry, dict) else {}
-        parts = message.get("parts")
-        if isinstance(parts, list):
-            count += sum(1 for part in parts if isinstance(part, dict) and part.get("type") == "tool")
-    return count
-
-
-def _format_tool_usage(tool_names):
-    safe_names = [
-        name.lower()
-        for name in tool_names
-        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", name)
-    ]
-    return f"Tools used: {', '.join(dict.fromkeys(safe_names)) if safe_names else 'none'}"
+_tool_names = tooling.tool_names
+_tool_call_count = tooling.tool_call_count
+_format_tool_usage = tooling.format_tool_usage
 
 
 def _record_exchange_diagnostics(messages, response):
@@ -256,14 +187,7 @@ def _event_details(event):
     session_id = properties.get("sessionID") or part.get("sessionID")
     message_id = properties.get("messageID") or part.get("messageID")
     part_type = part.get("type")
-    tool_name = part.get("tool") if part_type == "tool" else None
-    tool_state = part.get("state") if part_type == "tool" else None
-    tool_state = tool_state if isinstance(tool_state, dict) else {}
-    tool_status = tool_state.get("status")
-    tool_input = tool_state.get("input")
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    is_test_command = tool_name == "bash" and isinstance(command, str) and bool(_TEST_COMMAND.search(command))
-    is_gh_command = tool_name == "bash" and isinstance(command, str) and bool(_GH_CLI_COMMAND.search(command))
+    tool_name, tool_status, is_test_command, is_gh_command = tooling.event_tool_metadata(part)
     return session_id, message_id, part_type, tool_name, tool_status, is_test_command, is_gh_command
 
 
@@ -274,24 +198,7 @@ def _event_progress_stage(
     is_test_command=False,
     is_gh_command=False,
 ):
-    if part_type == "reasoning":
-        return "Analysis in progress"
-    if part_type != "tool":
-        return None
-
-    if is_test_command:
-        label = "Tests"
-    elif is_gh_command:
-        label = "GitHub CLI"
-    elif isinstance(tool_name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", tool_name):
-        label = _TOOL_PROGRESS_LABELS.get(tool_name.lower(), f"Tool {tool_name}")
-    else:
-        label = "Tool"
-    suffix = {
-        "completed": "complete",
-        "error": "failed",
-    }.get(tool_status, "in progress")
-    return f"{label} {suffix}"
+    return tooling.progress_stage(part_type, tool_name, tool_status, is_test_command, is_gh_command)
 
 
 def _permission_signature(permissions):
