@@ -75,14 +75,12 @@ SCENARIO = textwrap.dedent("""
                 updates = [
                     {
                         "update_id": i,
-                        "message": {"chat": {"id": 123}, "text": "/xx" if scenario == "command" else "Hello"},
+                        "message": {"chat": {"id": 123}, "text": "/start" if scenario == "command" else "Hello"},
                     }
                     for i in range(count)
                 ]
                 return {"ok": True, "result": updates}
             if scenario in ("worker", "queued", "command"):
-                if scenario == "command":
-                    bridge._REQUEST_EXECUTOR._tasks.join()
                 if not active.wait(3):
                     raise AssertionError("Worker did not start")
                 return block()
@@ -90,10 +88,9 @@ SCENARIO = textwrap.dedent("""
         if url == TG + "sendMessage":
             if scenario == "ack":
                 return block()
+            if scenario == "command":
+                active.set()
             return {"ok": True, "result": {"message_id": 456}}
-        if url == TG + "editMessageText" and scenario == "command":
-            active.set()
-            return {"ok": True, "result": True}
         raise AssertionError("Unexpected HTTP call")
 
     def status(timeout):
@@ -153,10 +150,9 @@ class TelegramShutdownTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, stderr)
             self.assertIn("Received SIGTERM", stderr)
             self.assertIn("STOPPED", stdout)
+            self.assertNotIn("request_completed", stderr)
             if scenario == "command":
-                self.assertIn("request_completed", stderr)
-            else:
-                self.assertNotIn("request_completed", stderr)
+                self.assertNotIn("request_accepted", stderr)
             if scenario == "queued":
                 self.assertEqual(stderr.count("request_accepted"), 1)
         finally:

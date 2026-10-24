@@ -223,10 +223,7 @@ def format_exchange_footer(messages):
     if usage["message_count"] == 0 or usage["cost"] is None:
         return "\n\nCost: unavailable"
     details = usage["agents"]
-    if len(details) == 1:
-        agent, cost = next(iter(details.items()))
-        return f"\n\nCost: {format_cost(usage['cost'])} ({agent}: {format_cost(cost)})"
-    if details:
+    if len(details) > 1:
         breakdown = ", ".join(f"{agent}: {format_cost(cost)}" for agent, cost in sorted(details.items()))
         return f"\n\nCost: {format_cost(usage['cost'])} ({breakdown})"
     return f"\n\nCost: {format_cost(usage['cost'])}"

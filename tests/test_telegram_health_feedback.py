@@ -328,6 +328,36 @@ class RequestFeedbackTests(unittest.TestCase):
         self.assertIn("OpenCode activity: 30s ago; API heartbeat: 0s ago.", self.progress[0][1])
         self.assertIn("OpenCode activity: 60s ago; API heartbeat: 0s ago.", self.progress[1][1])
 
+    def test_progress_hides_recent_api_and_opencode_ages_until_over_five_seconds(self):
+        snapshot = bridge.exchange._MonitorSnapshot(True, False, [], [])
+        updates = []
+
+        for age in (4, 5, 6):
+            monitor = bridge._AsyncRequestMonitor(
+                "private-session",
+                "private-prompt",
+                "REF12345",
+                time.time(),
+            )
+            monitor.current_stage = "Analysis in progress"
+            monitor.monitor_started_at = 0
+            monitor.last_progress_at = -30
+            monitor.last_opencode_activity_at = 0
+            monitor.last_api_success_at = 0
+            with patch.object(bridge.time, "monotonic", return_value=age):
+                monitor._report_progress(snapshot, updates.append)
+
+        self.assertEqual(updates[0], "Analysis in progress (4s elapsed).")
+        self.assertEqual(
+            updates[1],
+            "Analysis in progress (5s elapsed).",
+        )
+        self.assertEqual(
+            updates[2],
+            "Analysis in progress (6s elapsed).\n"
+            "OpenCode activity: 6s ago; API heartbeat: 6s ago.",
+        )
+
     def test_progress_reports_age_of_last_api_response_during_polling_errors(self):
         prompt = {"info": {"id": "msg_prompt", "role": "user"}}
 
@@ -457,8 +487,8 @@ class RequestFeedbackTests(unittest.TestCase):
              patch("sys.stderr", output):
             bridge._request_worker(123, "Hi", {}, 123, "REF12345", 456)
         self.assertEqual(edit.call_count, 2)
-        self.assertIn("/status", edit.call_args_list[0].args[2])
-        self.assertIn("/abort", edit.call_args_list[0].args[2])
+        self.assertNotIn("/status", edit.call_args_list[0].args[2])
+        self.assertNotIn("/abort", edit.call_args_list[0].args[2])
         self.assertIn("REF12345", edit.call_args_list[0].args[2])
         self.assertIn("timed out", send.call_args.args[1])
         self.assertIn("phase=response_wait", output.getvalue())

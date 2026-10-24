@@ -29,6 +29,7 @@ from . import tooling
 
 _SESSIONS_LOCK = threading.RLock()
 _PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 5
+_PROGRESS_AGE_DISPLAY_THRESHOLD_SECONDS = 5
 _PERMISSION_POLL_INTERVAL_SECONDS = 5
 _PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS = 3
 _PERMISSION_ANCESTRY_MAX_DEPTH = 8
@@ -710,12 +711,16 @@ class _AsyncRequestMonitor:
             text = f"OpenCode is waiting for {count} {permission_label} ({elapsed}s elapsed)."
         else:
             text = f"{self.current_stage or 'OpenCode is working on your request'} ({elapsed}s elapsed)."
-        api_heartbeat = (
-            f"API heartbeat: {api_age}s ago"
-            if api_responding
-            else f"API last responded: {api_age}s ago"
-        )
-        text = f"{text}\nOpenCode activity: {activity_age}s ago; {api_heartbeat}."
+        if (
+            activity_age > _PROGRESS_AGE_DISPLAY_THRESHOLD_SECONDS
+            or api_age > _PROGRESS_AGE_DISPLAY_THRESHOLD_SECONDS
+        ):
+            api_heartbeat = (
+                f"API heartbeat: {api_age}s ago"
+                if api_responding
+                else f"API last responded: {api_age}s ago"
+            )
+            text = f"{text}\nOpenCode activity: {activity_age}s ago; {api_heartbeat}."
         cost_line = observed_cost or self.reported_cost
         if cost_line:
             text = f"{text}\n{cost_line}"

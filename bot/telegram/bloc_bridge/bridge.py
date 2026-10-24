@@ -471,15 +471,17 @@ def _terminal_request_summary(request, state, response=None, error=None):
         else:
             tool_names = getattr(error, "tool_names", None)
             tool_call_count = getattr(error, "tool_call_count", "unknown")
-    tool_count = len(tool_names) if tool_names is not None else "unknown"
+    tool_summary = ", ".join(tool_names) if tool_names is not None and tool_names else "none"
+    if tool_names is None:
+        tool_summary = "unknown"
     elapsed = time.time() - request.get("created_at", time.time())
     return "\n".join(
         (
-            f"Request {request['reference']}",
-            f"Status: {_request_status_text(state)}",
+            f"Ref: {request['reference']}",
             cost_label,
+            f"Tools used: {tool_summary}; {tool_call_count} calls",
+            f"Status: {_request_status_text(state)}",
             f"Duration: {_format_elapsed(elapsed)}",
-            f"Tools used: {tool_count} distinct; {tool_call_count} calls",
         )
     )
 
@@ -968,7 +970,6 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
             else:
                 set_phase("opencode_request")
                 response = answer_async(chat_id, prompt, sessions, reference, set_phase, progress)
-            response = f"{response.rstrip()}\n\nRef: {reference}"
             request_store.update(reference, state="delivering", detail="completed")
             set_phase("telegram_final_send")
             send(chat_id, response)
@@ -1106,6 +1107,58 @@ def _run_with_slot(function, *args):
         function(*args)
     finally:
         _REQUEST_SLOTS.release()
+
+
+def _command_worker(chat_id, prompt, sessions, update_id):
+    """Run a non-model slash command without creating a request card."""
+    try:
+        bridge_runtime.check_shutdown()
+        response = authorized_response(chat_id, prompt, sessions)
+        bridge_runtime.check_shutdown()
+        send(chat_id, response)
+    except bridge_runtime.ShutdownRequested:
+        return
+    except Exception as error:
+        print(
+            f"command_failed update_id={update_id} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            send(chat_id, "The command failed. Please try again later.")
+        except Exception as delivery_error:
+            print(
+                f"command_reply_failed update_id={update_id} error_type={type(delivery_error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _enqueue_command(chat_id, prompt, sessions, update_id):
+    """Queue a non-model command reply without acknowledging it with a card."""
+    if not _REQUEST_SLOTS.acquire(blocking=False):
+        send(chat_id, "The bridge is busy. Please retry later.")
+        return
+    try:
+        _REQUEST_EXECUTOR.submit(
+            _run_with_slot,
+            _command_worker,
+            chat_id,
+            prompt,
+            sessions,
+            update_id,
+        )
+    except bridge_runtime.ShutdownRequested:
+        _REQUEST_SLOTS.release()
+        raise
+    except Exception as error:
+        _REQUEST_SLOTS.release()
+        print(
+            f"command_enqueue_failed update_id={update_id} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        send(chat_id, "The command could not be queued. Please try again later.")
 
 
 def _recovery_notice_worker(chat_id, update_id, reference, acknowledgement_id):
@@ -1326,6 +1379,11 @@ def handle_update(update, sessions):
                 flush=True,
             )
             send(chat_id, "The request control command failed. Use /status to check the request.")
+        return
+    if command is not None:
+        if not request_store.claim_update(update_id):
+            return
+        _enqueue_command(chat_id, prompt, sessions, update_id)
         return
     _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id)
 
