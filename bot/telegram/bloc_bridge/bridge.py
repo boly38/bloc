@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from . import bridge_runtime, http_api, opper_health, request_store, session_state
 from .opencode import cost_reporting, api as opencode_api
 from .telegram import markdown_renderer, polling as telegram_polling
+from .telegram.request_presentation import RequestPresentation
 from .bridge_config import (
     ALLOWED,
     HEALTH_OPPER_ENABLED,
@@ -38,6 +39,9 @@ _REQUEST_SLOTS = threading.BoundedSemaphore(32)
 _SESSIONS_LOCK = threading.RLock()
 _CHAT_LOCKS_LOCK = threading.Lock()
 _CHAT_LOCKS = {}
+_REQUEST_PRESENTATIONS_LOCK = threading.RLock()
+_REQUEST_PRESENTATIONS = {}
+_MAX_REQUEST_PRESENTATIONS = 256
 _PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 5
 _PERMISSION_POLL_INTERVAL_SECONDS = 5
 _PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS = 3
@@ -51,9 +55,6 @@ _TEST_COMMAND = re.compile(
 _GH_CLI_COMMAND = re.compile(
     r"\bgh\s+(?:api|auth|issue|pr|repo|run|workflow|release|label|search|gist|secret|variable)\b",
     re.IGNORECASE,
-)
-_PERMISSION_SECRET = re.compile(
-    r"(?i)\b(token|password|secret|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,;]+)"
 )
 _TOOL_PROGRESS_LABELS = {
     "bash": "Command",
@@ -74,9 +75,10 @@ class OpenCodeRequestTimeout(TimeoutError):
 class OpenCodeRequestStopped(RuntimeError):
     """OpenCode confirmed that an active request stopped."""
 
-    def __init__(self, state, tool_names=()):
+    def __init__(self, state, tool_names=(), tool_call_count=0):
         self.state = state
         self.tool_names = tuple(tool_names)
+        self.tool_call_count = tool_call_count
         super().__init__("OpenCode request stopped")
 
 
@@ -88,6 +90,96 @@ def _chat_lock(chat_id):
     key = str(chat_id)
     with _CHAT_LOCKS_LOCK:
         return _CHAT_LOCKS.setdefault(key, threading.Lock())
+
+
+def _request_presentation(reference, chat_id=None, acknowledgement_id=None):
+    with _REQUEST_PRESENTATIONS_LOCK:
+        presentation = _REQUEST_PRESENTATIONS.get(reference)
+        if presentation is not None:
+            if chat_id is not None and str(presentation.chat_id) != str(chat_id):
+                return None
+            return presentation
+        if chat_id is None or acknowledgement_id is None:
+            request = request_store.get(reference)
+            if request is not None:
+                if request.get("state") in request_store.TERMINAL_STATES:
+                    return None
+                chat_id = request.get("chat_id") if chat_id is None else chat_id
+                acknowledgement_id = (
+                    request.get("acknowledgement_id") if acknowledgement_id is None else acknowledgement_id
+                )
+        if chat_id is None or acknowledgement_id is None:
+            return None
+        presentation = RequestPresentation(chat_id, acknowledgement_id, reference)
+        _REQUEST_PRESENTATIONS[reference] = presentation
+        _prune_request_presentations()
+        return presentation
+
+
+def _register_request_presentation(presentation):
+    with _REQUEST_PRESENTATIONS_LOCK:
+        _REQUEST_PRESENTATIONS[presentation.reference] = presentation
+        _prune_request_presentations()
+        _prune_request_presentations()
+
+
+def _prune_request_presentations():
+    while len(_REQUEST_PRESENTATIONS) > _MAX_REQUEST_PRESENTATIONS:
+        for reference, presentation in list(_REQUEST_PRESENTATIONS.items()):
+            with presentation.lock:
+                finished = presentation.final_text is not None
+            if finished:
+                _REQUEST_PRESENTATIONS.pop(reference, None)
+                break
+        else:
+            return
+
+
+def _request_presentation_for_request(request):
+    return _request_presentation(
+        request["reference"],
+        request.get("chat_id"),
+        request.get("acknowledgement_id"),
+    )
+
+
+def _edit_request_presentation(presentation):
+    if presentation is None:
+        return
+    with presentation.lock:
+        text, reply_markup = presentation.edit_payload()
+        edit_reply(
+            presentation.chat_id,
+            presentation.message_id,
+            text,
+            reply_markup=reply_markup,
+        )
+
+
+def _forget_request_presentation(reference):
+    with _REQUEST_PRESENTATIONS_LOCK:
+        _REQUEST_PRESENTATIONS.pop(reference, None)
+
+
+def _append_request_status(chat_id, reference, status_text):
+    request = request_store.get_for_chat(reference, chat_id)
+    if request is None:
+        return False
+    presentation = _request_presentation_for_request(request)
+    if presentation is None:
+        return False
+    presentation.append_status(status_text)
+    _edit_request_presentation(presentation)
+    return True
+
+
+def _finish_request_presentation(request, summary):
+    presentation = _request_presentation_for_request(request)
+    if presentation is None:
+        return False
+    presentation.finish(summary)
+    _edit_request_presentation(presentation)
+    return True
 
 
 def _assistant_message_key(entry):
@@ -142,6 +234,18 @@ def _tool_names(messages):
                     names.append("gh")
                     seen.add("gh")
     return names
+
+
+def _tool_call_count(messages):
+    count = 0
+    for entry in messages:
+        message = entry.get("message") if isinstance(entry, dict) else None
+        if not isinstance(message, dict):
+            message = entry if isinstance(entry, dict) else {}
+        parts = message.get("parts")
+        if isinstance(parts, list):
+            count += sum(1 for part in parts if isinstance(part, dict) and part.get("type") == "tool")
+    return count
 
 
 def _format_tool_usage(tool_names):
@@ -282,62 +386,6 @@ def _event_progress_stage(
     return f"{label} {suffix}"
 
 
-def _safe_permission_scope(value):
-    if not isinstance(value, str):
-        return "scope details unavailable"
-    value = " ".join(value.split())
-    if value.startswith(("http://", "https://")):
-        try:
-            parsed = urllib.parse.urlsplit(value)
-            host = parsed.hostname or ""
-            if parsed.port is not None:
-                host = f"{host}:{parsed.port}"
-            value = urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
-        except ValueError:
-            value = "web resource"
-    else:
-        value = _PERMISSION_SECRET.sub(r"\1\2[redacted]", value)
-    if len(value) > 120:
-        value = value[:117] + "..."
-    return value or "scope details unavailable"
-
-
-def _format_permission_prompt(permissions):
-    lines = ["OpenCode is waiting for permission:"]
-    permissions = sorted(permissions, key=lambda request: request.get("id", ""))
-    for index, permission in enumerate(permissions[:5], start=1):
-        name = permission.get("permission")
-        name = name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,40}", name) else "tool action"
-        patterns = permission.get("patterns")
-        patterns = patterns if isinstance(patterns, list) else []
-        scopes = [_safe_permission_scope(pattern) for pattern in patterns[:3]]
-        if len(patterns) > 3:
-            scopes.append(f"and {len(patterns) - 3} more")
-        scope_text = ", ".join(scopes) if scopes else "scope details unavailable"
-        always_patterns = permission.get("always")
-        rememberable = isinstance(always_patterns, list) and bool(always_patterns)
-        if rememberable:
-            remember_scopes = [_safe_permission_scope(pattern) for pattern in always_patterns[:3]]
-            if len(always_patterns) > 3:
-                remember_scopes.append(f"and {len(always_patterns) - 3} more")
-            scope_text = f"{scope_text} (remember scope: {', '.join(remember_scopes)})"
-        lines.append(f"{index}. {name}: {scope_text}")
-    if len(permissions) == 1:
-        permission = permissions[0]
-        always_patterns = permission.get("always") if isinstance(permission, dict) else None
-        if isinstance(always_patterns, list) and always_patterns:
-            lines.append("Reply /allow to allow once, /allow always to remember, or /deny to reject.")
-        else:
-            lines.append("Reply /allow to allow once or /deny to reject.")
-    else:
-        lines.append("Reply /allow <number> [always] or /deny <number>.")
-    if len(permissions) > 5:
-        lines.append(
-            f"{len(permissions) - 5} more are pending; use the remote TUI to inspect those."
-        )
-    return "\n".join(lines)
-
-
 def _permission_signature(permissions):
     entries = [
         (permission["id"], permission.get("permission"))
@@ -366,6 +414,21 @@ def _permission_belongs_to_session_tree(session_id, root_session_id, known_sessi
         traversed.append(current_session_id)
         current_session_id = parent_session_id
     return False
+
+
+def _permissions_in_session_tree(root_session_id, requests, related_sessions, unrelated_sessions):
+    matches = []
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        session_id = request.get("sessionID")
+        if not isinstance(session_id, str) or session_id in unrelated_sessions:
+            continue
+        if _permission_belongs_to_session_tree(session_id, root_session_id, related_sessions):
+            matches.append(request)
+        else:
+            unrelated_sessions.add(session_id)
+    return sorted(matches, key=lambda request: request.get("id", ""))
 
 
 def _watch_events(session_id, reference, events, stop):
@@ -636,44 +699,32 @@ class _AsyncRequestMonitor:
 
         self.reported_permission_error = False
         previous = self.pending_permissions
-        related = []
-        session_lookup_failed = False
-        for request in requests:
-            if not isinstance(request, dict):
-                continue
-            request_session_id = request.get("sessionID")
-            if not isinstance(request_session_id, str):
-                continue
-            if request_session_id in self.unrelated_permission_sessions:
-                continue
-            try:
-                belongs_to_request = _permission_belongs_to_session_tree(
-                    request_session_id,
-                    self.session_id,
-                    self.related_permission_sessions,
+        try:
+            self.pending_permissions = _permissions_in_session_tree(
+                self.session_id,
+                requests,
+                self.related_permission_sessions,
+                self.unrelated_permission_sessions,
+            )
+        except Exception as error:
+            if not self.reported_permission_session_error:
+                print(
+                    f"permission_session_lookup_failed ref={self.reference} "
+                    f"error_type={type(error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
                 )
-            except Exception as error:
-                if not self.reported_permission_session_error:
-                    print(
-                        f"permission_session_lookup_failed ref={self.reference} "
-                        f"error_type={type(error).__name__}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    self.reported_permission_session_error = True
-                session_lookup_failed = True
-                continue
-            if belongs_to_request:
-                related.append(request)
-            else:
-                self.unrelated_permission_sessions.add(request_session_id)
-        self.pending_permissions = related
-        if not session_lookup_failed:
+                self.reported_permission_session_error = True
+            return
+        else:
             self.reported_permission_session_error = False
         if _permission_signature(previous) != _permission_signature(self.pending_permissions):
             self.last_opencode_activity_at = time.monotonic()
         if previous and not self.pending_permissions:
             self.current_stage = "Permission decision submitted; OpenCode is resuming"
+        presentation = _request_presentation(self.reference)
+        if presentation is not None:
+            presentation.sync_permissions(self.pending_permissions)
 
     def _handle_read_error(self, error):
         """Log polling failures safely and mark unconfirmed stop states."""
@@ -711,6 +762,7 @@ class _AsyncRequestMonitor:
                 opencode_api.raise_response_error(message)
         except opencode_api.OpenCodeResponseError as error:
             error.tool_names = _tool_names(snapshot.correlated_messages)
+            error.tool_call_count = _tool_call_count(snapshot.correlated_messages)
             raise
 
     def _update_progress_stage(self, correlated_messages):
@@ -788,7 +840,11 @@ class _AsyncRequestMonitor:
         if self.abort_reason is None or snapshot.busy or self.idle_samples < 2:
             return
         if snapshot.prompt_found or self.abort_sent:
-            raise OpenCodeRequestStopped(self.abort_reason, _tool_names(snapshot.correlated_messages))
+            raise OpenCodeRequestStopped(
+                self.abort_reason,
+                _tool_names(snapshot.correlated_messages),
+                _tool_call_count(snapshot.correlated_messages),
+            )
         request_store.update(
             self.reference,
             state="failed",
@@ -873,8 +929,9 @@ class _AsyncRequestMonitor:
         activity_age = int(now - self.last_opencode_activity_at)
         api_age = int(now - self.last_api_success_at)
         if snapshot.pending_permissions:
-            text = _format_permission_prompt(snapshot.pending_permissions)
-            text = f"{text}\nRequest elapsed: {elapsed}s."
+            count = len(snapshot.pending_permissions)
+            permission_label = "permission" if count == 1 else "permissions"
+            text = f"OpenCode is waiting for {count} {permission_label} ({elapsed}s elapsed)."
         else:
             text = f"{self.current_stage or 'OpenCode is working on your request'} ({elapsed}s elapsed)."
         api_heartbeat = (
@@ -928,7 +985,10 @@ def _format_async_result(session_id, correlated, previous_ids, reference):
         if previous_ids is None
         else cost_reporting.format_exchange_footer([entry["message"] for entry in new_messages])
     )
-    return f"{text}{cost_footer}\n\n{_format_tool_usage(_tool_names(new_messages))}"
+    return (
+        f"{text}{cost_footer}\n\n{_format_tool_usage(_tool_names(new_messages))}"
+        f"\nTool calls: {_tool_call_count(new_messages)}"
+    )
 
 
 def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
@@ -1068,32 +1128,45 @@ def _control_reference(prompt, command):
 
 def _permission_selection(prompt, command):
     """Parse a short permission command; request IDs stay inside the bridge."""
-    index = None
-    response = "once"
+    letter = None
+    response = "reject" if command == "/deny" else "always" if command == "/allowall" else "once"
     for argument in prompt.split()[1:]:
         normalized = argument.lower()
-        if normalized.isdecimal() and index is None:
-            index = int(normalized)
-        elif command == "/allow" and normalized in ("once", "always"):
+        if len(normalized) == 1 and "a" <= normalized <= "z" and letter is None:
+            letter = normalized.upper()
+        elif command == "/allow" and normalized == "always":
             response = normalized
         else:
-            usage = "/allow [number] [once|always]" if command == "/allow" else "/deny [number]"
+            usage = {
+                "/allow": "Usage: /allow [letter] [always]",
+                "/allowall": "Usage: /allowAll <letter>",
+                "/deny": "Usage: /deny [letter]",
+            }.get(command, "Invalid permission command")
             raise ValueError(f"Usage: {usage}")
-    return index, response
+    return letter, response
 
 
-def permission_reply_response(chat_id, prompt, command):
-    """Apply an explicit Telegram decision to a pending permission for the active request."""
-    index, response = _permission_selection(prompt, command)
-    active = request_store.active_for_chat(chat_id)
-    if not active:
+def permission_reply_response(chat_id, prompt, command, reference=None):
+    """Apply an explicit Telegram permission command to the active request."""
+    letter, decision = _permission_selection(prompt, command)
+    if reference is None:
+        active = request_store.active_for_chat(chat_id)
+        if not active:
+            return "No active request has a pending permission."
+        if len(active) != 1:
+            return "Multiple active requests found; use the remote TUI to manage permissions."
+        reference = active[0]["reference"]
+    return _respond_to_permission(chat_id, reference, letter, decision)
+
+
+def _respond_to_permission(chat_id, reference, letter, decision, expected_permission_id=None):
+    """Revalidate a displayed permission before applying a human decision."""
+    request = request_store.get_for_chat(reference, chat_id)
+    if request is None or request["state"] not in request_store.ACTIVE_STATES:
         return "No active request has a pending permission."
-    if len(active) != 1:
-        return "Multiple active requests found; use the remote TUI to manage permissions."
-    if active[0]["state"] == "cancellation_requested":
+    if request["state"] == "cancellation_requested":
         return "The active request is stopping; no permission will be granted."
-    session_id = active[0].get("session_id")
-    reference = active[0]["reference"]
+    session_id = request.get("session_id")
     if not session_id:
         return "The active request has not reached OpenCode yet."
 
@@ -1106,53 +1179,73 @@ def permission_reply_response(chat_id, prompt, command):
             flush=True,
         )
         return "Could not check pending permissions. Use the remote TUI or /cancel."
-    pending = []
     known_sessions = {session_id}
     unrelated_sessions = set()
-    for permission in pending_requests:
-        if not isinstance(permission, dict):
-            continue
-        permission_session_id = permission.get("sessionID")
-        if not isinstance(permission_session_id, str) or permission_session_id in unrelated_sessions:
-            continue
-        try:
-            belongs_to_request = _permission_belongs_to_session_tree(
-                permission_session_id,
-                session_id,
-                known_sessions,
-            )
-        except Exception as error:
-            print(
-                f"permission_session_lookup_failed ref={reference} error_type={type(error).__name__}",
-                file=sys.stderr,
-                flush=True,
-            )
-            return "Could not verify which task owns that permission. Use the remote TUI."
-        if belongs_to_request:
-            pending.append(permission)
-        else:
-            unrelated_sessions.add(permission_session_id)
-    pending.sort(key=lambda request: request.get("id", ""))
+    try:
+        pending = _permissions_in_session_tree(
+            session_id,
+            pending_requests,
+            known_sessions,
+            unrelated_sessions,
+        )
+    except Exception as error:
+        print(
+            f"permission_session_lookup_failed ref={reference} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return "Could not verify which task owns that permission. Use the remote TUI."
     if not pending:
         return "No pending permission for the active request."
-    if index is None:
+    presentation = _request_presentation_for_request(request)
+    if presentation is not None:
+        presentation.sync_permissions(pending)
+    if expected_permission_id is not None:
+        selected_permission = next(
+            (permission for permission in pending if permission.get("id") == expected_permission_id),
+            None,
+        )
+        if selected_permission is None:
+            return f"Permission {letter or ''} is no longer pending. Use /status to refresh the request."
+        alias = None
+        if presentation is not None:
+            alias = next(
+                (
+                    current_letter
+                    for current_letter, permission in presentation.permissions_by_letter().items()
+                    if permission.get("id") == expected_permission_id
+                ),
+                None,
+            )
+        if letter is not None and alias != letter:
+            return f"Permission {letter} changed. Use the current request card to decide."
+        letter = alias or letter
+    elif letter is None:
         if len(pending) != 1:
-            return "Multiple permissions are pending. Use /allow <number> or /deny <number>."
-        index = 1
-    if index < 1 or index > len(pending):
-        return f"No permission numbered {index} is pending."
-    if index > 5:
-        return "That permission is not shown here; use the remote TUI to inspect it."
-
-    selected_permission = pending[index - 1]
-    if response == "always":
+            return "Multiple permissions are pending; use the letter shown beside each request."
+        selected_permission = pending[0]
+        aliases = presentation.permissions_by_letter() if presentation is not None else {}
+        letter = next(
+            (
+                alias
+                for alias, permission in aliases.items()
+                if permission.get("id") == selected_permission.get("id")
+            ),
+            "A",
+        )
+    else:
+        selected_permission = presentation.permission_for_letter(letter) if presentation is not None else None
+        if selected_permission is None:
+            return f"Permission {letter} is no longer pending. Use /status to refresh the request."
+        if not any(item.get("id") == selected_permission.get("id") for item in pending):
+            return f"Permission {letter} is no longer pending. Use /status to refresh the request."
+    if decision == "always":
         always_patterns = selected_permission.get("always")
         if not isinstance(always_patterns, list) or not always_patterns:
-            return f"Permission {index} cannot be remembered; use /allow for a one-time approval."
+            return f"Permission {letter} cannot be remembered; use /allow {letter} for a one-time approval."
     permission_id = selected_permission.get("id")
     if not isinstance(permission_id, str):
         return "The pending permission is invalid; use the remote TUI or /cancel."
-    decision = "reject" if command == "/deny" else response
     try:
         confirmed = opencode_api.respond_to_permission(
             selected_permission["sessionID"],
@@ -1169,11 +1262,15 @@ def permission_reply_response(chat_id, prompt, command):
         return "Could not send that permission decision. Use the remote TUI or /cancel."
     if not confirmed:
         return "OpenCode did not confirm the permission decision. Use the remote TUI or /cancel."
-    if command == "/deny":
-        return f"Permission {index} denied. OpenCode can handle the rejection."
-    if decision == "always":
-        return f"Permission {index} allowed and remembered for matching requests."
-    return f"Permission {index} allowed once. OpenCode can continue."
+    if presentation is not None:
+        presentation.resolve_permission(permission_id)
+    if decision == "reject":
+        response_text = f"Permission {letter} denied. OpenCode can handle the rejection."
+    elif decision == "always":
+        response_text = f"Permission {letter} allowed and remembered for matching requests."
+    else:
+        response_text = f"Permission {letter} allowed once. OpenCode can continue."
+    return response_text
 
 
 def _request_status_text(state):
@@ -1195,6 +1292,146 @@ def _request_status_text(state):
         "acknowledgement_unknown": "not started; acknowledgement delivery could not be confirmed",
         "delivery_unknown": "finished, but reply delivery could not be confirmed",
     }.get(state, "status unavailable")
+
+
+def _format_elapsed(seconds):
+    remaining = max(0, int(seconds))
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, seconds = divmod(remaining, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def _response_tools(response):
+    for line in reversed(response.splitlines()):
+        if line.startswith("Tools used:"):
+            names = line.split(":", 1)[1].strip()
+            return [] if names == "none" else [name.strip() for name in names.split(",") if name.strip()]
+    return None
+
+
+def _response_cost(response):
+    for line in reversed(response.splitlines()):
+        if line.startswith("Cost:"):
+            return line.split(":", 1)[1].strip()
+    return "unavailable"
+
+
+def _response_tool_call_count(response):
+    for line in reversed(response.splitlines()):
+        if line.startswith("Tool calls:"):
+            count = line.split(":", 1)[1].strip()
+            return count if count.isdecimal() else "unknown"
+    return "unknown"
+
+
+def _request_record(reference, chat_id, acknowledgement_id):
+    return request_store.get(reference) or {
+        "reference": reference,
+        "chat_id": chat_id,
+        "acknowledgement_id": acknowledgement_id,
+        "created_at": time.time(),
+    }
+
+
+def _terminal_request_summary(request, state, response=None, error=None):
+    if response is not None:
+        cost_label = f"Final cost: {_response_cost(response)}"
+        tool_names = _response_tools(response)
+        if tool_names is None:
+            tool_names = []
+        tool_call_count = _response_tool_call_count(response)
+        if tool_call_count == "unknown":
+            tool_call_count = 0
+    else:
+        presentation = _request_presentation(request["reference"])
+        observed_cost = presentation.observed_cost if presentation is not None else None
+        cost_label = f"Observed cost: {observed_cost}" if observed_cost else "Final cost: unavailable"
+        if isinstance(error, OpenCodeSubmissionUnconfirmed):
+            tool_names = []
+            tool_call_count = 0
+        else:
+            tool_names = getattr(error, "tool_names", None)
+            tool_call_count = getattr(error, "tool_call_count", "unknown")
+    tool_count = len(tool_names) if tool_names is not None else "unknown"
+    elapsed = time.time() - request.get("created_at", time.time())
+    return "\n".join(
+        (
+            f"Request {request['reference']}",
+            f"Status: {_request_status_text(state)}",
+            cost_label,
+            f"Duration: {_format_elapsed(elapsed)}",
+            f"Tools used: {tool_count} distinct; {tool_call_count} calls",
+        )
+    )
+
+
+def _finalize_request_presentation(request, state, response=None, error=None):
+    summary = _terminal_request_summary(request, state, response, error)
+    presentation = _request_presentation_for_request(request)
+    if presentation is None:
+        edit_reply(
+            request["chat_id"],
+            request.get("acknowledgement_id"),
+            summary,
+            reply_markup={"inline_keyboard": []},
+        )
+        return
+    presentation.finish(summary)
+    _edit_request_presentation(presentation)
+
+
+def _append_request_status(chat_id, reference, text):
+    request = request_store.get_for_chat(reference, chat_id)
+    if request is None:
+        return False
+    presentation = _request_presentation_for_request(request)
+    if presentation is None:
+        return False
+    with presentation.lock:
+        if presentation.final_text is not None:
+            return False
+    presentation.append_status(text)
+    _edit_request_presentation(presentation)
+    return True
+
+
+def _show_request_status(chat_id, reference=None):
+    response = request_status_response(chat_id, reference)
+    if reference is None:
+        active = request_store.active_for_chat(chat_id)
+        reference = active[0]["reference"] if active else None
+    if reference is not None and _append_request_status(chat_id, reference, response):
+        return True
+    send(chat_id, response)
+    return False
+
+
+def _record_control_result(chat_id, reference, response):
+    request = request_store.get_for_chat(reference, chat_id) if reference else None
+    if request is None:
+        send(chat_id, response)
+        return
+    if request["state"] in request_store.TERMINAL_STATES:
+        presentation = _request_presentation_for_request(request)
+        if request["state"] == "cancelled" and presentation is not None and presentation.final_text is None:
+            error = OpenCodeRequestStopped("user_cancelled")
+            _finalize_request_presentation(request, request["state"], error=error)
+            _forget_request_presentation(reference)
+        else:
+            send(chat_id, response)
+        return
+    if not _append_request_status(chat_id, reference, response):
+        send(chat_id, response)
 
 
 def request_status_response(chat_id, reference=None):
@@ -1235,22 +1472,6 @@ def cancel_request_response(chat_id, reference=None):
             completed_at=time.time(),
         )
         if cancelled is not None and cancelled["state"] == "cancelled":
-            acknowledgement_id = cancelled.get("acknowledgement_id")
-            if acknowledgement_id is not None:
-                try:
-                    edit_reply(
-                        chat_id,
-                        acknowledgement_id,
-                        f"Request {reference} was cancelled before it started.",
-                    )
-                except Exception as error:
-                    _log_request_error(
-                        reference,
-                        cancelled["update_id"],
-                        "telegram_error_edit",
-                        time.monotonic(),
-                        error,
-                    )
             return f"Request {reference} was cancelled before it started."
         request = cancelled
         if request is None or request["state"] not in request_store.ACTIVE_STATES:
@@ -1326,7 +1547,7 @@ def authorized_response(chat_id, prompt, sessions):
         except ValueError as error:
             return str(error)
         return request_status_response(chat_id, reference)
-    if command == "/cancel":
+    if command in ("/cancel", "/abort"):
         try:
             reference = _control_reference(prompt, command)
         except ValueError as error:
@@ -1334,7 +1555,7 @@ def authorized_response(chat_id, prompt, sessions):
         if reference is None:
             return cancel_request_response(chat_id)
         return cancel_request_response(chat_id, reference)
-    if command in ("/allow", "/deny"):
+    if command in ("/allow", "/allowall", "/deny"):
         return permission_reply_response(chat_id, prompt, command)
     if command is not None:
         return "Unknown command. Use /help to list the available commands."
@@ -1361,9 +1582,11 @@ def help_response():
             "/health — check bridge, OpenCode API, session, and optional provider reachability",
             "/cost — show cost and usage for this chat's current session",
             "/status [reference] — inspect the active or a previous request",
+            "/abort — stop the active request; alias for /cancel",
             "/cancel [reference] — stop the active request or one identified by reference",
-            "/allow [number] [always] — approve an active permission (once by default)",
-            "/deny [number] — reject an active permission",
+            "/allow [letter] — approve that permission once (default when one is pending)",
+            "/allowAll <letter> — remember an eligible permission rule",
+            "/deny [letter] — reject that permission",
         )
     )
 
@@ -1420,18 +1643,23 @@ def health_response(chat_id, sessions):
     return "\n".join(lines)
 
 
-def send(chat_id, text):
+def send(chat_id, text, reply_markup=None):
     result = None
     for message in markdown_renderer.render_markdown(text):
         payload = {"chat_id": chat_id, "text": message.html, "parse_mode": "HTML"}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         try:
             result = http_api.telegram("sendMessage", payload)
         except http_api.TelegramFormattingError:
-            result = http_api.telegram("sendMessage", {"chat_id": chat_id, "text": message.plain})
+            fallback = {"chat_id": chat_id, "text": message.plain}
+            if reply_markup is not None:
+                fallback["reply_markup"] = reply_markup
+            result = http_api.telegram("sendMessage", fallback)
     return result
 
 
-def edit_reply(chat_id, message_id, text):
+def edit_reply(chat_id, message_id, text, reply_markup=None):
     chunks = markdown_renderer.render_markdown(text)
     if not chunks:
         chunks = markdown_renderer.render_markdown(" ")
@@ -1442,13 +1670,15 @@ def edit_reply(chat_id, message_id, text):
         "text": first.html,
         "parse_mode": "HTML",
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         http_api.telegram("editMessageText", payload)
     except http_api.TelegramFormattingError:
-        http_api.telegram(
-            "editMessageText",
-            {"chat_id": chat_id, "message_id": message_id, "text": first.plain},
-        )
+        fallback = {"chat_id": chat_id, "message_id": message_id, "text": first.plain}
+        if reply_markup is not None:
+            fallback["reply_markup"] = reply_markup
+        http_api.telegram("editMessageText", fallback)
     for chunk in chunks[1:]:
         try:
             http_api.telegram(
@@ -1596,11 +1826,12 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
     def progress(text):
         set_phase("telegram_progress_edit")
         try:
-            edit_reply(
-                chat_id,
-                acknowledgement_id,
-                f"{text}\n\nUse /status to check progress or /cancel to stop.\nRef: {reference}",
-            )
+            presentation = _request_presentation(reference, chat_id, acknowledgement_id)
+            if presentation is None:
+                edit_reply(chat_id, acknowledgement_id, f"{text}\n\nRef: {reference}")
+            else:
+                presentation.set_progress(text)
+                _edit_request_presentation(presentation)
         except Exception as error:
             _log_request_error(reference, update_id, state["phase"], started, error)
         finally:
@@ -1627,11 +1858,15 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
             else:
                 set_phase("opencode_request")
                 response = answer_async(chat_id, prompt, sessions, reference, set_phase, progress)
-            set_phase("telegram_final_edit")
             response = f"{response.rstrip()}\n\nRef: {reference}"
             request_store.update(reference, state="delivering", detail="completed")
-            edit_reply(chat_id, acknowledgement_id, response)
+            set_phase("telegram_final_send")
+            send(chat_id, response)
             request_store.update(reference, state="completed", detail=None, completed_at=time.time())
+            completed = _request_record(reference, chat_id, acknowledgement_id)
+            set_phase("telegram_terminal_summary_edit")
+            _finalize_request_presentation(completed, "completed", response=response)
+            _forget_request_presentation(reference)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         print(
             f"request_completed ref={reference} update_id={update_id} elapsed_ms={elapsed_ms}",
@@ -1657,6 +1892,14 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                     detail=stored.get("detail"),
                     completed_at=time.time(),
                 )
+                _finalize_request_presentation(
+                    _request_record(reference, chat_id, acknowledgement_id),
+                    "delivery_unknown",
+                    response=response if "response" in locals() else None,
+                )
+                _forget_request_presentation(reference)
+            elif stored is not None and stored["state"] in request_store.TERMINAL_STATES:
+                _forget_request_presentation(reference)
             return
         if isinstance(error, OpenCodeSubmissionUnconfirmed):
             terminal_state = "failed"
@@ -1704,29 +1947,43 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
         if tool_names is not None:
             error_text = f"{error_text}\n\n{_format_tool_usage(tool_names)}"
         try:
-            set_phase("telegram_error_edit")
-            edit_reply(
-                chat_id,
-                acknowledgement_id,
-                error_text,
-            )
-            if terminal_state != "uncertain":
-                request_store.update(
-                    reference,
-                    state=terminal_state,
-                    detail=None,
-                    completed_at=time.time(),
-                )
-            else:
+            if terminal_state == "uncertain":
                 request_store.update(reference, state="uncertain", detail="stop_unconfirmed")
+                if not _append_request_status(chat_id, reference, error_text):
+                    send(chat_id, error_text)
+                return
+
+            set_phase("telegram_error_send")
+            request_store.update(reference, state="delivering", detail=terminal_state)
+            _finalize_request_presentation(
+                _request_record(reference, chat_id, acknowledgement_id),
+                terminal_state,
+                error=error,
+            )
+            request_store.update(
+                reference,
+                state=terminal_state,
+                detail=None,
+                completed_at=time.time(),
+            )
+            send(chat_id, error_text)
+            _forget_request_presentation(reference)
         except Exception as delivery_error:
-            if terminal_state != "uncertain":
-                request_store.update(
-                    reference,
-                    state="delivery_unknown",
-                    detail=terminal_state,
-                    completed_at=time.time(),
+            request_store.update(
+                reference,
+                state="delivery_unknown",
+                detail=terminal_state,
+                completed_at=time.time(),
+            )
+            try:
+                _finalize_request_presentation(
+                    _request_record(reference, chat_id, acknowledgement_id),
+                    "delivery_unknown",
+                    error=error,
                 )
+            except Exception as summary_error:
+                _log_request_error(reference, update_id, "telegram_terminal_summary_edit", started, summary_error)
+            _forget_request_presentation(reference)
             _log_request_error(reference, update_id, state["phase"], started, delivery_error)
 
 
@@ -1836,8 +2093,84 @@ def _poll_with_recovery(stop, sessions):
     telegram_polling.poll_updates(stop, handle_update, sessions)
 
 
+def _answer_callback_query(callback_query_id, text=None):
+    if not callback_query_id:
+        return
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text[:180]
+    try:
+        http_api.telegram("answerCallbackQuery", payload)
+    except Exception as error:
+        print(
+            f"telegram_callback_answer_failed error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _handle_callback_update(update):
+    callback = update.get("callback_query")
+    message = callback.get("message") if isinstance(callback, dict) else None
+    chat_id = message.get("chat", {}).get("id") if isinstance(message, dict) else None
+    callback_id = callback.get("id") if isinstance(callback, dict) else None
+    data = callback.get("data") if isinstance(callback, dict) else None
+    if chat_id is None or str(chat_id) not in ALLOWED:
+        _answer_callback_query(callback_id, "This chat is not authorized.")
+        return
+    if not request_store.claim_update(update.get("update_id", "unknown")):
+        _answer_callback_query(callback_id, "This action was already handled.")
+        return
+    if not isinstance(data, str):
+        _answer_callback_query(callback_id, "This action is invalid.")
+        return
+
+    parts = data.split(":")
+    if len(parts) < 2 or not re.fullmatch(r"[A-Fa-f0-9]{16}", parts[1]):
+        _answer_callback_query(callback_id, "This action is invalid.")
+        return
+    reference = parts[1].upper()
+    request = request_store.get_for_chat(reference, chat_id)
+    if request is None:
+        _answer_callback_query(callback_id, "This request is no longer available.")
+        return
+
+    if parts[0] == "status" and len(parts) == 2:
+        _show_request_status(chat_id, reference)
+        _answer_callback_query(callback_id, "Status added to the request message.")
+        return
+    if parts[0] == "abort" and len(parts) == 2:
+        _answer_callback_query(callback_id, "Requesting abort.")
+        response = cancel_request_response(chat_id, reference)
+        _record_control_result(chat_id, reference, response)
+        return
+    if parts[0] == "p" and len(parts) in (4, 5):
+        letter, action = parts[2], parts[3]
+        decisions = {"o": "once", "a": "always", "d": "reject"}
+        if not re.fullmatch(r"[A-Z]", letter) or action not in decisions:
+            _answer_callback_query(callback_id, "This permission action is invalid.")
+            return
+        decision = decisions[action]
+        permission_id = parts[4] if len(parts) == 5 else None
+        _answer_callback_query(callback_id, "Applying permission decision.")
+        response = _respond_to_permission(
+            chat_id,
+            reference,
+            letter,
+            decision,
+            expected_permission_id=permission_id,
+        )
+        _record_control_result(chat_id, reference, response)
+        return
+
+    _answer_callback_query(callback_id, "This action is invalid.")
+
+
 def handle_update(update, sessions):
     """Validate an incoming Telegram update before handing it to the request flow."""
+    if isinstance(update, dict) and isinstance(update.get("callback_query"), dict):
+        _handle_callback_update(update)
+        return
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     prompt = message.get("text", "").strip()
@@ -1848,21 +2181,32 @@ def handle_update(update, sessions):
         return
     update_id = update.get("update_id", "unknown")
     command = _command_name(prompt)
-    if command in ("/status", "/cancel", "/allow", "/deny"):
+    if command in ("/status", "/cancel", "/abort", "/allow", "/allowall", "/deny"):
         if not request_store.claim_update(update_id):
             return
         try:
-            if command in ("/allow", "/deny"):
-                response = permission_reply_response(chat_id, prompt, command)
-            else:
+            if command == "/status":
                 reference = _control_reference(prompt, command)
-                if command == "/status":
-                    response = request_status_response(chat_id, reference)
-                elif reference is None:
-                    response = cancel_request_response(chat_id)
+                _show_request_status(chat_id, reference)
+            elif command in ("/cancel", "/abort"):
+                reference = _control_reference(prompt, command)
+                if reference is None:
+                    active = request_store.active_for_chat(chat_id)
+                    target = active[0] if active else None
                 else:
-                    response = cancel_request_response(chat_id, reference)
-            send(chat_id, response)
+                    target = request_store.get_for_chat(reference, chat_id)
+                response = cancel_request_response(chat_id, reference)
+                if target is None:
+                    send(chat_id, response)
+                else:
+                    _record_control_result(chat_id, target["reference"], response)
+            else:
+                response = permission_reply_response(chat_id, prompt, command)
+                active = request_store.active_for_chat(chat_id)
+                if len(active) == 1:
+                    _record_control_result(chat_id, active[0]["reference"], response)
+                else:
+                    send(chat_id, response)
         except ValueError as error:
             send(chat_id, str(error))
         except Exception as error:
@@ -1896,7 +2240,7 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
             send(
                 chat_id,
                 f"This chat already has an active request ({active[0]['reference']}). "
-                "Use /status to check progress or /cancel to stop it.",
+                "Use the request card or /status and /abort to control it.",
             )
         except Exception as error:
             _log_request_error(active[0]["reference"], update_id, "telegram_acknowledgement", time.monotonic(), error)
@@ -1907,12 +2251,11 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
     if not created:
         return
     started = time.monotonic()
+    presentation = RequestPresentation(chat_id, None, reference)
+    acknowledgement_text, acknowledgement_markup = presentation.edit_payload()
     try:
         # Acknowledge before queuing so users get an immediate response.
-        acknowledgement = send(
-            chat_id,
-            f"Request received. Use /status to check progress or /cancel to stop. Ref: {reference}",
-        )
+        acknowledgement = send(chat_id, acknowledgement_text, reply_markup=acknowledgement_markup)
     except Exception as error:
         request_store.update(
             reference,
@@ -1940,6 +2283,8 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
             flush=True,
         )
         return
+    presentation.message_id = acknowledgement_id
+    _register_request_presentation(presentation)
     request_store.update(reference, state="queued", acknowledgement_id=acknowledgement_id)
     print(
         f"request_accepted ref={reference} update_id={update_id}",
@@ -1955,10 +2300,11 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
             flush=True,
         )
         try:
-            edit_reply(
-                chat_id,
-                acknowledgement_id,
-                f"The bridge is busy. Please retry later. Ref: {reference}",
+            request = request_store.get(reference)
+            _finalize_request_presentation(
+                request,
+                "rejected",
+                "The bridge is busy. Please retry later.",
             )
         except Exception as error:
             _log_request_error(reference, update_id, "telegram_error_edit", started, error)

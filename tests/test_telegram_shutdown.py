@@ -173,6 +173,7 @@ class TelegramShutdownTests(unittest.TestCase):
 
         def poll(method, payload):
             self.assertEqual(method, "getUpdates")
+            self.assertEqual(payload["allowed_updates"], ["message", "callback_query"])
             offsets.append(payload["offset"])
             if len(offsets) == 2:
                 stop.set()

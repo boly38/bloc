@@ -13,6 +13,8 @@ Docker runs `python -m bloc_bridge`. Its Dockerfile copies the entire package.
   Keep `main()` focused on startup, supervision, signals, and cleanup.
 - `telegram/polling.py`: the single Telegram poller, update offsets, and retry backoff.
 - `telegram/markdown_renderer.py`: Markdown-to-HTML conversion and bounded message chunks.
+- `telegram/request_presentation.py`: persistent-in-chat request card, status history, and
+  permission action buttons.
 - `telegram/format_test.py`: static formatting fixture; never calls the model.
 - `opencode/api.py`: OpenCode API helpers and prompt/assistant correlation.
 - `opencode/cost_reporting.py`: usage aggregation and sanitized diagnostics.
@@ -28,12 +30,16 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
 ## Behavior to preserve
 
 - Check the chat allowlist before acknowledgements, session access, or model calls.
-- Acknowledge before queuing; update that message with progress/result and send extra
-  chunks only when needed. A failed send may already have reached Telegram: do not
-  blindly retry an acknowledgement after a transport timeout.
+- Acknowledge before queuing and keep that message as the request card. Append the terminal
+  summary there, send the model's final answer as a separate message, and send extra chunks only
+  when needed. A failed send may already have reached Telegram: do not blindly retry an
+  acknowledgement after a transport timeout.
 - Keep one poller and advance offsets only after handling an update.
+- Handle callback-query updates from the request card under the same chat allowlist and update
+  deduplication as message commands. Keep the first acknowledgement as the active request card;
+  append timestamped status entries, and remove active controls when the request becomes terminal.
 - Bound admitted work (currently 32 requests, 4 workers), admit at most one active request
-  per chat, and retain per-chat locking. `/status` and `/cancel` must remain available while
+  per chat, and retain per-chat locking. `/status`, `/abort`, and `/cancel` must remain available while
   a request is active.
 - Reuse the selected session per chat. `/new` changes the mapping without deleting history;
   persist mappings with atomic file replacement.
@@ -45,14 +51,14 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
   progress information, not proof of completion; status and history determine completion.
 - Keep progress updates deterministic and sanitized: report analysis/tool/test stages and safe
   tool names, never raw reasoning text, tool inputs, or tool output. Include the request reference
-  and remind users that `/status` and `/cancel` target the active request by default.
+  and remind users that `/status` and `/abort` target the active request by default.
 - Show the age of the last correlated OpenCode activity separately from successful API polling;
   API reachability alone does not prove agent progress.
-- Surface permission requests for the active request's session tree and require an explicit `/allow` or
-  `/deny` decision; `/allow` is one-time by default. Never auto-approve. Interactive questions
-  are not currently bridged to Telegram.
-- At exchange completion, report a deduplicated list of tool names, including recognized CLI names
-  such as `gh`; never include command arguments or tool output.
+- Surface permission requests for the active request's session tree and require an explicit
+  `/allow <letter>`, `/allowAll <letter>`, or `/deny <letter>` decision; approval is one-time by
+  default. Never auto-approve. Interactive questions are not currently bridged to Telegram.
+- At exchange completion, report a deduplicated list of tool names and tool-call count, including
+  recognized CLI names such as `gh`; never include command arguments or tool output.
 - Report only OpenCode usage already observed for the active exchange, marked as partial; do not
   estimate cost or count repeated history snapshots more than once.
 - Persist request references, Telegram update IDs, acknowledgement IDs, and OpenCode
