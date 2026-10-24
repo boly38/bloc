@@ -36,11 +36,11 @@ TERMINAL_STATES = frozenset(
 
 ALLOWED_TRANSITIONS = {
     "acknowledging": frozenset(("acknowledging", "queued", "failed", "acknowledgement_unknown")),
-    "queued": frozenset(("queued", "submitting", "failed", "interrupted", "rejected")),
-    "submitting": frozenset(("submitting", "running", "uncertain", "failed")),
-    "running": frozenset(("running", "cancellation_requested", "delivering", "uncertain")),
+    "queued": frozenset(("queued", "submitting", "delivering", "failed", "interrupted", "rejected")),
+    "submitting": frozenset(("submitting", "running", "delivering", "uncertain", "failed")),
+    "running": frozenset(("running", "cancellation_requested", "recovering", "delivering", "uncertain", "failed")),
     "cancellation_requested": frozenset(
-        ("cancellation_requested", "running", "cancelled", "timed_out", "uncertain")
+        ("cancellation_requested", "running", "delivering", "cancelled", "timed_out", "uncertain")
     ),
     "recovering": frozenset(("recovering", "running", "uncertain", "failed")),
     "uncertain": frozenset(("uncertain", "recovering", "running", "failed", "cancelled", "timed_out")),
