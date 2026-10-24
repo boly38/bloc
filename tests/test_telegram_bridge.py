@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot", "telegra
 with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "unit-test-secret", "TELEGRAM_ALLOWED_CHAT_IDS": "123"}):
     from bloc_bridge import bridge, bridge_config, http_api, request_store, session_state
     from bloc_bridge.opencode import cost_reporting, api as opencode_api
+    from bloc_bridge.telegram.request_presentation import RequestPresentation
 
 
 class FakeResponse:
@@ -138,7 +139,8 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertNotIn("private command output", report)
 
     def test_permission_prompt_shows_sanitized_scope_and_explicit_choices(self):
-        prompt = bridge._format_permission_prompt(
+        presentation = RequestPresentation(123, 456, "REF12345")
+        presentation.sync_permissions(
             [
                 {
                     "id": "private-permission-id",
@@ -148,14 +150,30 @@ class TelegramBridgeTests(unittest.TestCase):
                 }
             ]
         )
+        prompt, keyboard = presentation.edit_payload()
 
         self.assertIn("webfetch: https://docs.example.test/path", prompt)
         self.assertIn("remember scope: *", prompt)
-        self.assertIn("/allow to allow once", prompt)
-        self.assertIn("/allow always", prompt)
-        self.assertIn("/deny", prompt)
+        self.assertIn("/allow A", prompt)
+        self.assertIn("/allowAll A", prompt)
+        self.assertIn("/deny A", prompt)
         self.assertNotIn("private-permission-id", prompt)
         self.assertNotIn("private-secret", prompt)
+        self.assertEqual(
+            [button["text"] for row in keyboard["inline_keyboard"] for button in row],
+            ["Status", "Abort", "Allow A", "Always A", "Deny A"],
+        )
+
+    def test_permission_letters_rotate_after_a_request_is_resolved(self):
+        presentation = RequestPresentation(123, 456, "REF12345")
+        first = {"id": "per-first", "permission": "read", "patterns": ["a"]}
+        second = {"id": "per-second", "permission": "write", "patterns": ["b"]}
+
+        presentation.sync_permissions([first])
+        presentation.resolve_permission("per-first")
+        presentation.sync_permissions([second])
+
+        self.assertEqual(presentation.permissions_by_letter(), {"B": second})
 
     def test_http_requests_do_not_add_basic_authentication(self):
         for url in (bridge_config.OC + "/global/health", bridge_config.TG + "getMe"):
@@ -252,7 +270,9 @@ class TelegramBridgeTests(unittest.TestCase):
         send.assert_called_once()
         self.assertIn("Ref:", send.call_args.args[1])
         self.assertIn("/status", send.call_args.args[1])
-        self.assertIn("/cancel", send.call_args.args[1])
+        self.assertIn("/abort", send.call_args.args[1])
+        keyboard = send.call_args.kwargs["reply_markup"]["inline_keyboard"]
+        self.assertEqual([button["text"] for button in keyboard[0]], ["Status", "Abort"])
         submit.assert_called_once()
         self.assertEqual(
             submit.call_args.args[:3],
@@ -260,8 +280,18 @@ class TelegramBridgeTests(unittest.TestCase):
         )
         self.assertEqual(
             submit.call_args.args[3:],
-            ({}, 987, send.call_args.args[1].rsplit(" ", 1)[-1], 654),
+            (
+                {},
+                987,
+                next(
+                    line.removeprefix("Ref: ")
+                    for line in send.call_args.args[1].splitlines()
+                    if line.startswith("Ref: ")
+                ),
+                654,
+            ),
         )
+        self.assertTrue(send.call_args.kwargs["reply_markup"]["inline_keyboard"])
 
     def test_async_answer_uses_correlated_completion_and_reports_cost(self):
         prompt_id = "msg_prompt-id"
@@ -296,7 +326,7 @@ class TelegramBridgeTests(unittest.TestCase):
                                     lambda _text: None,
                                 )
 
-        self.assertEqual(result, "Done\n\nCost: $0.250000\n\nTools used: none")
+        self.assertEqual(result, "Done\n\nCost: $0.250000\n\nTools used: none\nTool calls: 0")
         submit.assert_called_once()
         self.assertEqual(
             submit.call_args.args[:3],
@@ -426,7 +456,7 @@ class TelegramBridgeTests(unittest.TestCase):
                                     progress.append,
                                 )
 
-        self.assertEqual(result, "Done\n\nCost: $0.000000\n\nTools used: none")
+        self.assertEqual(result, "Done\n\nCost: $0.000000\n\nTools used: none\nTool calls: 0")
         self.assertEqual(
             progress,
             [
@@ -496,15 +526,17 @@ class TelegramBridgeTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(bridge, "answer_async", side_effect=bridge.OpenCodeRequestTimeout()):
             with patch.object(bridge, "edit_reply") as edit:
-                with patch("sys.stderr", output):
-                    bridge._request_worker(123, "private prompt", {}, 987, "REF12345", 654)
+                with patch.object(bridge, "send") as send:
+                    with patch("sys.stderr", output):
+                        bridge._request_worker(123, "private prompt", {}, 987, "REF12345", 654)
 
-        self.assertIn("may still be running", edit.call_args.args[2])
+        self.assertIn("may still be running", send.call_args.args[1])
         self.assertIn(
             "An operator can inspect the session using the remote TUI (`make remote-tui`).",
-            edit.call_args.args[2],
+            send.call_args.args[1],
         )
-        self.assertIn("REF12345", edit.call_args.args[2])
+        self.assertIn("REF12345", send.call_args.args[1])
+        self.assertIn("Status: failed", edit.call_args.args[2])
         self.assertIn("phase=opencode_request", output.getvalue())
         self.assertIn("timeout_s=432000", output.getvalue())
         self.assertNotIn("private prompt", output.getvalue())
@@ -513,12 +545,14 @@ class TelegramBridgeTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(bridge, "answer_async", side_effect=RuntimeError("private prompt text")):
             with patch.object(bridge, "edit_reply") as edit:
-                with patch("sys.stderr", output):
-                    bridge._request_worker(123, "Hi", {}, 990, "REF98765", 656)
+                with patch.object(bridge, "send") as send:
+                    with patch("sys.stderr", output):
+                        bridge._request_worker(123, "Hi", {}, 990, "REF98765", 656)
 
-        self.assertIn("OpenCode request failed", edit.call_args.args[2])
-        self.assertNotIn("remote TUI", edit.call_args.args[2])
-        self.assertIn("REF98765", edit.call_args.args[2])
+        self.assertIn("OpenCode request failed", send.call_args.args[1])
+        self.assertNotIn("remote TUI", send.call_args.args[1])
+        self.assertIn("REF98765", send.call_args.args[1])
+        self.assertIn("Status: failed", edit.call_args.args[2])
         self.assertNotIn("private prompt text", output.getvalue())
         self.assertIn("detail=redacted", output.getvalue())
 
@@ -526,11 +560,13 @@ class TelegramBridgeTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(bridge, "answer_async", return_value="Done"):
             with patch.object(bridge, "edit_reply", side_effect=TimeoutError()) as edit:
-                with patch("sys.stderr", output):
-                    bridge._request_worker(123, "Hi", {}, 989, "REF54321", 655)
+                with patch.object(bridge, "send") as send:
+                    with patch("sys.stderr", output):
+                        bridge._request_worker(123, "Hi", {}, 989, "REF54321", 655)
 
         edit.assert_called_once()
-        self.assertIn("phase=telegram_final_edit", output.getvalue())
+        send.assert_called_once()
+        self.assertIn("phase=telegram_terminal_summary_edit", output.getvalue())
         self.assertNotIn("phase=telegram_error_edit", output.getvalue())
 
     def test_telegram_ack_timeout_is_not_misreported_as_opencode_failure(self):
@@ -878,7 +914,8 @@ class TelegramBridgeTests(unittest.TestCase):
         with patch.object(bridge, "authorized_response", return_value="Use /help") as respond:
             with patch.object(bridge, "answer_async") as answer:
                 with patch.object(bridge, "edit_reply"):
-                    bridge._request_worker(123, "/unknown", {}, 991, "REF12345", 657)
+                    with patch.object(bridge, "send"):
+                        bridge._request_worker(123, "/unknown", {}, 991, "REF12345", 657)
 
         respond.assert_called_once_with(123, "/unknown", {})
         answer.assert_not_called()

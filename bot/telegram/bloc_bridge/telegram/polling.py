@@ -18,7 +18,7 @@ def poll_updates(stop, handle_update, sessions):
                 {
                     "offset": offset,
                     "timeout": TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
-                    "allowed_updates": ["message"],
+                    "allowed_updates": ["message", "callback_query"],
                 },
             ) or []
             conflict_backoff = 5
