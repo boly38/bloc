@@ -2,6 +2,7 @@
 
 import re
 import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -10,6 +11,7 @@ _SENSITIVE_VALUE = re.compile(
     r"(?i)\b(token|password|secret|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,;]+)"
 )
 _MAX_MESSAGE_LENGTH = 3600
+_STATUS_CHECK_TTL_SECONDS = 180
 
 
 def _safe_scope(value):
@@ -40,6 +42,7 @@ class RequestPresentation:
         self.lock = threading.RLock()
         self.progress = "Request received."
         self.status_entries = []
+        self.status_expiry_timer = None
         self.permissions = []
         self.permission_letters = {}
         self.next_permission_letter = 0
@@ -61,8 +64,28 @@ class RequestPresentation:
         with self.lock:
             if self.final_text is not None:
                 return
-            self.status_entries.append(f"[{timestamp}] {text}")
+            now = time.monotonic()
+            self.expire_statuses(now)
+            self.status_entries.append(
+                {"expires_at": now + _STATUS_CHECK_TTL_SECONDS, "text": f"[{timestamp}] {text}"}
+            )
             self.status_entries = self.status_entries[-8:]
+
+    def expire_statuses(self, now=None):
+        """Remove status-check results that have been visible for three minutes."""
+        if now is None:
+            now = time.monotonic()
+        with self.lock:
+            remaining = [entry for entry in self.status_entries if entry["expires_at"] > now]
+            changed = len(remaining) != len(self.status_entries)
+            self.status_entries = remaining
+            return changed
+
+    def seconds_until_status_expiry(self):
+        with self.lock:
+            if self.final_text is not None or not self.status_entries:
+                return None
+            return max(0, min(entry["expires_at"] for entry in self.status_entries) - time.monotonic())
 
     def sync_permissions(self, requests):
         with self.lock:
@@ -115,6 +138,9 @@ class RequestPresentation:
     def finish(self, text):
         with self.lock:
             self.final_text = text
+            if self.status_expiry_timer is not None:
+                self.status_expiry_timer.cancel()
+                self.status_expiry_timer = None
             self.permissions = []
             self.permission_letters = {}
 
@@ -150,13 +176,14 @@ class RequestPresentation:
         return None
 
     def _render_active(self):
+        self.expire_statuses()
         lines = [
             self.progress,
             f"Ref: {self.reference}",
             "Use /status or /abort (/cancel); buttons below control this request.",
         ]
         if self.status_entries:
-            lines.extend(("", "Status checks:", *self.status_entries))
+            lines.extend(("", "Status checks:", *(entry["text"] for entry in self.status_entries)))
         if self.permissions:
             lines.extend(("", "Permissions waiting for a decision:"))
             for entry in self.permissions[:5]:

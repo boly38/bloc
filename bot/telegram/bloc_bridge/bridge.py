@@ -156,9 +156,41 @@ def _edit_request_presentation(presentation):
         )
 
 
+def _schedule_request_status_expiry(presentation):
+    with presentation.lock:
+        if presentation.status_expiry_timer is not None:
+            presentation.status_expiry_timer.cancel()
+            presentation.status_expiry_timer = None
+        delay = presentation.seconds_until_status_expiry()
+        if delay is None:
+            return
+        timer = threading.Timer(delay, lambda: _expire_request_statuses(presentation, timer))
+        timer.daemon = True
+        presentation.status_expiry_timer = timer
+    timer.start()
+
+
+def _expire_request_statuses(presentation, timer):
+    with presentation.lock:
+        if presentation.status_expiry_timer is not timer:
+            return
+        presentation.status_expiry_timer = None
+        changed = presentation.expire_statuses()
+    if changed:
+        _schedule_request_status_expiry(presentation)
+        _edit_request_presentation(presentation)
+    else:
+        _schedule_request_status_expiry(presentation)
+
+
 def _forget_request_presentation(reference):
     with _REQUEST_PRESENTATIONS_LOCK:
-        _REQUEST_PRESENTATIONS.pop(reference, None)
+        presentation = _REQUEST_PRESENTATIONS.pop(reference, None)
+    if presentation is not None:
+        with presentation.lock:
+            if presentation.status_expiry_timer is not None:
+                presentation.status_expiry_timer.cancel()
+                presentation.status_expiry_timer = None
 
 
 def _append_request_status(chat_id, reference, status_text):
@@ -1401,6 +1433,7 @@ def _append_request_status(chat_id, reference, text):
         if presentation.final_text is not None:
             return False
     presentation.append_status(text)
+    _schedule_request_status_expiry(presentation)
     _edit_request_presentation(presentation)
     return True
 
