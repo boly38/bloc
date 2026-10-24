@@ -141,6 +141,45 @@ class TelegramRequestTests(unittest.TestCase):
         )
         bridge._forget_request_presentation(request["reference"])
 
+    def test_status_check_disappears_after_three_minutes_without_changing_progress(self):
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.cancelled = False
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+            def fire(self):
+                self.function()
+
+        request, _ = request_store.create("C" * 16, 123, 1045, state="running")
+        request_store.update(request["reference"], acknowledgement_id=543)
+        presentation = bridge._request_presentation(request["reference"], 123, 543)
+        presentation.set_progress("Request is still running")
+
+        with patch("bloc_bridge.telegram.request_presentation.time.monotonic", return_value=100):
+            with patch.object(bridge.threading, "Timer", FakeTimer):
+                with patch.object(bridge, "edit_reply") as edit:
+                    self.assertTrue(bridge._append_request_status(123, request["reference"], "Still running"))
+                    timer = presentation.status_expiry_timer
+                    self.assertEqual(timer.interval, 180)
+
+                    with patch(
+                        "bloc_bridge.telegram.request_presentation.time.monotonic",
+                        return_value=280,
+                    ):
+                        timer.fire()
+
+        self.assertEqual(edit.call_count, 2)
+        self.assertNotIn("Status checks:", edit.call_args.args[2])
+        self.assertIn("Request is still running", edit.call_args.args[2])
+        bridge._forget_request_presentation(request["reference"])
+
     def test_cancel_requests_real_opencode_abort_and_reports_confirmation(self):
         request, _ = request_store.create("D" * 16, 123, 105, state="running")
         request_store.update(
