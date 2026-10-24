@@ -34,6 +34,27 @@ TERMINAL_STATES = frozenset(
     }
 )
 
+ALLOWED_TRANSITIONS = {
+    "acknowledging": frozenset(("acknowledging", "queued", "failed", "acknowledgement_unknown")),
+    "queued": frozenset(("queued", "submitting", "failed", "interrupted", "rejected")),
+    "submitting": frozenset(("submitting", "running", "uncertain", "failed")),
+    "running": frozenset(("running", "cancellation_requested", "delivering", "uncertain")),
+    "cancellation_requested": frozenset(
+        ("cancellation_requested", "running", "cancelled", "timed_out", "uncertain")
+    ),
+    "recovering": frozenset(("recovering", "running", "uncertain", "failed")),
+    "uncertain": frozenset(("uncertain", "recovering", "running", "failed", "cancelled", "timed_out")),
+    "delivering": frozenset(
+        ("delivering", "completed", "failed", "cancelled", "timed_out", "delivery_unknown")
+    ),
+}
+for _terminal_state in TERMINAL_STATES:
+    ALLOWED_TRANSITIONS[_terminal_state] = frozenset((_terminal_state,))
+
+
+class InvalidTransition(RuntimeError):
+    """Raised when a request attempts a state transition outside its lifecycle."""
+
 
 def _connect():
     directory = os.path.dirname(REQUESTS_PATH)
@@ -90,6 +111,8 @@ def initialize():
 
 def create(reference, chat_id, update_id, state="acknowledging", detail=None):
     """Create one request for a Telegram update; return its row and whether it was new."""
+    if state not in ALLOWED_TRANSITIONS:
+        raise InvalidTransition(f"unknown initial state {state}")
     now = time.time()
     with _connection() as connection:
         # Telegram may redeliver an update until the next poll confirms its offset.
@@ -157,12 +180,50 @@ def update(reference, **fields):
     if not updates:
         return get(reference)
 
+    requested_state = updates.get("state")
+    if requested_state is not None:
+        return transition(reference, requested_state, **{key: value for key, value in updates.items() if key != "state"})
+
     updates["updated_at"] = time.time()
     assignments = ", ".join(f"{key} = ?" for key in updates)
     values = list(updates.values()) + [reference]
     with _connection() as connection:
         connection.execute(
             f"UPDATE requests SET {assignments} WHERE reference = ?", values
+        )
+        row = connection.execute(
+            "SELECT * FROM requests WHERE reference = ?", (reference,)
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def transition(reference, new_state, **fields):
+    """Atomically validate and apply one request lifecycle transition."""
+    allowed = {
+        "acknowledgement_id",
+        "session_id",
+        "prompt_message_id",
+        "detail",
+        "started_at",
+        "completed_at",
+    }
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    updates["state"] = new_state
+    updates["updated_at"] = time.time()
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT state FROM requests WHERE reference = ?", (reference,)
+        ).fetchone()
+        if row is None:
+            return None
+        current_state = row["state"]
+        if new_state not in ALLOWED_TRANSITIONS.get(current_state, ()):
+            raise InvalidTransition(f"cannot transition from {current_state} to {new_state}")
+        values = list(updates.values()) + [reference, current_state]
+        connection.execute(
+            f"UPDATE requests SET {assignments} WHERE reference = ? AND state = ?",
+            values,
         )
         row = connection.execute(
             "SELECT * FROM requests WHERE reference = ?", (reference,)
@@ -184,12 +245,29 @@ def update_if_state(reference, expected_states, **fields):
     updates = {key: value for key, value in fields.items() if key in allowed}
     if not updates:
         return get(reference)
+    requested_state = updates.get("state")
+    updates.pop("state", None)
     updates["updated_at"] = time.time()
     assignments = ", ".join(f"{key} = ?" for key in updates)
     expected = tuple(expected_states)
     placeholders = ", ".join("?" for _ in expected)
     values = list(updates.values()) + [reference, *expected]
     with _connection() as connection:
+        if requested_state is not None:
+            current = connection.execute(
+                "SELECT state FROM requests WHERE reference = ? AND state IN ({} )".format(placeholders),
+                (reference, *expected),
+            ).fetchone()
+            if current is None:
+                row = connection.execute(
+                    "SELECT * FROM requests WHERE reference = ?", (reference,)
+                ).fetchone()
+                return dict(row) if row is not None else None
+            if requested_state not in ALLOWED_TRANSITIONS.get(current["state"], ()):
+                raise InvalidTransition(f"cannot transition from {current['state']} to {requested_state}")
+            updates["state"] = requested_state
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            values = list(updates.values()) + [reference, *expected]
         connection.execute(
             f"UPDATE requests SET {assignments} WHERE reference = ? AND state IN ({placeholders})",
             values,
