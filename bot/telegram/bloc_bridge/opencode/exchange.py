@@ -23,6 +23,7 @@ from ..bridge_config import (
 )
 from . import api as opencode_api
 from . import cost_reporting
+from . import monitor_policy
 from . import tooling
 
 
@@ -381,21 +382,13 @@ class _AsyncRequestMonitor:
             daemon=True,
         )
 
-        self.monitor_started_at = time.monotonic()
-        # Use the persisted wall clock across restarts, then a monotonic deadline locally.
-        elapsed_duration = max(0, time.time() - started_at)
-        remaining_duration = max(0, OPENCODE_REQUEST_MAX_DURATION_SECONDS - elapsed_duration)
-        self.deadline = self.monitor_started_at + remaining_duration
-        self.prompt_reconcile_deadline = self.monitor_started_at + 10
-
-        self.abort_reason = None
-        self.abort_deadline = None
-        self.abort_sent = False
-        self.abort_unavailable = False
-        self.next_abort_at = 0
-        self.reconcile_deadline = None
-        self.reconcile_reported = False
-        self.idle_samples = 0
+        self.policy = monitor_policy.AsyncRequestMonitorPolicy.start(
+            started_at,
+            OPENCODE_REQUEST_MAX_DURATION_SECONDS,
+            time.time(),
+            time.monotonic(),
+        )
+        self.monitor_started_at = self.policy.monitor_started_at
         self.reported_read_error = False
 
         self.current_stage = None
@@ -447,27 +440,12 @@ class _AsyncRequestMonitor:
     def _update_stop_reason(self):
         """Apply user cancellation or the request deadline to monitor state."""
         request = request_store.get(self.reference) if self.reference else None
-        cancellation_pending = request and (
-            request["state"] == "cancellation_requested"
-            or (request["state"] == "recovering" and request.get("detail") == "user_cancelled")
-        )
-        if cancellation_pending and request.get("detail") == "user_cancelled":
-            if self.abort_reason != "user_cancelled":
-                self.abort_reason = "user_cancelled"
-                self.abort_sent = False
-                self.abort_unavailable = False
-                self.next_abort_at = time.monotonic()
-        elif cancellation_pending and self.abort_reason is None:
-            self.abort_reason = request.get("detail") or "cancelled"
-
-        if self.abort_reason is None and time.monotonic() >= self.deadline:
-            self.abort_reason = "timed_out"
-        if self.abort_reason is not None and self.reconcile_deadline is None:
-            self.reconcile_deadline = time.monotonic() + 60
+        reason_to_persist = self.policy.update_stop_reason(request, time.monotonic())
+        if reason_to_persist is not None:
             request_store.update(
                 self.reference,
                 state="cancellation_requested",
-                detail=self.abort_reason,
+                detail=reason_to_persist,
             )
 
     def _read_snapshot(self):
@@ -478,7 +456,7 @@ class _AsyncRequestMonitor:
             self.session_id,
             timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
         )
-        self.idle_samples = 0 if busy else self.idle_samples + 1
+        self.policy.observe_session_status(busy)
         prompt_found = any(
             isinstance(message, dict)
             and isinstance(message.get("info"), dict)
@@ -567,18 +545,15 @@ class _AsyncRequestMonitor:
             request_store.update(self.reference, state="uncertain", detail="status_unavailable")
 
         now = time.monotonic()
-        if self.abort_deadline is not None and now >= self.abort_deadline:
+        if self.policy.abort_expired(now):
             request_store.update(self.reference, state="uncertain", detail="stop_unconfirmed")
-            self.abort_deadline = None
-            self.abort_sent = False
-            self.next_abort_at = now + 30
         self._report_unconfirmed_reconciliation(now)
 
     def _raise_correlated_response_error(self, snapshot):
         """Surface provider errors unless a timeout or cancellation is stopping work."""
         # An abort may itself be recorded as an assistant error. Once stopping
         # was requested, the confirmed stop reason takes precedence.
-        if self.abort_reason is not None:
+        if self.policy.abort_reason is not None:
             return
         try:
             for message in snapshot.correlated_messages:
@@ -621,50 +596,42 @@ class _AsyncRequestMonitor:
                 self.current_stage = stage
 
     def _is_request_complete(self, snapshot):
-        return (
-            self.abort_reason is None
-            and snapshot.correlated_messages
+        response_complete = bool(
+            snapshot.correlated_messages
             and _assistant_response_complete(snapshot.correlated_messages[-1])
-            and not snapshot.busy
-            and self.idle_samples >= 2
         )
+        return self.policy.request_is_complete(response_complete, snapshot.busy)
 
     def _request_abort(self, snapshot):
         """Abort only after the submitted prompt is visible in the busy session."""
         if not (
-            self.abort_reason is not None
-            and snapshot.prompt_found
-            and snapshot.busy
-            and not self.abort_sent
-            and not self.abort_unavailable
-            and time.monotonic() >= self.next_abort_at
+            self.policy.should_abort(
+                snapshot.prompt_found,
+                snapshot.busy,
+                time.monotonic(),
+            )
         ):
             return
 
         try:
             # Abort is session-wide, so require this job's prompt in history first.
-            self.abort_sent = opencode_api.abort_session(
+            abort_sent = opencode_api.abort_session(
                 self.session_id,
                 timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
             )
-            if self.abort_sent:
-                self.abort_deadline = time.monotonic() + 60
-            else:
-                self.next_abort_at = time.monotonic() + 30
+            self.policy.record_abort_result(abort_sent, time.monotonic())
         except Exception as error:
             request_store.update(self.reference, state="uncertain", detail="abort_unconfirmed")
-            if _retryable_status_error(error):
-                self.next_abort_at = time.monotonic() + 30
-            else:
-                self.abort_unavailable = True
+            self.policy.record_abort_error(_retryable_status_error(error), time.monotonic())
 
     def _resolve_stop_outcome(self, snapshot):
         """Resolve a requested stop, or fail if the submitted prompt is unconfirmed."""
-        if self.abort_reason is None or snapshot.busy or self.idle_samples < 2:
+        outcome = self.policy.stop_outcome(snapshot.prompt_found, snapshot.busy)
+        if outcome is None:
             return
-        if snapshot.prompt_found or self.abort_sent:
+        if outcome is not monitor_policy.MonitorOutcome.SUBMISSION_UNCONFIRMED:
             raise OpenCodeRequestStopped(
-                self.abort_reason,
+                outcome,
                 _tool_names(snapshot.correlated_messages),
                 _tool_call_count(snapshot.correlated_messages),
             )
@@ -679,11 +646,11 @@ class _AsyncRequestMonitor:
     def _reconcile_missing_prompt(self, snapshot):
         """Fail safely when OpenCode is idle but never confirms the submitted prompt."""
         if not (
-            self.abort_reason is None
-            and not snapshot.prompt_found
-            and not snapshot.busy
-            and self.idle_samples >= 2
-            and time.monotonic() >= self.prompt_reconcile_deadline
+            self.policy.missing_prompt_expired(
+                snapshot.prompt_found,
+                snapshot.busy,
+                time.monotonic(),
+            )
         ):
             return
         request_store.update(
@@ -697,29 +664,15 @@ class _AsyncRequestMonitor:
     def _update_stop_deadlines(self, snapshot):
         """Mark abort or submission reconciliation as uncertain when its grace period ends."""
         now = time.monotonic()
-        if (
-            self.reconcile_deadline is not None
-            and not snapshot.prompt_found
-            and not self.reconcile_reported
-            and now >= self.reconcile_deadline
-        ):
+        if self.policy.reconciliation_expired(snapshot.prompt_found, now):
             request_store.update(self.reference, state="uncertain", detail="submission_unconfirmed")
-            self.reconcile_reported = True
-        if self.abort_deadline is not None and now >= self.abort_deadline:
+        if self.policy.abort_expired(now):
             request_store.update(self.reference, state="uncertain", detail="stop_unconfirmed")
-            self.abort_deadline = None
-            self.abort_sent = False
-            self.next_abort_at = now + 30
 
     def _report_unconfirmed_reconciliation(self, now):
         """Record a submission that remains unconfirmed during a polling failure."""
-        if (
-            self.reconcile_deadline is not None
-            and not self.reconcile_reported
-            and now >= self.reconcile_deadline
-        ):
+        if self.policy.reconciliation_expired(prompt_found=False, now=now):
             request_store.update(self.reference, state="uncertain", detail="submission_unconfirmed")
-            self.reconcile_reported = True
 
     def _report_progress(self, snapshot, progress, api_responding=True):
         """Send throttled stage, heartbeat, and observed-cost updates."""

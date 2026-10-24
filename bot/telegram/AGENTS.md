@@ -18,6 +18,7 @@ Docker runs `python -m bloc_bridge`. Its Dockerfile copies the entire package.
   permission action buttons.
 - `telegram/format_test.py`: static formatting fixture; never calls the model.
 - `opencode/api.py`: OpenCode API helpers and prompt/assistant correlation.
+- `opencode/monitor_policy.py`: deterministic completion, cancellation, timeout, and recovery decisions.
 - `opencode/cost_reporting.py`: usage aggregation and sanitized diagnostics.
 - `bridge_runtime.py`: daemon workers, shutdown context, and cooperative cancellation.
 - `http_api.py`: shared HTTP transport, Telegram error classification, and polling lock.
