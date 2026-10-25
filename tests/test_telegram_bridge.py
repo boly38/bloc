@@ -211,6 +211,47 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertNotIn("/abort", text)
         self.assertEqual([button["text"] for button in keyboard["inline_keyboard"][0]], ["Status", "Abort"])
 
+    def test_request_card_shows_provider_model_and_variant_until_completion(self):
+        presentation = RequestPresentation(
+            123,
+            456,
+            "REF12345",
+            "github-copilot/gpt-6-luna#medium",
+        )
+
+        active_text, _ = presentation.edit_payload()
+        self.assertEqual(
+            active_text.splitlines()[:4],
+            [
+                "Ref: REF12345",
+                "Provider: `github-copilot`",
+                "Model: `gpt-6-luna`",
+                "Variant: `medium`",
+            ],
+        )
+
+        presentation.finish("Ref: REF12345\nStatus: completed")
+        final_text, _ = presentation.edit_payload()
+        self.assertEqual(
+            final_text.splitlines(),
+            [
+                "Ref: REF12345",
+                "Provider: `github-copilot`",
+                "Model: `gpt-6-luna`",
+                "Variant: `medium`",
+                "Status: completed",
+            ],
+        )
+
+    def test_request_card_labels_an_omitted_variant_as_default(self):
+        presentation = RequestPresentation(123, 456, "REF12345", "opper/gpt-5.6-luna")
+
+        text, _ = presentation.edit_payload()
+
+        self.assertIn("Provider: `opper`", text)
+        self.assertIn("Model: `gpt-5.6-luna`", text)
+        self.assertIn("Variant: `default`", text)
+
     def test_http_requests_do_not_add_basic_authentication(self):
         for url in (bridge_config.OC + "/global/health", bridge_config.TG + "getMe"):
             with self.subTest(url=url):

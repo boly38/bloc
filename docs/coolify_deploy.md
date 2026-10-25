@@ -6,6 +6,8 @@ The Compose deployment has been tested with Coolify. Configure the resource as f
 - **Docker Compose Location:** `/docker-compose.yml`
 - Add the values from [`.env.coolify.template`](../.env.coolify.template) as resource
   environment variables. Keep `COMPOSE_PROFILES=telegram` to enable the bot.
+- Set `OPENCODE_MODEL` to the chosen `provider/model#variant` when using a provider other than
+  the default Opper model. Leave the variant suffix off when using the provider default.
 - Set real credentials and allowed chat IDs; discover the first ID locally with
   [`make telegram-chat-id`](quickstart.md#configure-and-start) before enabling Telegram.
 - Keep the pinned `OPENCODE_IMAGE` digest unless a replacement has been qualified.
@@ -18,6 +20,10 @@ outside this repository's control and must not expose the API.
 For provider settings, see [Provider](provider.md); for trust boundaries, see
 [Security](security.md). The local TUI requires an operator shell with Docker access to
 the deployment.
+
+Provider authentication is deployment-specific. Connecting on the local machine does not
+authenticate the Coolify instance. After deployment, use the remote TUI below to run `/connect`
+and `/models`; credentials are stored in the remote OpenCode data volume.
 
 ## Remote TUI
 

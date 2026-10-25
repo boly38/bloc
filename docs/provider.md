@@ -1,37 +1,81 @@
-# Provider
+# Providers
 
-Opper AI is the example provider configured by default in BLOC. Its OpenAI-compatible
-endpoint and provider settings are defined in [`bot/opencode.json`](../bot/opencode.json).
-The API key comes from `OPPER_API_KEY`; it is passed to the OpenCode container and is not
-stored in that configuration file.
+BLOC uses Opper AI by default, but Opper is not required. BLOC can use providers supported by
+the qualified OpenCode release. Connect a provider in the trusted OpenCode TUI, choose one of
+its available models, then set that model as `OPENCODE_MODEL` so Telegram uses it too. Provider
+availability, authentication methods, model access, and billing are controlled by each provider.
+See the official [OpenCode provider directory](https://opencode.ai/docs/providers/) for details.
 
-OpenCode supports many providers and local models, and also lets you configure a custom
-provider. You can replace the example provider or add your own in `bot/opencode.json`.
-See the official [OpenCode provider documentation](https://opencode.ai/docs/providers/)
-for supported providers and configuration options.
+## Default provider: Opper AI
 
-Set the key in the ignored local `.env` file. The defaults are:
+The Opper endpoint is configured in [`bot/opencode.json`](../bot/opencode.json). Its API key
+is supplied through `OPPER_API_KEY`; do not put it in the config file or commit it. The defaults
+are:
 
 ```dotenv
 OPPER_MODEL=gpt-5.6-luna
 OPPER_VARIANT=medium
 ```
 
-The resulting OpenCode model identifier is
-`opper/${OPPER_MODEL}#${OPPER_VARIANT}`, by default
-`opper/gpt-5.6-luna#medium`. Use a model identifier available in your Opper project and
-do not add the `openai/` prefix to `OPPER_MODEL`.
+When `OPENCODE_MODEL` is empty, BLOC constructs
+`opper/${OPPER_MODEL}#${OPPER_VARIANT}`, which defaults to `opper/gpt-5.6-luna#medium`. Use a
+model available to your Opper project and omit the `openai/` prefix from `OPPER_MODEL`.
 
-After changing provider settings, validate and restart:
+## Use another provider
 
-```sh
-make config
-make start
-make health
-```
+These steps apply to local BLOC. For Coolify or another remote deployment, see
+[Remote deployment](#remote-deployment) first.
 
-For Coolify, configure these values as resource environment variables; see the
-[Coolify deployment guide](coolify_deploy.md). Never commit or share a real API key.
+1. Create `.env` from `.env.template`. `OPPER_API_KEY` is only needed if you plan to use Opper.
+2. Start the server and open its trusted TUI:
+
+   ```sh
+   make config
+   make start
+   make tui
+   ```
+
+3. In the TUI, run `/connect`, choose the provider, and complete the authentication it requests.
+   Some providers use browser sign-in; others ask for a provider API key or need extra settings.
+4. Run `/models` and choose a model that your provider account can use. The CLI command
+   `opencode models` lists full IDs in `provider/model` form. Do not infer an ID from its display
+   name.
+5. In `.env`, set `OPENCODE_MODEL` to that exact ID. Add `#variant` only if you selected a
+   variant; for example:
+
+   ```dotenv
+   OPENCODE_MODEL=github-copilot/gpt-6-luna#medium
+   ```
+
+6. Apply the setting:
+
+   ```sh
+   make config
+   make restart
+   ```
+
+Telegram requests use `OPENCODE_MODEL`, even if you select a different model in the TUI. Each
+Telegram request card shows the configured provider, model, and variant; an omitted variant is
+shown as `default`.
+
+Provider credentials added through `/connect` are kept in the persistent `opencode-data` volume,
+not in `.env`. A restart keeps them; `make clean` deletes the volume and requires connecting
+again.
+
+## Remote deployment
+
+For Coolify, set `OPENCODE_MODEL` in the resource environment variables, not in the repository.
+The local `.env` and local OpenCode credentials are not copied to Coolify. After deploying:
+
+1. Run `make remote-tui HOST=<ssh-alias>` to find the remote OpenCode container ID.
+2. Run `make remote-tui HOST=<ssh-alias> CONTAINER_ID=<container-id>` to open its TUI.
+3. In that remote TUI, run `/connect` and `/models`.
+
+The remote credentials are stored in that deployment's persistent `opencode-data` volume. See
+the [Coolify remote TUI instructions](coolify_deploy.md#remote-tui) for the full procedure and
+security requirements.
+
+Never publish the OpenCode API port to the Internet or commit provider credentials.
 
 ## Optional reachability check
 

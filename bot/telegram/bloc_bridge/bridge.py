@@ -70,7 +70,7 @@ def _request_presentation(reference, chat_id=None, acknowledgement_id=None):
                 )
         if chat_id is None or acknowledgement_id is None:
             return None
-        presentation = RequestPresentation(chat_id, acknowledgement_id, reference)
+        presentation = RequestPresentation(chat_id, acknowledgement_id, reference, MODEL)
         _REQUEST_PRESENTATIONS[reference] = presentation
         _prune_request_presentations()
         return presentation
@@ -1419,7 +1419,7 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
     if not created:
         return
     started = time.monotonic()
-    presentation = RequestPresentation(chat_id, None, reference)
+    presentation = RequestPresentation(chat_id, None, reference, MODEL)
     acknowledgement_text, acknowledgement_markup = presentation.edit_payload()
     try:
         # Acknowledge before queuing so users get an immediate response.

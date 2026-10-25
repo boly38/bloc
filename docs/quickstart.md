@@ -3,14 +3,18 @@
 ## Requirements
 
 - Docker with Compose v2;
-- an [Opper AI](https://opper.ai/) API key (see [Provider](provider.md));
+- access to the provider you choose (credentials depend on the provider); an
+  [Opper AI](https://opper.ai/) API key is needed only for the default Opper setup
+  (see [Provider](provider.md));
 - a Telegram bot from [@BotFather](https://t.me/BotFather) if you want Telegram access.
 
 Run all operations from the repository root through the `Makefile`.
 
 ## Configure and start
 
-Create the local environment file and set `OPPER_API_KEY`:
+Create the local environment file. For the default Opper setup, set `OPPER_API_KEY`. To use
+another provider, you can leave it empty and follow the [provider setup](provider.md) after
+starting OpenCode:
 
 ```sh
 cp .env.template .env

@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 _SENSITIVE_VALUE = re.compile(
     r"(?i)\b(token|password|secret|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,;]+)"
 )
+_MODEL_COMPONENT = re.compile(r"^[A-Za-z0-9@._:+/-]{1,120}$")
+_MODEL_VARIANT = re.compile(r"^[A-Za-z0-9@._:+-]{1,40}$")
 _MAX_MESSAGE_LENGTH = 3600
 _STATUS_CHECK_TTL_SECONDS = 180
 
@@ -32,13 +34,33 @@ def _safe_scope(value):
     return value[:117] + "..." if len(value) > 120 else value or "scope details unavailable"
 
 
+def _model_details(model_reference):
+    if not isinstance(model_reference, str):
+        return ()
+    model_reference, variant_separator, variant = model_reference.strip().partition("#")
+    provider, separator, model = model_reference.partition("/")
+    if not separator or not _MODEL_COMPONENT.fullmatch(provider) or not _MODEL_COMPONENT.fullmatch(model):
+        return ()
+    if variant_separator:
+        if not _MODEL_VARIANT.fullmatch(variant):
+            return ()
+    else:
+        variant = "default"
+    return (
+        f"Provider: `{provider}`",
+        f"Model: `{model}`",
+        f"Variant: `{variant}`",
+    )
+
+
 class RequestPresentation:
     """Keep one editable request message with status history and permission actions."""
 
-    def __init__(self, chat_id, message_id, reference):
+    def __init__(self, chat_id, message_id, reference, model_reference=None):
         self.chat_id = chat_id
         self.message_id = message_id
         self.reference = reference
+        self.model_details = _model_details(model_reference)
         self.lock = threading.RLock()
         self.progress = "Request received."
         self.status_entries = []
@@ -147,6 +169,11 @@ class RequestPresentation:
     def edit_payload(self):
         with self.lock:
             text = self.final_text or self._render_active()
+            if self.model_details:
+                lines = text.splitlines()
+                insert_at = 1 if lines and lines[0].startswith("Ref: ") else 0
+                lines[insert_at:insert_at] = self.model_details
+                text = "\n".join(lines)
             return self._truncate(text), self._keyboard()
 
     def _permission_signature(self):

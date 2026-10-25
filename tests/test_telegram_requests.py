@@ -86,6 +86,23 @@ class TelegramRequestTests(unittest.TestCase):
         send.assert_called_once()
         submit.assert_called_once()
 
+    def test_request_acknowledgement_shows_the_configured_model(self):
+        update = {"update_id": 1031, "message": {"chat": {"id": 123}, "text": "Use Copilot"}}
+        model_reference = "github-copilot/gpt-6-luna#medium"
+        with patch.object(bridge, "MODEL", model_reference):
+            with patch.object(bridge, "send", return_value={"message_id": 504}) as send:
+                with patch.object(bridge._REQUEST_EXECUTOR, "submit") as submit:
+                    with patch.object(bridge._REQUEST_SLOTS, "acquire", return_value=True):
+                        bridge.handle_update(update, {})
+
+        acknowledgement = send.call_args.args[1]
+        self.assertIn("Provider: `github-copilot`", acknowledgement)
+        self.assertIn("Model: `gpt-6-luna`", acknowledgement)
+        self.assertIn("Variant: `medium`", acknowledgement)
+        request = request_store.get_by_update_id(1031)
+        bridge._forget_request_presentation(request["reference"])
+        submit.assert_called_once()
+
     def test_non_model_command_sends_only_its_result_without_a_request_card(self):
         update = {"update_id": 1031, "message": {"chat": {"id": 123}, "text": "/start"}}
         with patch.object(bridge, "send") as send:
