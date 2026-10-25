@@ -1,6 +1,6 @@
 # BLOC
 
-**BLOC** (BLOC Layer for OpenCode) is a minimal Docker Compose setup for running
+**BLOC** (**BLOC for Long-running OpenCode Conversations**) is a minimal Docker Compose setup for running
 [OpenCode](https://opencode.ai/) on its own or connecting it to Telegram.
 
 This BLOC release is qualified with **OpenCode v1.19.3**. OpenCode v2 is not yet qualified.
