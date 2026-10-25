@@ -17,8 +17,8 @@ services:
       all_proxy: ""
       NO_PROXY: "localhost,127.0.0.1,::1"
       no_proxy: "localhost,127.0.0.1,::1"
-      OPPER_API_KEY: ${OPPER_API_KEY:?OPPER_API_KEY is required}
-      OPENCODE_MODEL: opper/${OPPER_MODEL:?OPPER_MODEL is required}#${OPPER_VARIANT:-medium}
+      OPPER_API_KEY: ${OPPER_API_KEY:-}
+      OPENCODE_MODEL: ${OPENCODE_MODEL:-opper/${OPPER_MODEL:-gpt-5.6-luna}#${OPPER_VARIANT:-medium}}
       GH_TOKEN: ${GH_TOKEN:-}
     volumes:
       - opencode-data:/root/.local/share/opencode
@@ -51,7 +51,7 @@ services:
       TELEGRAM_HEALTH_OPPER_ENABLED: ${TELEGRAM_HEALTH_OPPER_ENABLED:-false}
       OPENCODE_REQUEST_MAX_DURATION_SECONDS: ${OPENCODE_REQUEST_MAX_DURATION_SECONDS:-432000}
       OPENCODE_URL: http://opencode:4096
-      OPENCODE_MODEL: opper/${OPPER_MODEL:?OPPER_MODEL is required}#${OPPER_VARIANT:-medium}
+      OPENCODE_MODEL: ${OPENCODE_MODEL:-opper/${OPPER_MODEL:-gpt-5.6-luna}#${OPPER_VARIANT:-medium}}
     depends_on:
       opencode:
         condition: service_healthy
