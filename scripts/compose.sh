@@ -5,7 +5,16 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT_DIR"
 
 ENV_FILE=${ENV_FILE:-.env}
+BLOC_PROJECT_NAME=${BLOC_PROJECT_NAME:-bloc-v2}
 COMMAND=${1:-}
+
+case "$BLOC_PROJECT_NAME" in
+	''|[!a-z0-9]*|*[!a-z0-9_-]*)
+		printf 'Error: BLOC_PROJECT_NAME must start with a lowercase letter or digit and contain only lowercase letters, digits, hyphens, or underscores.\n' >&2
+		exit 2
+		;;
+esac
+
 if [ "$#" -gt 0 ]; then
 	shift
 fi
@@ -46,7 +55,7 @@ load_mode() {
 }
 
 compose_base() {
-	COMPOSE_PROFILES= docker compose --project-name bloc --env-file "$ENV_FILE" -f bot/docker-compose.yml "$@"
+	COMPOSE_PROFILES= docker compose --project-name "$BLOC_PROJECT_NAME" --env-file "$ENV_FILE" -f bot/docker-compose.yml "$@"
 }
 
 compose_mode() {
@@ -86,8 +95,25 @@ check_telegram_environment() {
 	unset resolved_environment
 }
 
+check_opencode_password() {
+	resolved_environment=$(compose_base config --environment)
+	printf '%s\n' "$resolved_environment" | awk -F= '
+		$1 == "OPENCODE_SERVER_PASSWORD" {
+			value = substr($0, index($0, "=") + 1)
+			if (value ~ /[^[:space:]]/) password = 1
+		}
+		END {
+			if (!password) {
+				print "Error: OPENCODE_SERVER_PASSWORD is required by OpenCode v2. Set a strong, unique password in the environment file."
+				exit 1
+			}
+		}'
+	unset resolved_environment
+}
+
 check_mode_and_telegram() {
 	load_mode
+	check_opencode_password
 	if [ "$mode" = true ]; then
 		check_telegram_environment
 	fi
@@ -103,6 +129,7 @@ case "$COMMAND" in
 	config)
 		check_mode_and_telegram
 		compose_mode config --quiet
+		docker compose --project-name "$BLOC_PROJECT_NAME-repair" --env-file "$ENV_FILE" -f bot-repair/docker-compose.yml config --quiet
 		;;
 	build)
 		check_mode_and_telegram
@@ -165,11 +192,11 @@ case "$COMMAND" in
 		;;
 	health)
 		check_env_file
-		compose_base exec opencode wget -qO- http://127.0.0.1:4096/global/health
+		compose_base exec opencode opencode api --server http://127.0.0.1:4096 GET /api/info
 		;;
 	tui)
 		load_mode
-		compose_mode exec opencode opencode attach http://127.0.0.1:4096
+		compose_mode exec opencode opencode --server http://127.0.0.1:4096
 		;;
 	remote-tui)
 		remote_host=${1:-}
@@ -195,12 +222,12 @@ case "$COMMAND" in
 					exit 2
 					;;
 			esac
-			ssh -t "$remote_host" docker exec -it "$container_id" opencode attach http://127.0.0.1:4096
+			ssh -t "$remote_host" docker exec -it "$container_id" opencode --server http://127.0.0.1:4096
 		fi
 		;;
 	repair)
 		check_env_file
-		docker compose --project-name bloc-repair --env-file "$ENV_FILE" -f bot-repair/docker-compose.yml run --rm repair
+		docker compose --project-name "$BLOC_PROJECT_NAME-repair" --env-file "$ENV_FILE" -f bot-repair/docker-compose.yml run --rm repair
 		;;
 	clean)
 		check_env_file

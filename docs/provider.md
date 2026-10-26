@@ -1,7 +1,7 @@
 # Providers
 
 BLOC uses Opper AI by default, but Opper is not required. BLOC can use providers supported by
-the qualified OpenCode release. Connect a provider in the trusted OpenCode TUI, choose one of
+its pinned OpenCode version. Connect a provider in the trusted OpenCode TUI, choose one of
 its available models, then set that model as `OPENCODE_MODEL` so Telegram uses it too. Provider
 availability, authentication methods, model access, and billing are controlled by each provider.
 See the official [OpenCode provider directory](https://opencode.ai/docs/providers/) for details.

@@ -21,6 +21,9 @@ cp .env.template .env
 ${EDITOR:-vi} .env
 ```
 
+Set `OPENCODE_SERVER_PASSWORD` to a strong, unique value. OpenCode v2 requires authenticated
+server access; the bridge and local TUI use this password. Generate one with `openssl rand -hex 32`.
+
 Start OpenCode alone, then check it:
 
 ```sh
@@ -61,3 +64,14 @@ make down                 # remove containers, keep persistent volumes
 
 Use `make help` for the complete command list. `make clean` also deletes persistent
 volumes; it is not a routine stop or update command.
+
+## BLOC 1.x deployments
+
+BLOC 2.x uses the separate Compose project `bloc-v2` and separate persistent volumes. It does
+not migrate OpenCode sessions, provider credentials, workspace files, Telegram state, or backups
+from BLOC 1.x. The v1 deployment and its resources remain untouched; continue using a BLOC 1.x
+release to access them. Do not restore a v1 backup into BLOC 2.x.
+
+When updating an existing checkout, update the local `.env` `OPENCODE_IMAGE` value to the v2
+digest shown in `.env.template`, and set `OPENCODE_SERVER_PASSWORD`. The existing `.env` is not
+overwritten by Git or by copying the template again.

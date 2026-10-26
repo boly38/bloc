@@ -1,23 +1,26 @@
-name: bloc-repair
+name: ${BLOC_PROJECT_NAME:-bloc-v2}-repair
 
 # This Compose stack is intentionally independent so a diagnostic shell can be opened
 # even if the main Compose stack fails to start.
 services:
   repair:
-    image: "${OPENCODE_IMAGE:-ghcr.io/anomalyco/opencode@sha256:6ebc13097f2381301220abe9d1b2a54f50cd1603a910dc1c66e93d8f2c4e8ebb}"
+    image: "${OPENCODE_IMAGE:-ghcr.io/anomalyco/opencode@sha256:6176a71bf7c1352d9aa9e7f112a4ef38443079a2f435789a33dd5ae809acea1a}"
     entrypoint: ["/bin/sh"]
     stdin_open: true
     tty: true
     volumes:
       - opencode-data:/root/.local/share/opencode
       - workspace:/workspace
-      - ../bot/opencode.json:/workspace/opencode.json:ro
+      - ../bot/opencode.json:/tmp/bloc-opencode.json:ro
     working_dir: /workspace
+    environment:
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?Set a strong OPENCODE_SERVER_PASSWORD for OpenCode v2}
+      OPENCODE_CONFIG: /tmp/bloc-opencode.json
 
 volumes:
   opencode-data:
     external: true
-    name: bloc_opencode-data
+    name: ${BLOC_PROJECT_NAME:-bloc-v2}_opencode-data
   workspace:
     external: true
-    name: bloc_workspace
+    name: ${BLOC_PROJECT_NAME:-bloc-v2}_workspace

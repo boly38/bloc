@@ -67,7 +67,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
     def test_http_timeout_defaults_are_separate_for_each_client(self):
         for url, expected in (
-            (bridge_config.OC + "/global/health", 300),
+            (bridge_config.OC + "/api/info", 300),
             (bridge_config.TG + "getMe", 70),
         ):
             with self.subTest(url=url):
@@ -78,12 +78,24 @@ class TelegramBridgeTests(unittest.TestCase):
     def test_opencode_sse_events_are_decoded_without_losing_payload_fields(self):
         event = {"type": "message.part.updated", "properties": {"sessionID": "session-1"}}
         body = f"data: {json.dumps({'payload': event})}\n\n".encode()
-        with patch("urllib.request.urlopen", return_value=FakeResponse(body)) as urlopen:
-            result = list(http_api.opencode_events())
+        with patch.object(http_api, "OPENCODE_SERVER_PASSWORD", "test-server-password"):
+            with patch("urllib.request.urlopen", return_value=FakeResponse(body)) as urlopen:
+                result = list(http_api.opencode_events())
 
         self.assertEqual(result, [event])
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 15)
-        self.assertEqual(urlopen.call_args.args[0].full_url, bridge_config.OC + "/event")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, bridge_config.OC + "/api/event")
+        self.assertEqual(request.get_header("Authorization"), "Basic b3BlbmNvZGU6dGVzdC1zZXJ2ZXItcGFzc3dvcmQ=")
+
+    def test_opencode_http_requests_use_basic_auth_without_exposing_password(self):
+        with patch.object(http_api, "OPENCODE_SERVER_PASSWORD", "test-server-password"):
+            with patch("urllib.request.urlopen", return_value=FakeResponse(b"{}")) as urlopen:
+                http_api.http(bridge_config.OC + "/api/info")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Basic b3BlbmNvZGU6dGVzdC1zZXJ2ZXItcGFzc3dvcmQ=")
+        self.assertNotIn("test-server-password", repr(request.headers))
 
     def test_tool_progress_uses_safe_tool_metadata_without_echoing_arguments(self):
         event = {
@@ -109,6 +121,40 @@ class TelegramBridgeTests(unittest.TestCase):
             bridge._event_progress_stage("tool", "bash", "running", False, True),
             "GitHub CLI in progress",
         )
+
+    def test_v2_tool_events_report_only_safe_progress_metadata(self):
+        tool_metadata = {}
+        started = bridge._event_details({
+            "type": "session.tool.input.started",
+            "data": {
+                "sessionID": "session-1",
+                "assistantMessageID": "assistant-1",
+                "id": "tool-1",
+                "name": "bash",
+            },
+        }, tool_metadata)
+        ended = bridge._event_details({
+            "type": "session.tool.input.ended",
+            "data": {
+                "sessionID": "session-1",
+                "assistantMessageID": "assistant-1",
+                "id": "tool-1",
+                "text": json.dumps({"command": "make test"}),
+            },
+        }, tool_metadata)
+        completed = bridge._event_details({
+            "type": "session.tool.success",
+            "data": {
+                "sessionID": "session-1",
+                "assistantMessageID": "assistant-1",
+                "id": "tool-1",
+            },
+        }, tool_metadata)
+
+        self.assertEqual(bridge._event_progress_stage(*started[2:]), "Command in progress")
+        self.assertEqual(bridge._event_progress_stage(*ended[2:]), "Tests in progress")
+        self.assertEqual(bridge._event_progress_stage(*completed[2:]), "Tests complete")
+        self.assertNotIn("make test", repr((started, ended, completed)))
 
     def test_tool_usage_log_lists_only_safe_names_and_recognized_gh_cli(self):
         messages = [
@@ -252,14 +298,11 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertIn("Model: `gpt-5.6-luna`", text)
         self.assertIn("Variant: `default`", text)
 
-    def test_http_requests_do_not_add_basic_authentication(self):
-        for url in (bridge_config.OC + "/global/health", bridge_config.TG + "getMe"):
-            with self.subTest(url=url):
-                with patch("urllib.request.urlopen", return_value=FakeResponse(b"{}")) as urlopen:
-                    http_api.http(url)
-
-                request = urlopen.call_args.args[0]
-                self.assertNotIn("Authorization", request.headers)
+    def test_telegram_requests_do_not_add_basic_authentication(self):
+        with patch("urllib.request.urlopen", return_value=FakeResponse(b"{}")) as urlopen:
+            http_api.http(bridge_config.TG + "getMe")
+        request = urlopen.call_args.args[0]
+        self.assertNotIn("Authorization", request.headers)
 
     def test_telegram_returns_result_from_successful_response(self):
         updates = [{"update_id": 10}]
@@ -269,48 +312,51 @@ class TelegramBridgeTests(unittest.TestCase):
 
     def test_answer_creates_and_persists_a_session(self):
         session_title = "Telegram 2026-10-22T14:35:12Z__opaque-suffix"
-        response = {"parts": [{"type": "text", "text": "Hello"}]}
         message = {
             "info": {"id": "message-1", "role": "assistant", "agent": "build", "cost": 0.1},
-            "parts": [],
+            "parts": [{"type": "text", "text": "Hello"}],
         }
+        prompt_id = "msg_prompt"
+        message["info"].update(parentID=prompt_id, time={"completed": 123})
         with patch.object(bridge, "_new_telegram_session_title", return_value=session_title) as title:
-            with patch.object(http_api, "http", side_effect=[{"id": "session-1"}, response]) as request:
-                with patch.object(
-                    opencode_api,
-                    "session_tree_messages",
-                    side_effect=[[], [{"session_id": "session-1", "message": message}]],
-                ):
-                    with patch.object(session_state, "save_sessions") as save:
-                        result = bridge.answer(123, "Hi", {})
+            with patch.object(opencode_api, "create_session", return_value={"id": "session-1"}) as create:
+                with patch.object(opencode_api, "submit_async") as submit:
+                    with patch.object(opencode_api, "session_status", return_value={}):
+                        with patch.object(
+                            opencode_api,
+                            "session_tree_messages",
+                            return_value=[{"session_id": "session-1", "message": message}],
+                        ):
+                            with patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt")):
+                                with patch.object(session_state, "save_sessions") as save:
+                                    result = bridge.answer(123, "Hi", {})
 
-        self.assertEqual(result, "Hello\n\nCost: $0.100000")
+        self.assertEqual(result, "Hello\n\nCost: $0.100000\n\nTools used: none\nTool calls: 0")
         title.assert_called_once_with()
-        request.assert_has_calls(
-            [
-                call(bridge_config.OC + "/session", {"title": session_title}),
-                call(
-                    bridge_config.OC + "/session/session-1/message",
-                    {"system": bridge_config.SYSTEM, "parts": [{"type": "text", "text": "Hi"}]},
-                ),
-            ]
-        )
+        create.assert_called_once_with(session_title)
+        submit.assert_called_once_with("session-1", "msg_prompt", {"text": "Hi"}, 10)
         save.assert_called_once_with({"123": "session-1"})
 
     def test_answer_reuses_existing_session(self):
-        response = {"parts": [{"type": "text", "text": "Existing session"}]}
-        message = {"info": {"id": "message-1", "role": "assistant", "cost": 0.25}, "parts": []}
+        message = {
+            "info": {
+                "id": "message-1", "role": "assistant", "parentID": "msg_prompt",
+                "time": {"completed": 123}, "cost": 0.25,
+            },
+            "parts": [{"type": "text", "text": "Existing session"}],
+        }
         sessions = {"123": "existing-session"}
-        with patch.object(http_api, "http", return_value=response) as request:
-            with patch.object(
-                opencode_api,
-                "session_tree_messages",
-                side_effect=[[], [{"session_id": "existing-session", "message": message}]],
-            ):
-                result = bridge.answer(123, "Continue", sessions)
-        self.assertEqual(result, "Existing session\n\nCost: $0.250000")
-        request.assert_called_once()
-        self.assertIn("/session/existing-session/message", request.call_args.args[0])
+        with patch.object(opencode_api, "submit_async") as submit:
+            with patch.object(opencode_api, "session_status", return_value={}):
+                with patch.object(
+                    opencode_api,
+                    "session_tree_messages",
+                    return_value=[{"session_id": "existing-session", "message": message}],
+                ):
+                    with patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt")):
+                        result = bridge.answer(123, "Continue", sessions)
+        self.assertEqual(result, "Existing session\n\nCost: $0.250000\n\nTools used: none\nTool calls: 0")
+        submit.assert_called_once_with("existing-session", "msg_prompt", {"text": "Continue"}, 10)
 
     def test_send_splits_long_replies(self):
         with patch.object(http_api, "telegram") as send_message:
@@ -405,17 +451,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
         self.assertEqual(result, "Done\n\nCost: $0.250000\n\nTools used: none\nTool calls: 0")
         submit.assert_called_once()
-        self.assertEqual(
-            submit.call_args.args[:3],
-            (
-                "session-1",
-                prompt_id,
-                {
-                    "system": bridge_config.SYSTEM,
-                    "parts": [{"type": "text", "text": "Hi"}],
-                },
-            ),
-        )
+        self.assertEqual(submit.call_args.args[:3], ("session-1", prompt_id, {"text": "Hi"}))
         self.assertEqual(submit.call_args.args[3], bridge_config.OPENCODE_STATUS_TIMEOUT_SECONDS)
         self.assertIn("response_wait", phases)
 
@@ -439,7 +475,7 @@ class TelegramBridgeTests(unittest.TestCase):
                 patch.object(bridge, "_new_telegram_session_title", return_value=session_title)
             )
             create_session = stack.enter_context(
-                patch.object(http_api, "http", return_value={"id": "session-1"})
+                patch.object(opencode_api, "create_session", return_value={"id": "session-1"})
             )
             save = stack.enter_context(patch.object(session_state, "save_sessions"))
             stack.enter_context(patch.object(bridge, "OPENCODE_REQUEST_MAX_DURATION_SECONDS", 0))
@@ -467,10 +503,7 @@ class TelegramBridgeTests(unittest.TestCase):
                 )
 
         title.assert_called_once_with()
-        create_session.assert_called_once_with(
-            bridge_config.OC + "/session",
-            {"title": session_title},
-        )
+        create_session.assert_called_once_with(session_title)
         self.assertEqual(sessions, {"123": "session-1"})
         save.assert_called_once_with({"123": "session-1"})
 
@@ -594,6 +627,20 @@ class TelegramBridgeTests(unittest.TestCase):
             )
         self.assertNotIn(private_detail, str(caught.exception))
         self.assertEqual(bridge._safe_error_detail(caught.exception), "response_error=ProviderError")
+        with self.assertRaises(opencode_api.OpenCodeResponseError) as v2_error:
+            opencode_api.text_from_response({
+                "info": {
+                    "error": {
+                        "type": "APIError",
+                        "status": 401,
+                        "message": private_detail,
+                    }
+                },
+                "parts": [{"type": "text", "text": "partial private output"}],
+            })
+        self.assertEqual(v2_error.exception.status_code, 401)
+        self.assertEqual(v2_error.exception.error_name, "APIError")
+        self.assertNotIn(private_detail, str(v2_error.exception))
 
     def test_open_code_retry_status_is_still_considered_busy(self):
         self.assertTrue(bridge._session_is_busy({"type": "retry"}))
@@ -681,7 +728,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
     def test_opencode_http_errors_do_not_log_session_ids_or_response_bodies(self):
         error = urllib.error.HTTPError(
-            bridge_config.OC + "/session/private-session-id/message",
+            bridge_config.OC + "/api/session/private-session-id/message",
             500,
             "Server error",
             {},
@@ -689,14 +736,14 @@ class TelegramBridgeTests(unittest.TestCase):
         )
         with patch("urllib.request.urlopen", side_effect=error):
             with self.assertRaises(RuntimeError) as caught:
-                http_api.http(bridge_config.OC + "/session/private-session-id/message")
+                http_api.http(bridge_config.OC + "/api/session/private-session-id/message")
 
         self.assertEqual(str(caught.exception), "OpenCode API HTTP 500")
         self.assertTrue(caught.exception.__suppress_context__)
 
     def test_opencode_http_error_retains_only_safe_classification_metadata(self):
         error = urllib.error.HTTPError(
-            bridge_config.OC + "/session/private-session-id/message",
+            bridge_config.OC + "/api/session/private-session-id/message",
             503,
             "Server error",
             {},
@@ -711,7 +758,7 @@ class TelegramBridgeTests(unittest.TestCase):
         )
         with patch("urllib.request.urlopen", side_effect=error):
             with self.assertRaises(http_api.OpenCodeHTTPError) as caught:
-                http_api.http(bridge_config.OC + "/session/private-session-id/message")
+                http_api.http(bridge_config.OC + "/api/session/private-session-id/message")
 
         self.assertEqual(caught.exception.status, 503)
         self.assertEqual(caught.exception.error_name, "ProviderUnavailable")
@@ -721,7 +768,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
     def test_opencode_validation_error_logs_field_names_but_not_values(self):
         error = urllib.error.HTTPError(
-            bridge_config.OC + "/session/session-1/prompt_async",
+            bridge_config.OC + "/api/session/session-1/prompt",
             400,
             "Bad request",
             {},
@@ -732,7 +779,7 @@ class TelegramBridgeTests(unittest.TestCase):
                         "data": {
                             "issues": [
                                 {
-                                    "path": ["body", "messageID"],
+                                    "path": ["body", "id"],
                                     "code": "invalid_value",
                                     "message": "private validation detail",
                                 }
@@ -744,12 +791,12 @@ class TelegramBridgeTests(unittest.TestCase):
         )
         with patch("urllib.request.urlopen", side_effect=error):
             with self.assertRaises(http_api.OpenCodeHTTPError) as caught:
-                http_api.http(bridge_config.OC + "/session/session-1/prompt_async")
+                http_api.http(bridge_config.OC + "/api/session/session-1/prompt")
 
         detail = bridge._safe_error_detail(caught.exception)
         self.assertIn("http_status=400", detail)
         self.assertIn("error_name=InvalidRequestError", detail)
-        self.assertIn("validation_fields=body.messageID", detail)
+        self.assertIn("validation_fields=body.id", detail)
         self.assertIn("validation_codes=invalid_value", detail)
         self.assertNotIn("private validation detail", detail)
 
@@ -811,17 +858,21 @@ class TelegramBridgeTests(unittest.TestCase):
             self.assertNotIn(private_value, serialized)
 
     def test_answer_diagnostics_records_all_new_assistant_messages(self):
-        session_url = bridge_config.OC + "/session/session-1/message"
         old_message = {"info": {"id": "old-id", "role": "assistant", "cost": 0.1}, "parts": []}
         intermediate = {
-            "info": {"id": "intermediate-id", "role": "assistant", "agent": "build", "cost": 0.2},
+            "info": {
+                "id": "intermediate-id", "parentID": "msg_prompt", "role": "assistant",
+                "agent": "build", "cost": 0.2, "time": {"completed": 1},
+            },
             "parts": [{"type": "step-finish", "cost": 0.2}],
         }
         final = {
-            "info": {"id": "final-id", "role": "assistant", "agent": "helper", "cost": 0.3},
+            "info": {
+                "id": "final-id", "parentID": "intermediate-id", "role": "assistant",
+                "agent": "helper", "cost": 0.3, "time": {"completed": 2},
+            },
             "parts": [{"type": "text", "text": "Done"}],
         }
-        response = {"info": {"id": "final-id", "role": "assistant"}, "parts": [{"type": "text", "text": "Done"}]}
         with patch.object(cost_reporting, "COST_DIAGNOSTICS_ENABLED", True):
             with patch.object(
                 opencode_api,
@@ -833,14 +884,25 @@ class TelegramBridgeTests(unittest.TestCase):
                         {"session_id": "session-1", "message": intermediate},
                         {"session_id": "session-1", "message": final},
                     ],
+                    [
+                        {"session_id": "session-1", "message": old_message},
+                        {"session_id": "session-1", "message": intermediate},
+                        {"session_id": "session-1", "message": final},
+                    ],
                 ],
             ):
-                with patch.object(http_api, "http", return_value=response) as request:
-                    with patch.object(cost_reporting, "record_cost_diagnostics") as record:
-                        result = bridge.answer(123, "Use a tool", {"123": "session-1"})
+                with patch.object(opencode_api, "submit_async") as submit:
+                    with patch.object(opencode_api, "session_status", return_value={}):
+                        with patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt")):
+                            with patch.object(cost_reporting, "record_cost_diagnostics") as record:
+                                result = bridge.answer(123, "Use a tool", {"123": "session-1"})
 
-        self.assertEqual(result, "Done\n\nCost: $0.500000 (build: $0.200000, helper: $0.300000)")
-        request.assert_called_once_with(session_url, {"system": bridge_config.SYSTEM, "parts": [{"type": "text", "text": "Use a tool"}]})
+        self.assertEqual(
+            result,
+            "Done\n\nCost: $0.500000 (build: $0.200000, helper: $0.300000)"
+            "\n\nTools used: none\nTool calls: 0",
+        )
+        submit.assert_called_once_with("session-1", "msg_prompt", {"text": "Use a tool"}, 10)
         self.assertEqual(record.call_args_list, [call(intermediate, {"index": 1, "count": 2}), call(final, {"index": 2, "count": 2})])
 
     def test_cost_report_sums_session_and_current_utc_hour_per_agent(self):
@@ -891,8 +953,30 @@ class TelegramBridgeTests(unittest.TestCase):
             "session_tree_messages",
             return_value=[{"session_id": "session-1", "message": message} for message in messages],
         ):
-            report = cost_reporting.cost_report("session-1", datetime(2026, 10, 11, 18, 30, tzinfo=timezone.utc))
+            with patch.object(cost_reporting, "_session_cost_from_metadata", return_value=None):
+                report = cost_reporting.cost_report(
+                    "session-1",
+                    datetime(2026, 10, 11, 18, 30, tzinfo=timezone.utc),
+                )
         self.assertIn("Session: unavailable", report)
+        self.assertIn("UTC hour (18:00–19:00): unavailable", report)
+
+    def test_cost_report_falls_back_to_v2_session_aggregates(self):
+        message = {"info": {"role": "assistant", "time": {"created": 1791744000000}}, "parts": []}
+        messages = [{"session_id": "session-1", "message": message}]
+        with patch.object(cost_reporting, "session_tree_messages", return_value=messages):
+            with patch.object(cost_reporting, "session_tree_session_ids", return_value=["session-1", "child-1"]):
+                with patch.object(
+                    cost_reporting,
+                    "session_details",
+                    side_effect=[{"cost": 0.2}, {"cost": 0.1}],
+                ):
+                    report = cost_reporting.cost_report(
+                        "session-1",
+                        datetime(2026, 10, 11, 18, 30, tzinfo=timezone.utc),
+                    )
+
+        self.assertIn("Session: $0.300000", report)
         self.assertIn("UTC hour (18:00–19:00): unavailable", report)
 
     def test_cost_command_does_not_call_the_llm(self):
@@ -939,7 +1023,7 @@ class TelegramBridgeTests(unittest.TestCase):
         session_title = "Telegram 2026-10-22T14:35:12Z__opaque-suffix"
         sessions = {"123": "old-session", "456": "other-chat-session"}
         with patch.object(bridge, "_new_telegram_session_title", return_value=session_title) as title:
-            with patch.object(http_api, "http", return_value={"id": "new-session"}) as request:
+            with patch.object(opencode_api, "create_session", return_value={"id": "new-session"}) as create:
                 with patch.object(session_state, "save_sessions") as save:
                     with patch.object(bridge, "answer") as answer:
                         response = bridge.authorized_response(123, "/new", sessions)
@@ -947,10 +1031,7 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(sessions, {"123": "new-session", "456": "other-chat-session"})
         title.assert_called_once_with()
         save.assert_called_once_with({"123": "new-session", "456": "other-chat-session"})
-        request.assert_called_once_with(
-            bridge_config.OC + "/session",
-            {"title": session_title},
-        )
+        create.assert_called_once_with(session_title)
         self.assertIn("previous session and its history are kept", response)
         answer.assert_not_called()
 
@@ -975,7 +1056,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
     def test_cost_starts_at_zero_after_creating_a_new_session(self):
         sessions = {"123": "old-session"}
-        with patch.object(http_api, "http", return_value={"id": "new-session"}):
+        with patch.object(opencode_api, "create_session", return_value={"id": "new-session"}):
             with patch.object(session_state, "save_sessions"):
                 bridge.authorized_response(123, "/new", sessions)
         with patch.object(cost_reporting, "session_tree_messages", return_value=[]) as history:
@@ -997,7 +1078,7 @@ class TelegramBridgeTests(unittest.TestCase):
         send.assert_called_once_with(123, "Use /help")
 
     def test_health_command_reports_only_sanitized_status_without_a_model_call(self):
-        with patch.object(http_api, "http", return_value={"healthy": True}) as request:
+        with patch.object(http_api, "http", return_value={"version": "2.1.3"}) as request:
             with patch.object(
                 opencode_api,
                 "session_details",
@@ -1013,7 +1094,7 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertNotIn("private-session-id", report)
         self.assertNotIn("private title", report)
         request.assert_called_once_with(
-            bridge_config.OC + "/global/health",
+            bridge_config.OC + "/api/info",
             timeout=bridge_config.OPENCODE_STATUS_TIMEOUT_SECONDS,
         )
         get_session.assert_called_once_with(
@@ -1023,7 +1104,7 @@ class TelegramBridgeTests(unittest.TestCase):
         answer.assert_not_called()
 
     def test_health_command_does_not_require_a_session(self):
-        with patch.object(http_api, "http", return_value={"healthy": False}):
+        with patch.object(http_api, "http", return_value={"version": None}):
             with patch.object(opencode_api, "session_details") as get_session:
                 report = bridge.authorized_response(123, "/health", {})
 
@@ -1074,7 +1155,7 @@ class TelegramBridgeTests(unittest.TestCase):
         main_message = {"info": {"id": "main-message", "role": "assistant"}, "parts": []}
         child_message = {"info": {"id": "child-message", "role": "assistant"}, "parts": []}
         with patch.object(opencode_api, "session_messages", side_effect=[[main_message], [child_message]]) as get_messages:
-            with patch.object(opencode_api, "http", side_effect=[[{"id": "child-session"}], []]) as get_children:
+            with patch.object(opencode_api, "session_children", side_effect=[[{"id": "child-session"}], []]) as get_children:
                 result = opencode_api.session_tree_messages("main-session")
 
         self.assertEqual(
@@ -1087,17 +1168,82 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(get_messages.call_count, 2)
         get_children.assert_has_calls(
             [
-                call(bridge_config.OC + "/session/main-session/children"),
-                call(bridge_config.OC + "/session/child-session/children"),
+                call("main-session", timeout=None),
+                call("child-session", timeout=None),
             ]
         )
 
     def test_session_details_uses_the_read_only_session_endpoint(self):
-        with patch.object(opencode_api, "http", return_value={"id": "session one"}) as request:
+        with patch.object(opencode_api, "http", return_value={"data": {"id": "session one"}}) as request:
             result = opencode_api.session_details("session one", timeout=10)
 
         self.assertEqual(result, {"id": "session one"})
-        request.assert_called_once_with(bridge_config.OC + "/session/session%20one", timeout=10)
+        request.assert_called_once_with(bridge_config.OC + "/api/session/session%20one", timeout=10)
+
+    def test_create_session_attaches_telegram_context_using_v2_instruction_api(self):
+        with patch.object(
+            opencode_api,
+            "http",
+            side_effect=[{"data": {"id": "session-1"}}, None],
+        ) as request:
+            session = opencode_api.create_session("Telegram session")
+
+        self.assertEqual(session["id"], "session-1")
+        self.assertEqual(
+            request.call_args_list[0],
+            call(bridge_config.OC + "/api/session", {"title": "Telegram session"}),
+        )
+        self.assertEqual(
+            request.call_args_list[1].args[0],
+            bridge_config.OC + "/api/experimental/session/session-1/instructions/entries/bloc-telegram",
+        )
+        self.assertEqual(request.call_args_list[1].kwargs["method"], "PUT")
+        self.assertIn("Format replies using only this Markdown subset", request.call_args_list[1].args[1]["value"])
+
+    def test_v2_prompt_submission_sends_and_reconciles_the_client_message_id(self):
+        prompt_id = "msg_client-correlation"
+        with patch.object(
+            opencode_api,
+            "http",
+            return_value={"data": {"id": prompt_id, "sessionID": "session-1"}},
+        ) as request:
+            response = opencode_api.submit_async("session-1", prompt_id, {"text": "Ping"}, 10)
+
+        self.assertEqual(response["id"], prompt_id)
+        request.assert_called_once_with(
+            bridge_config.OC + "/api/session/session-1/prompt",
+            {"text": "Ping", "id": prompt_id},
+            10,
+        )
+
+    def test_v2_messages_are_normalized_and_paginated_in_timeline_order(self):
+        responses = [
+            {
+                "data": [
+                    {"id": "msg_prompt", "type": "user", "text": "hello", "time": {"created": 1}},
+                    {
+                        "id": "msg_assistant",
+                        "type": "assistant",
+                        "content": [{"type": "text", "text": "hello back"}],
+                        "cost": 0.25,
+                        "time": {"created": 2, "completed": 3},
+                    },
+                ],
+                "cursor": {"next": "next-page"},
+            },
+            {"data": [{"id": "msg_idle", "type": "idle", "outcome": "succeeded"}], "cursor": {}},
+        ]
+        with patch.object(opencode_api, "http", side_effect=responses) as request:
+            messages = opencode_api.session_messages("session-1", timeout=7)
+
+        self.assertEqual(messages[0]["info"]["role"], "user")
+        self.assertEqual(messages[1]["info"]["parentID"], "msg_prompt")
+        self.assertEqual(messages[1]["parts"], [{"type": "text", "text": "hello back"}])
+        self.assertEqual(messages[2]["info"]["role"], None)
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("order=asc", request.call_args_list[0].args[0])
+        self.assertIn("cursor=next-page", request.call_args_list[1].args[0])
+        self.assertEqual(request.call_args.kwargs["timeout"], 7)
 
 
 if __name__ == "__main__":

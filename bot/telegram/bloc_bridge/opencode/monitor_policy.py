@@ -41,9 +41,12 @@ class AsyncRequestMonitorPolicy:
         """Apply persisted cancellation or timeout state; return a reason to persist, if any."""
         cancellation_pending = request and (
             request["state"] == "cancellation_requested"
-            or (request["state"] == "recovering" and request.get("detail") == "user_cancelled")
+            or (
+                request["state"] == "recovering"
+                and request.get("detail") in ("user_cancelled", "user_cancelled_unconfirmed")
+            )
         )
-        if cancellation_pending and request.get("detail") == "user_cancelled":
+        if cancellation_pending and request.get("detail") in ("user_cancelled", "user_cancelled_unconfirmed"):
             if self.abort_reason != "user_cancelled":
                 self.abort_reason = "user_cancelled"
                 self.abort_sent = False

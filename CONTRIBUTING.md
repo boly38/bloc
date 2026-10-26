@@ -59,10 +59,10 @@ check `make status`, `make health`, and `make logs SERVICE=telegram`. The `/heal
 
 ## Draft a release
 
-After release changes are merged into `main`, open **Actions > Draft patch release >
-Run workflow**, select `main`, and run the workflow. It runs the offline checks, creates
-the next patch version tag (for example, `v1.0.0` becomes `v1.0.1`), and prepares a GitHub
-release draft with generated notes. Review the notes and publish the draft manually.
+After release changes are merged into `main`, open **Actions > Draft release > Run workflow**,
+select `main`, choose the semantic-version bump, and run the workflow. It runs the offline checks,
+creates the next tag, and prepares a GitHub release draft with generated notes. For the first
+BLOC 2.x release, select `major` to create `v2.0.0`; review the notes and publish the draft
+manually.
 
-Only patch releases are currently supported. Never attach `.env`, credentials, sessions,
-or Docker volumes.
+Never attach `.env`, credentials, sessions, or Docker volumes.

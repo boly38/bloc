@@ -1,5 +1,5 @@
-# BLOC is qualified with OpenCode v1.19.3; qualify a new version before updating the digest.
-ARG OPENCODE_IMAGE=ghcr.io/anomalyco/opencode@sha256:6ebc13097f2381301220abe9d1b2a54f50cd1603a910dc1c66e93d8f2c4e8ebb
+# BLOC 2.x is being qualified against OpenCode v2.1.4; change only when retargeting qualification.
+ARG OPENCODE_IMAGE=ghcr.io/anomalyco/opencode@sha256:6176a71bf7c1352d9aa9e7f112a4ef38443079a2f435789a33dd5ae809acea1a
 FROM ${OPENCODE_IMAGE}
 
 # Keep GitHub CLI in the image so it is available after container recreation.
