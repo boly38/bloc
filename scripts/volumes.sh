@@ -11,8 +11,17 @@ case "$BACKUP_DIR" in
 esac
 
 VOLUMES="opencode-data workspace telegram-data"
-VOLUME_PREFIX=bloc_
+BLOC_PROJECT_NAME=${BLOC_PROJECT_NAME:-bloc-v2}
+VOLUME_PREFIX=${BLOC_PROJECT_NAME}_
+BACKUP_FORMAT_VERSION=2
 ARCHIVE_IMAGE=busybox:1.37.0
+
+case "$BLOC_PROJECT_NAME" in
+	''|[!a-z0-9]*|*[!a-z0-9_-]*)
+		printf 'Error: BLOC_PROJECT_NAME must start with a lowercase letter or digit and contain only lowercase letters, digits, hyphens, or underscores.\n' >&2
+		exit 2
+		;;
+esac
 
 check_stopped() {
 	for suffix in $VOLUMES; do
@@ -28,9 +37,10 @@ backup() {
 	check_stopped
 	umask 077
 	stamp=$(date -u +%Y%m%dT%H%M%SZ)
-	destination="$BACKUP_DIR/bloc-$stamp"
+	destination="$BACKUP_DIR/$BLOC_PROJECT_NAME-$stamp"
 	mkdir -p "$BACKUP_DIR"
 	mkdir "$destination"
+	printf '%s\n' "$BACKUP_FORMAT_VERSION" > "$destination/.bloc-backup-version"
 	for suffix in $VOLUMES; do
 		volume="$VOLUME_PREFIX$suffix"
 		if ! docker volume inspect "$volume" >/dev/null 2>&1; then
@@ -54,6 +64,8 @@ backup() {
 }
 
 has_archives() {
+	[ -f "$1/.bloc-backup-version" ] || return 1
+	[ "$(cat "$1/.bloc-backup-version")" = "$BACKUP_FORMAT_VERSION" ] || return 1
 	for suffix in $VOLUMES; do
 		[ -f "$1/$suffix.tar.gz" ] || return 1
 	done
@@ -65,7 +77,7 @@ resolve_restore_dir() {
 	fi
 
 	latest=
-	for candidate in "$BACKUP_DIR"/bloc-*; do
+	for candidate in "$BACKUP_DIR"/"$BLOC_PROJECT_NAME"-*; do
 		[ -d "$candidate" ] || continue
 		if has_archives "$candidate"; then
 			latest=$candidate
@@ -77,8 +89,8 @@ resolve_restore_dir() {
 		return
 	fi
 
-	printf 'Error: no complete backup found in %s. Pass a timestamped directory such as %s/bloc-<timestamp>.\n' \
-		"$BACKUP_DIR" "$BACKUP_DIR" >&2
+	printf 'Error: no compatible BLOC v2 backup found in %s. BLOC v1 backups cannot be restored into this deployment.\n' \
+		"$BACKUP_DIR" >&2
 	return 1
 }
 

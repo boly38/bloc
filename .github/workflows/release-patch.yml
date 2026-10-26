@@ -1,13 +1,23 @@
-name: Draft patch release
+name: Draft release
 
 on:
   workflow_dispatch:
+    inputs:
+      bump:
+        description: Semantic version bump for the next release
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-patch
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -35,14 +45,14 @@ jobs:
         run: |
           make test
           python3 -m compileall -q bot/telegram/bloc_bridge scripts/telegram_chat_id.py
-      - name: Create next patch tag
+      - name: Create next release tag
         id: version
         # https://github.com/mathieudutour/github-tag-action
         uses: mathieudutour/github-tag-action@v7
         with:
           github_token: ${{ github.token }}
           release_branches: main
-          force_bump: patch
+          force_bump: ${{ inputs.bump }}
           create_annotated_tag: true
       - name: Create draft release
         # https://github.com/ncipollo/release-action

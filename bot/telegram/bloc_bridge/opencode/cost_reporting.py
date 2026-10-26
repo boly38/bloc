@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 
 from ..bridge_config import COST_DIAGNOSTICS_ENABLED, COST_DIAGNOSTICS_PATH
-from .api import session_tree_messages
+from .api import session_details, session_tree_messages, session_tree_session_ids
 
 
 UTC = timezone.utc
@@ -239,8 +239,11 @@ def cost_report(session_id, now=None):
     session_usage = usage_summary(messages)
     hour_usage = usage_summary(messages, hour_start, hour_end)
 
-    session_cost = format_cost(session_usage["cost"]) if session_usage["cost"] is not None else "unavailable"
-    if not hour_usage["timestamps_complete"] or hour_usage["cost"] is None:
+    session_cost_value = session_usage["cost"]
+    if session_cost_value is None and session_usage["message_count"]:
+        session_cost_value = _session_cost_from_metadata(session_id)
+    session_cost = format_cost(session_cost_value) if session_cost_value is not None else "unavailable"
+    if session_usage["cost"] is None or not hour_usage["timestamps_complete"] or hour_usage["cost"] is None:
         hour_cost = "unavailable"
     else:
         hour_cost = format_cost(hour_usage["cost"])
@@ -267,3 +270,18 @@ def cost_report(session_id, now=None):
         if token_parts:
             lines.append("Tokens (session): " + ", ".join(token_parts))
     return "\n".join(lines)
+
+
+def _session_cost_from_metadata(session_id):
+    """Use OpenCode's session aggregates when assistant messages omit their own cost."""
+    try:
+        costs = []
+        for current_id in session_tree_session_ids(session_id):
+            details = session_details(current_id)
+            cost = _valid_cost(details)
+            if cost is None:
+                return None
+            costs.append(cost)
+        return sum(costs) if costs else None
+    except Exception:
+        return None

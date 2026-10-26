@@ -38,7 +38,7 @@ class OpperHealthTests(unittest.TestCase):
 
     def test_disabled_health_never_contacts_opper(self):
         with patch.object(bridge, "HEALTH_OPPER_ENABLED", False), \
-             patch.object(http_api, "http", return_value={"healthy": True}), \
+             patch.object(http_api, "http", return_value={"version": "2.1.3"}), \
              patch.object(opper_health, "health_status") as probe:
             result = bridge.authorized_response(123, "/health", {})
         probe.assert_not_called()
@@ -412,6 +412,10 @@ class RequestFeedbackTests(unittest.TestCase):
         self.assertIn("/allowAll A", text)
         self.assertIn("/deny A", text)
         self.assertIn("Always A", [button["text"] for row in keyboard["inline_keyboard"] for button in row])
+        self.permissions.assert_called_once_with(
+            "private-session",
+            timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
         respond.assert_not_called()
         bridge._forget_request_presentation(reference)
 
@@ -453,8 +457,8 @@ class RequestFeedbackTests(unittest.TestCase):
 
     def test_error_categories_reach_user_with_reference_not_provider_text(self):
         for error, expected in (
-            (opencode_api.OpenCodeResponseError("ProviderAuthError"), "authentication/access"),
-            (opencode_api.OpenCodeResponseError("APIError", status_code=401), "authentication/access"),
+            (opencode_api.OpenCodeResponseError("ProviderAuthError"), "could not authenticate"),
+            (opencode_api.OpenCodeResponseError("APIError", status_code=401), "could not authenticate"),
             (opencode_api.OpenCodeResponseError("APIError", status_code=429), "rate/quota"),
             (opencode_api.OpenCodeResponseError("APIError", status_code=503), "provider service error"),
             (opencode_api.OpenCodeResponseError("private-provider-text"), "assistant/provider error"),
@@ -474,6 +478,24 @@ class RequestFeedbackTests(unittest.TestCase):
                 self.assertIn("REF12345", reply)
                 self.assertNotIn("private", reply)
                 self.assertNotIn("private-prompt", output.getvalue())
+
+    def test_v2_provider_model_errors_recommend_connection_and_model_check(self):
+        unavailable_model = bridge._opencode_failure_text(
+            opencode_api.OpenCodeResponseError("provider.no-route"),
+            "REF12345",
+        )
+        internal_provider = bridge._opencode_failure_text(
+            opencode_api.OpenCodeResponseError("provider.internal", status_code=503),
+            "REF12345",
+        )
+
+        self.assertIn("/connect", unavailable_model)
+        self.assertIn("/models", unavailable_model)
+        self.assertIn("OPENCODE_MODEL", unavailable_model)
+        self.assertIn("provider returned an internal error", internal_provider)
+        self.assertIn("/connect", internal_provider)
+        self.assertIn("/models", internal_provider)
+        self.assertIn("OPENCODE_MODEL", internal_provider)
 
     def test_successful_progress_edit_restores_opencode_phase(self):
         def exchange(_chat, _prompt, _sessions, _ref, _phase, progress):

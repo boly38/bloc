@@ -1,11 +1,11 @@
-name: bloc
+name: ${BLOC_PROJECT_NAME:-bloc-v2}
 
 services:
   opencode:
     build:
       context: ./opencode
       args:
-        OPENCODE_IMAGE: "${OPENCODE_IMAGE:-ghcr.io/anomalyco/opencode@sha256:6ebc13097f2381301220abe9d1b2a54f50cd1603a910dc1c66e93d8f2c4e8ebb}"
+        OPENCODE_IMAGE: "${OPENCODE_IMAGE:-ghcr.io/anomalyco/opencode@sha256:6176a71bf7c1352d9aa9e7f112a4ef38443079a2f435789a33dd5ae809acea1a}"
     command: serve --hostname 0.0.0.0 --port 4096
     environment:
       # Do not inherit a proxy configured in the image or on the host.
@@ -18,16 +18,18 @@ services:
       NO_PROXY: "localhost,127.0.0.1,::1"
       no_proxy: "localhost,127.0.0.1,::1"
       OPPER_API_KEY: ${OPPER_API_KEY:-}
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?Set a strong OPENCODE_SERVER_PASSWORD for OpenCode v2}
+      OPENCODE_CONFIG: /tmp/bloc-opencode.json
       OPENCODE_MODEL: ${OPENCODE_MODEL:-opper/${OPPER_MODEL:-gpt-5.6-luna}#${OPPER_VARIANT:-medium}}
       GH_TOKEN: ${GH_TOKEN:-}
     volumes:
       - opencode-data:/root/.local/share/opencode
       - workspace:/workspace
-      - ./opencode.json:/workspace/opencode.json:ro
+      - ./opencode.json:/tmp/bloc-opencode.json:ro
     working_dir: /workspace
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4096/global/health >/dev/null"]
+      test: ["CMD-SHELL", "opencode api --server http://127.0.0.1:4096 GET /api/info >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -51,6 +53,7 @@ services:
       TELEGRAM_HEALTH_OPPER_ENABLED: ${TELEGRAM_HEALTH_OPPER_ENABLED:-false}
       OPENCODE_REQUEST_MAX_DURATION_SECONDS: ${OPENCODE_REQUEST_MAX_DURATION_SECONDS:-432000}
       OPENCODE_URL: http://opencode:4096
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?Set a strong OPENCODE_SERVER_PASSWORD for OpenCode v2}
       OPENCODE_MODEL: ${OPENCODE_MODEL:-opper/${OPPER_MODEL:-gpt-5.6-luna}#${OPPER_VARIANT:-medium}}
     depends_on:
       opencode:

@@ -8,6 +8,7 @@ ALLOWED = {item.strip() for item in os.environ["TELEGRAM_ALLOWED_CHAT_IDS"].spli
 TG = f"https://api.telegram.org/bot{TOKEN}/"
 OC = os.getenv("OPENCODE_URL", "http://opencode:4096").rstrip("/")
 MODEL = os.getenv("OPENCODE_MODEL", "")
+OPENCODE_SERVER_PASSWORD = os.getenv("OPENCODE_SERVER_PASSWORD", "")
 
 OPENCODE_HTTP_TIMEOUT_SECONDS = 300
 OPENCODE_STATUS_TIMEOUT_SECONDS = 10
@@ -26,13 +27,12 @@ COST_DIAGNOSTICS_ENABLED = os.getenv("TELEGRAM_COST_DIAGNOSTICS", "false").strip
 COST_DIAGNOSTICS_PATH = "/data/cost-diagnostics.jsonl"
 HEALTH_OPPER_ENABLED = os.getenv("TELEGRAM_HEALTH_OPPER_ENABLED", "false").strip().lower() == "true"
 
-SYSTEM = (
-    "Never guess: rely on a test with an official binary, "
-    "verified official documentation, or ask the human for clarification. Be concise. "
-    "Format replies using only this Markdown subset: paragraphs, # headings, **bold**, *italic*, "
-    "~~strikethrough~~, simple bullet or numbered lists, > block quotes, `inline code`, "
-    "fenced code blocks with an optional language, and [links](https://example.com). "
-    "Do not emit raw HTML, tables, nested lists, images, or reference-style links. "
-    "Do not nest inline emphasis or put formatting inside link labels. "
-    "Do not escape Markdown for Telegram; the bridge converts this subset."
+TELEGRAM_INSTRUCTIONS = (
+    "Never guess: rely on a test with an official binary, verified official documentation, "
+    "or ask the human for clarification. Be concise. Format replies using only this Markdown subset: "
+    "paragraphs, # headings, **bold**, *italic*, ~~strikethrough~~, simple bullet or numbered lists, "
+    "> block quotes, `inline code`, fenced code blocks with an optional language, and "
+    "[links](https://example.com). Do not emit raw HTML, tables, nested lists, images, or reference-style links. "
+    "Do not escape Markdown for Telegram; the bridge converts this subset. "
+    "Do not nest inline emphasis or put formatting inside link labels."
 )

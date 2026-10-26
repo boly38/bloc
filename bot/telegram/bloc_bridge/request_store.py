@@ -37,13 +37,27 @@ TERMINAL_STATES = frozenset(
 ALLOWED_TRANSITIONS = {
     "acknowledging": frozenset(("acknowledging", "queued", "failed", "acknowledgement_unknown")),
     "queued": frozenset(("queued", "submitting", "delivering", "failed", "interrupted", "rejected")),
-    "submitting": frozenset(("submitting", "running", "delivering", "uncertain", "failed")),
+    "submitting": frozenset(
+        ("submitting", "running", "cancellation_requested", "delivering", "uncertain", "failed")
+    ),
     "running": frozenset(("running", "cancellation_requested", "recovering", "delivering", "uncertain", "failed")),
     "cancellation_requested": frozenset(
-        ("cancellation_requested", "running", "delivering", "cancelled", "timed_out", "uncertain")
+        (
+            "cancellation_requested",
+            "recovering",
+            "running",
+            "delivering",
+            "cancelled",
+            "timed_out",
+            "uncertain",
+        )
     ),
-    "recovering": frozenset(("recovering", "running", "uncertain", "failed")),
-    "uncertain": frozenset(("uncertain", "recovering", "running", "failed", "cancelled", "timed_out")),
+    "recovering": frozenset(
+        ("recovering", "cancellation_requested", "running", "delivering", "uncertain", "failed")
+    ),
+    "uncertain": frozenset(
+        ("uncertain", "cancellation_requested", "recovering", "running", "delivering", "failed", "cancelled", "timed_out")
+    ),
     "delivering": frozenset(
         ("delivering", "completed", "failed", "cancelled", "timed_out", "delivery_unknown")
     ),

@@ -303,17 +303,33 @@ class TelegramRequestTests(unittest.TestCase):
             self.assertTrue(opencode_api.abort_session("session with space", timeout=7))
 
         request.assert_called_once_with(
-            f"{bridge.OC}/session/session%20with%20space/abort",
-            {},
+            f"{bridge.OC}/api/session/session%20with%20space/interrupt",
             timeout=7,
+            method="POST",
         )
 
-    def test_pending_permissions_uses_the_project_permission_endpoint(self):
-        permissions = [{"id": "per1"}]
-        with patch.object(opencode_api, "http", return_value=permissions) as request:
-            self.assertEqual(self.real_pending_permissions(timeout=7), permissions)
+    def test_pending_permissions_uses_each_session_endpoint_and_normalizes_scope(self):
+        raw_permission = {
+            "id": "per1",
+            "sessionID": "root-session",
+            "action": "webfetch",
+            "resources": ["https://docs.example.test"],
+            "save": ["https://docs.example.test"],
+        }
+        with patch.object(opencode_api, "session_tree_session_ids", return_value=["root-session"]):
+            with patch.object(opencode_api, "http", return_value={"data": [raw_permission]}) as request:
+                self.assertEqual(
+                    self.real_pending_permissions("root-session", timeout=7),
+                    [{
+                        "id": "per1",
+                        "sessionID": "root-session",
+                        "permission": "webfetch",
+                        "patterns": ["https://docs.example.test"],
+                        "always": ["https://docs.example.test"],
+                    }],
+                )
 
-        request.assert_called_once_with(f"{bridge.OC}/permission", timeout=7)
+        request.assert_called_once_with(f"{bridge.OC}/api/session/root-session/permission", timeout=7)
 
     def test_monitor_only_surfaces_permissions_for_its_active_session(self):
         permission = {
@@ -351,8 +367,26 @@ class TelegramRequestTests(unittest.TestCase):
             )
 
         request.assert_called_once_with(
-            f"{bridge.OC}/session/session%20with%20space/permissions/permission%20with%20space",
-            {"response": "once"},
+            f"{bridge.OC}/api/session/session%20with%20space/permission/permission%20with%20space/reply",
+            {"decision": "once"},
+            timeout=7,
+        )
+
+    def test_permission_rejection_includes_feedback_for_the_agent(self):
+        with patch.object(opencode_api, "http", return_value=True) as request:
+            self.assertTrue(
+                opencode_api.respond_to_permission(
+                    "session with space",
+                    "permission with space",
+                    "reject",
+                    timeout=7,
+                    message="The user denied this permission.",
+                )
+            )
+
+        request.assert_called_once_with(
+            f"{bridge.OC}/api/session/session%20with%20space/permission/permission%20with%20space/reply",
+            {"decision": "reject", "message": "The user denied this permission."},
             timeout=7,
         )
 
@@ -364,12 +398,16 @@ class TelegramRequestTests(unittest.TestCase):
             {"id": "per-active", "sessionID": "active-session", "permission": "webfetch", "patterns": ["https://docs.example.test"]},
         ]
         update = {"update_id": 1053, "message": {"chat": {"id": 123}, "text": "/allow"}}
-        with patch.object(opencode_api, "pending_permissions", return_value=pending):
+        with patch.object(opencode_api, "pending_permissions", return_value=pending) as list_pending:
             with patch.object(opencode_api, "session_details", return_value={}):
                 with patch.object(opencode_api, "respond_to_permission", return_value=True) as respond:
                     with patch.object(bridge, "send") as send:
                         bridge.handle_update(update, {})
 
+        list_pending.assert_called_once_with(
+            "active-session",
+            timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
         respond.assert_called_once_with(
             "active-session",
             "per-active",
@@ -419,8 +457,13 @@ class TelegramRequestTests(unittest.TestCase):
             "per1",
             "reject",
             timeout=bridge.OPENCODE_STATUS_TIMEOUT_SECONDS,
+            message=(
+                "The user denied this permission. Do not retry this action or use another tool to perform the same "
+                "action. Continue without it if possible; otherwise explain that it was denied."
+            ),
         )
         self.assertIn("Permission A denied", response)
+        self.assertIn("not to retry", response)
 
     def test_permission_reply_includes_descendant_agent_sessions(self):
         request, _ = request_store.create("C" * 16, 123, 1055, state="running")
@@ -465,6 +508,145 @@ class TelegramRequestTests(unittest.TestCase):
 
         self.assertIn("did not confirm cancellation", response)
         self.assertEqual(request_store.get(request["reference"])["state"], "cancellation_requested")
+
+    def test_cancel_on_uncertain_submission_queues_reconciliation_without_replay(self):
+        request, _ = request_store.create("A" * 16, 123, 1061, state="uncertain")
+        request_store.update(
+            request["reference"],
+            session_id="private-session-id",
+            prompt_message_id="msg_prompt",
+            acknowledgement_id=518,
+        )
+        with patch.object(bridge._REQUEST_SLOTS, "acquire", return_value=True):
+            with patch.object(bridge._REQUEST_EXECUTOR, "submit") as submit:
+                response = bridge.cancel_request_response(123, request["reference"])
+
+        self.assertIn("reconciling", response)
+        self.assertEqual(request_store.get(request["reference"])["state"], "recovering")
+        self.assertEqual(request_store.get(request["reference"])["detail"], "user_cancelled_unconfirmed")
+        submit.assert_called_once_with(
+            bridge._request_worker_with_slot,
+            "123",
+            None,
+            {},
+            "1061",
+            request["reference"],
+            518,
+            True,
+        )
+
+    def test_abort_callback_error_is_reported_without_crashing_the_bridge(self):
+        request, _ = request_store.create("B" * 16, 123, 1062, state="uncertain")
+        update = {
+            "update_id": 1063,
+            "callback_query": {
+                "id": "callback-id",
+                "data": f"abort:{request['reference']}",
+                "message": {"chat": {"id": 123}, "message_id": 519},
+            },
+        }
+        with patch.object(request_store, "get_for_chat", return_value=request):
+            with patch.object(bridge, "_answer_callback_query"):
+                with patch.object(bridge, "cancel_request_response", side_effect=request_store.InvalidTransition("bad state")):
+                    with patch.object(bridge, "_append_request_status") as append_status:
+                        bridge._handle_callback_update(update)
+
+        append_status.assert_called_once()
+
+    def test_explicit_prompt_rejection_is_not_marked_uncertain(self):
+        request, _ = request_store.create("D" * 16, 123, 1064, state="queued")
+        with patch.object(opencode_api, "session_tree_messages", return_value=[]):
+            with patch.object(
+                opencode_api,
+                "submit_async",
+                side_effect=http_api.OpenCodeHTTPError(400),
+            ):
+                with self.assertRaises(http_api.OpenCodeHTTPError):
+                    bridge.answer_async(
+                        123,
+                        "private prompt",
+                        {"123": "private-session"},
+                        request["reference"],
+                        lambda _phase: None,
+                        lambda _text: None,
+                    )
+
+        self.assertEqual(request_store.get(request["reference"])["state"], "submitting")
+
+    def test_ambiguous_prompt_submission_remains_uncertain_for_reconciliation(self):
+        request, _ = request_store.create("E" * 16, 123, 1065, state="queued")
+        with patch.object(opencode_api, "session_tree_messages", return_value=[]):
+            with patch.object(
+                opencode_api,
+                "submit_async",
+                side_effect=http_api.OpenCodeHTTPError(500),
+            ) as submit:
+                with patch.object(bridge.exchange, "resume_async_request", return_value="reconciled") as reconcile:
+                    result = bridge.answer_async(
+                        123,
+                        "private prompt",
+                        {"123": "private-session"},
+                        request["reference"],
+                        lambda _phase: None,
+                        lambda _text: None,
+                    )
+
+        self.assertEqual(result, "reconciled")
+        self.assertEqual(request_store.get(request["reference"])["state"], "uncertain")
+        self.assertEqual(request_store.get(request["reference"])["detail"], "submission_ack_unconfirmed")
+        self.assertEqual(
+            reconcile.call_args.args[0]["prompt_message_id"],
+            request_store.get(request["reference"])["prompt_message_id"],
+        )
+        submit.assert_called_once()
+
+    def test_submission_ack_error_queues_reconciliation_monitor(self):
+        request, _ = request_store.create("C" * 16, 123, 1066, state="queued")
+        request_store.update(request["reference"], acknowledgement_id=519)
+
+        def ambiguous_submission(*_args):
+            request_store.update(
+                request["reference"],
+                state="submitting",
+                session_id="private-session-id",
+                prompt_message_id="msg_prompt",
+                started_at=bridge.time.time(),
+            )
+            request_store.update(
+                request["reference"],
+                state="uncertain",
+                detail="submission_ack_unconfirmed",
+            )
+            raise RuntimeError("ambiguous acknowledgement")
+
+        with patch.object(bridge, "answer_async", side_effect=ambiguous_submission):
+            with patch.object(bridge._REQUEST_SLOTS, "acquire", return_value=True):
+                with patch.object(bridge._REQUEST_SLOTS, "release") as release_slot:
+                    with patch.object(bridge._REQUEST_EXECUTOR, "submit") as submit:
+                        with patch.object(bridge, "_append_request_status", return_value=True):
+                            with patch.object(bridge, "send"):
+                                bridge._request_worker(
+                                    123,
+                                    "private prompt",
+                                    {},
+                                    "1066",
+                                    request["reference"],
+                                    519,
+                                )
+
+        self.assertEqual(request_store.get(request["reference"])["state"], "recovering")
+        self.assertEqual(request_store.get(request["reference"])["detail"], "submission_ack_unconfirmed")
+        submit.assert_called_once_with(
+            bridge._request_worker_with_slot,
+            "123",
+            None,
+            {},
+            "1066",
+            request["reference"],
+            519,
+            True,
+        )
+        release_slot.assert_not_called()
 
     def test_recovery_resumes_submitted_requests_without_resubmitting_prompts(self):
         request, _ = request_store.create("F" * 16, 123, 107, state="running")
@@ -520,7 +702,15 @@ class TelegramRequestTests(unittest.TestCase):
         prompt = {"info": {"id": "msg_prompt", "role": "user"}, "parts": []}
         with patch.object(opencode_api, "session_status", return_value={}):
             with patch.object(opencode_api, "session_messages", return_value=[prompt, assistant]):
-                with patch.object(opencode_api, "submit_async") as submit:
+                with patch.object(
+                    opencode_api,
+                    "session_tree_messages",
+                    return_value=[
+                        {"session_id": "active-session", "message": prompt},
+                        {"session_id": "active-session", "message": assistant},
+                    ],
+                ):
+                    with patch.object(opencode_api, "submit_async") as submit:
                         with patch.object(bridge, "_watch_events"):
                             with patch.object(bridge.bridge_runtime, "wait"):
                                 with patch.object(bridge, "edit_reply") as edit:
@@ -583,7 +773,35 @@ class TelegramRequestTests(unittest.TestCase):
                             lambda _text: None,
                         )
 
+        self.assertEqual(request_store.get(request["reference"])["state"], "running")
+        submit.assert_not_called()
+
+    def test_recovered_unconfirmed_submission_finishes_cleanly(self):
+        request, _ = request_store.create("F" * 16, 123, 1111, state="recovering")
+        request_store.update(
+            request["reference"],
+            session_id="private-session-id",
+            prompt_message_id="msg_prompt",
+            acknowledgement_id=520,
+        )
+        with patch.object(opencode_api, "session_status", return_value={}):
+            with patch.object(opencode_api, "session_messages", return_value=[]):
+                with patch.object(opencode_api, "submit_async") as submit:
+                    with patch.object(bridge, "edit_reply") as edit:
+                        with patch.object(bridge, "send") as send:
+                            bridge._request_worker(
+                                123,
+                                None,
+                                {},
+                                "1111",
+                                request["reference"],
+                                520,
+                                True,
+                            )
+
         self.assertEqual(request_store.get(request["reference"])["state"], "failed")
+        self.assertIn("did not confirm request", send.call_args.args[1])
+        self.assertIn("Status: failed", edit.call_args.args[2])
         submit.assert_not_called()
 
     def test_monitor_confirms_user_cancellation_after_open_code_becomes_idle(self):

@@ -29,9 +29,10 @@ jobs:
           TELEGRAM_BOT_TOKEN=ci-placeholder
           TELEGRAM_ALLOWED_CHAT_IDS=123456789
           OPPER_API_KEY=ci-placeholder
+          OPENCODE_SERVER_PASSWORD=ci-placeholder
           OPPER_MODEL=gpt-5.6-luna
           OPPER_VARIANT=medium
-          OPENCODE_IMAGE=ghcr.io/anomalyco/opencode@sha256:6ebc13097f2381301220abe9d1b2a54f50cd1603a910dc1c66e93d8f2c4e8ebb
+          OPENCODE_IMAGE=ghcr.io/anomalyco/opencode@sha256:6176a71bf7c1352d9aa9e7f112a4ef38443079a2f435789a33dd5ae809acea1a
           EOF
           make config ENV_FILE="$env_file"
           TELEGRAM_ENABLED=true make config ENV_FILE="$env_file"

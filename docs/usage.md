@@ -27,8 +27,10 @@ The Telegram commands are:
 - `/cancel [reference]` asks OpenCode to abort the active request, or the identified request.
   The command reports whether the stop was confirmed; use `/status` to check the final state.
 - `/allow [letter]` approves the matching permission once. `/allowAll <letter>` remembers an
-  eligible rule, and `/deny [letter]` rejects it. The active request card shows the available
-  letter and clickable buttons; no permission is approved automatically.
+  eligible rule, and `/deny [letter]` rejects it and tells OpenCode not to retry the action. The
+  agent may continue without it; otherwise it should explain that the action was denied. The active
+  request card shows the available letter and clickable buttons; no permission is approved
+  automatically.
 
 An unknown slash command returns an error directing you to `/help`; it is not sent to the
 model. Normal messages are still sent to OpenCode. `/health` and `/cost` do not send a

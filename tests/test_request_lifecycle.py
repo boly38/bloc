@@ -59,3 +59,9 @@ class RequestLifecycleTests(unittest.TestCase):
         request_store.transition("F" * 16, "running")
         request_store.transition("F" * 16, "recovering")
         request_store.transition("F" * 16, "failed")
+
+    def test_uncertain_submission_can_enter_cancellation_recovery(self):
+        request_store.create("G" * 16, 123, 7, state="uncertain")
+        request_store.transition("G" * 16, "cancellation_requested", detail="user_cancelled_unconfirmed")
+        request_store.transition("G" * 16, "recovering", detail="user_cancelled_unconfirmed")
+        self.assertEqual(request_store.get("G" * 16)["state"], "recovering")

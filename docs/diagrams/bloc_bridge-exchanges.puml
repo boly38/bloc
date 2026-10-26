@@ -70,22 +70,24 @@ else Allowed text message
             else Regular prompt
                 worker -> exchange : Submit or resume exchange
                 opt No session for this chat
-                    exchange -> oc : POST /session
+                    exchange -> oc : POST /api/session
                     oc --> exchange : Session ID
+                    exchange -> oc : PUT /api/experimental/session/{id}/instructions/entries/bloc-telegram
+                    oc --> exchange : Telegram instructions attached to session
                     exchange -> state : Persist chat-to-session mapping
                 end
                 exchange -> oc : Read session tree history (cost baseline)
                 exchange -> state : Persist session ID and generated prompt message ID
                 exchange -> events : Start SSE watcher for this exchange
-                events -> oc : GET /event
-                exchange -> oc : POST /session/{id}/prompt_async
+                events -> oc : GET /api/event
+                exchange -> oc : POST /api/session/{id}/prompt
                 oc --> exchange : Submission accepted
                 exchange -> state : Mark request running
                 loop Until correlated completion and two idle samples, or 5 days maximum
-                    exchange -> oc : GET /session/status (10 s HTTP timeout)
-                    oc --> exchange : Busy / retry / idle
-                    exchange -> oc : GET /session/{id}/message (10 s HTTP timeout)
-                    oc --> exchange : History; filter assistant chain by parentID
+                    exchange -> oc : GET /api/session/active (10 s HTTP timeout)
+                    oc --> exchange : Running sessions; absent sessions are idle
+                    exchange -> oc : GET /api/session/{id}/message (10 s HTTP timeout)
+                    oc --> exchange : Paginated v2 message history; normalize and correlate by prompt ID
                     opt Transient HTTP timeout
                         exchange -> exchange : Retry status/history; keep request active
                     end
@@ -108,7 +110,7 @@ else Allowed text message
                     end
                 end
                 opt User cancellation or 5 days limit
-                    exchange -> oc : POST /session/{id}/abort
+                    exchange -> oc : POST /api/session/{id}/interrupt
                     oc --> exchange : Abort result
                     exchange -> exchange : Keep chat active until OpenCode is confirmed idle
                 end

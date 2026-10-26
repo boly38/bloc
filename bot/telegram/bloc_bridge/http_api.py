@@ -1,5 +1,6 @@
 """HTTP transport and Telegram polling helpers."""
 
+import base64
 import fcntl
 import json
 import re
@@ -14,6 +15,7 @@ from .bridge_config import (
     OC,
     OPENCODE_EVENT_TIMEOUT_SECONDS,
     OPENCODE_HTTP_TIMEOUT_SECONDS,
+    OPENCODE_SERVER_PASSWORD,
     POLLING_LOCK_PATH,
     TG,
     TELEGRAM_HTTP_TIMEOUT_SECONDS,
@@ -79,19 +81,21 @@ def acquire_polling_lock(stop=None):
     return None
 
 
-def http(url, payload=None, timeout=None):
+def http(url, payload=None, timeout=None, method=None):
     bridge_runtime.check_shutdown()
     try:
-        return _http(url, payload, timeout)
+        if method is None:
+            return _http(url, payload, timeout)
+        return _http(url, payload, timeout, method)
     finally:
         bridge_runtime.check_shutdown()
 
 
-def _http(url, payload=None, timeout=None):
+def _http(url, payload=None, timeout=None, method=None):
     if timeout is None:
         timeout = http_timeout(url)
     data = None if payload is None else json.dumps(payload).encode()
-    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    request = urllib.request.Request(url, data=data, headers=_request_headers(url), method=method)
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -110,7 +114,7 @@ def _http(url, payload=None, timeout=None):
             try:
                 response_error = json.loads(details)
                 if isinstance(response_error, dict):
-                    error_name = response_error.get("name")
+                    error_name = response_error.get("name") or response_error.get("_tag")
                     error_value = response_error.get("error")
                     if error_name is None:
                         if isinstance(error_value, dict):
@@ -155,6 +159,16 @@ def _http(url, payload=None, timeout=None):
                 tuple(sorted(validation_codes)),
             ) from None
         raise RuntimeError(f"HTTP {error.code} {url}: {details[:1000]}") from error
+
+
+def _request_headers(url, accept=None):
+    headers = {"Content-Type": "application/json"}
+    if accept is not None:
+        headers["Accept"] = accept
+    if url.startswith(OC) and OPENCODE_SERVER_PASSWORD:
+        credentials = base64.b64encode(f"opencode:{OPENCODE_SERVER_PASSWORD}".encode()).decode("ascii")
+        headers["Authorization"] = f"Basic {credentials}"
+    return headers
 
 
 def _handle_telegram_error(url, status, details) -> NoReturn:
@@ -203,8 +217,8 @@ def telegram(method, payload):
 def opencode_events():
     """Yield decoded OpenCode SSE events without logging response content."""
     request = urllib.request.Request(
-        OC + "/event",
-        headers={"Accept": "text/event-stream"},
+        OC + "/api/event",
+        headers=_request_headers(OC + "/api/event", "text/event-stream"),
     )
     try:
         with urllib.request.urlopen(request, timeout=OPENCODE_EVENT_TIMEOUT_SECONDS) as response:

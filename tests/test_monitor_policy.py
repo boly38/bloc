@@ -39,6 +39,17 @@ class AsyncRequestMonitorPolicyTests(unittest.TestCase):
         self.assertTrue(policy.should_abort(prompt_found=True, busy=True, now=20))
         self.assertFalse(policy.should_abort(prompt_found=False, busy=True, now=20))
 
+    def test_uncertain_submission_cancellation_survives_recovery(self):
+        policy = self.make_policy()
+
+        reason_to_persist = policy.update_stop_reason(
+            {"state": "recovering", "detail": "user_cancelled_unconfirmed"},
+            now=20,
+        )
+
+        self.assertEqual(reason_to_persist, "user_cancelled")
+        self.assertTrue(policy.should_abort(prompt_found=True, busy=True, now=20))
+
     def test_timeout_uses_elapsed_wall_time_and_monotonic_deadline(self):
         policy = self.make_policy(max_duration=100, started_at=100, wall_now=160, monotonic_now=50)
 

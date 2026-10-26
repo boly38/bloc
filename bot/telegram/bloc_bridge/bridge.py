@@ -27,7 +27,6 @@ from .bridge_config import (
     OPENCODE_STATUS_TIMEOUT_SECONDS,
     OPENCODE_PROGRESS_INTERVAL_SECONDS,
     OPENCODE_REQUEST_MAX_DURATION_SECONDS,
-    SYSTEM,
     TELEGRAM_HTTP_TIMEOUT_SECONDS,
     TELEGRAM_LONG_POLL_TIMEOUT_SECONDS,
     OPENCODE_EVENT_TIMEOUT_SECONDS,
@@ -280,7 +279,10 @@ def _respond_to_permission(chat_id, reference, letter, decision, expected_permis
         return "The active request has not reached OpenCode yet."
 
     try:
-        pending_requests = opencode_api.pending_permissions(timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+        pending_requests = opencode_api.pending_permissions(
+            session_id,
+            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
     except Exception as error:
         print(
             f"permission_lookup_failed ref={reference} error_type={type(error).__name__}",
@@ -355,12 +357,21 @@ def _respond_to_permission(chat_id, reference, letter, decision, expected_permis
     permission_id = selected_permission.get("id")
     if not isinstance(permission_id, str):
         return "The pending permission is invalid; use the remote TUI or /cancel."
+    reply_message = None
+    if decision == "reject":
+        reply_message = (
+            "The user denied this permission. Do not retry this action or use another tool to perform the same action. "
+            "Continue without it if possible; otherwise explain that it was denied."
+        )
     try:
+        reply_options = {"timeout": OPENCODE_STATUS_TIMEOUT_SECONDS}
+        if reply_message is not None:
+            reply_options["message"] = reply_message
         confirmed = opencode_api.respond_to_permission(
             selected_permission["sessionID"],
             permission_id,
             decision,
-            timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+            **reply_options,
         )
     except Exception as error:
         print(
@@ -374,7 +385,9 @@ def _respond_to_permission(chat_id, reference, letter, decision, expected_permis
     if presentation is not None:
         presentation.resolve_permission(permission_id)
     if decision == "reject":
-        response_text = f"Permission {letter} denied. OpenCode can handle the rejection."
+        response_text = (
+            f"Permission {letter} denied. OpenCode was told not to retry that action and may continue without it."
+        )
     elif decision == "always":
         response_text = f"Permission {letter} allowed and remembered for matching requests."
     else:
@@ -560,6 +573,55 @@ def request_status_response(chat_id, reference=None):
     return f"Request {request['reference']}: {_request_status_text(request['state'])}."
 
 
+def _queue_recovery_monitor(request, recovery_detail):
+    """Resume reconciliation for an uncertain submission without replaying its prompt."""
+    reference = request["reference"]
+    if not _REQUEST_SLOTS.acquire(blocking=False):
+        return f"OpenCode reconciliation for {reference} is waiting for worker capacity."
+
+    recovering = request_store.update_if_state(
+        reference,
+        (request["state"],),
+        state="recovering",
+        detail=recovery_detail,
+    )
+    if recovering is None or recovering.get("state") != "recovering":
+        _REQUEST_SLOTS.release()
+        return f"Request {reference} is already being reconciled. Use /status {reference}."
+
+    try:
+        _REQUEST_EXECUTOR.submit(
+            _request_worker_with_slot,
+            request["chat_id"],
+            None,
+            {},
+            request["update_id"],
+            reference,
+            request.get("acknowledgement_id"),
+            True,
+        )
+    except Exception as error:
+        _REQUEST_SLOTS.release()
+        request_store.update_if_state(
+            reference,
+            ("recovering",),
+            state=request["state"],
+            detail=recovery_detail,
+        )
+        print(
+            f"uncertain_cancel_recovery_enqueue_failed ref={reference} error_type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return f"OpenCode reconciliation for {reference} could not be queued. Use /status."
+
+    return f"OpenCode is reconciling request {reference} without resubmitting it. Use /status to check progress."
+
+
+def _queue_uncertain_cancellation(request):
+    return _queue_recovery_monitor(request, "user_cancelled_unconfirmed")
+
+
 def cancel_request_response(chat_id, reference=None):
     if reference is None:
         active = request_store.active_for_chat(chat_id)
@@ -575,6 +637,10 @@ def cancel_request_response(chat_id, reference=None):
             return "No request with that reference was found for this chat."
     if request["state"] not in request_store.ACTIVE_STATES:
         return f"Request {reference}: {_request_status_text(request['state'])}; it is not active."
+    if request["state"] == "recovering" and request.get("detail") == "user_cancelled_unconfirmed":
+        return f"Cancellation is being reconciled with OpenCode for {reference}. Use /status to check progress."
+    if request["state"] == "cancellation_requested" and request.get("detail") == "user_cancelled_unconfirmed":
+        return _queue_uncertain_cancellation(request)
     if request["state"] in ("acknowledging", "queued"):
         cancelled = request_store.update_if_state(
             reference,
@@ -598,17 +664,20 @@ def cancel_request_response(chat_id, reference=None):
     }
     if request["state"] not in cancellable_states:
         return f"Request {reference} is finishing. Use /status {reference} to check its result."
+    uncertain_submission = request["state"] == "uncertain"
     requested = request_store.update_if_state(
         reference,
         (request["state"],),
         state="cancellation_requested",
-        detail="user_cancelled",
+        detail="user_cancelled_unconfirmed" if uncertain_submission else "user_cancelled",
     )
     if requested is None:
         return f"No request with that reference was found for this chat."
     if requested["state"] != "cancellation_requested":
         return f"Request {reference}: {_request_status_text(requested['state'])}."
     request = requested
+    if uncertain_submission:
+        return _queue_uncertain_cancellation(request)
     session_id = request.get("session_id")
     prompt_message_id = request.get("prompt_message_id")
     if not session_id or not prompt_message_id:
@@ -705,7 +774,7 @@ def help_response():
 
 def new_session_response(chat_id, sessions):
     """Create and select a new session while preserving the current session."""
-    session = http_api.http(OC + "/session", {"title": _new_telegram_session_title()})
+    session = opencode_api.create_session(_new_telegram_session_title())
     session_id = session.get("id") if isinstance(session, dict) else None
     if not isinstance(session_id, str) or not session_id:
         raise RuntimeError("OpenCode returned an invalid session")
@@ -727,10 +796,10 @@ def health_response(chat_id, sessions):
     """Report sanitized bridge dependency and persisted-session status without model calls."""
     lines = ["Bridge: healthy"]
     try:
-        health = http_api.http(OC + "/global/health", timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+        health = http_api.http(OC + "/api/info", timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
         opencode_status = (
             "healthy"
-            if isinstance(health, dict) and health.get("healthy") is True
+            if isinstance(health, dict) and isinstance(health.get("version"), str)
             else "unavailable"
         )
         lines.append(f"OpenCode API: {opencode_status}")
@@ -867,8 +936,21 @@ def _opencode_failure_text(error, reference):
         summary = "OpenCode timed out."
     elif isinstance(error, opencode_api.OpenCodeResponseError):
         status = error.status_code
-        if error.error_name == "ProviderAuthError" or status in (401, 403):
-            summary = "OpenCode reported a provider authentication/access failure. Ask the operator to check credentials."
+        if error.error_name in ("ProviderAuthError", "provider.auth") or status in (401, 403):
+            summary = (
+                "OpenCode could not authenticate to the configured provider. In the trusted TUI, run `/connect` "
+                "and check that its credentials are valid; verify the model with `/models`."
+            )
+        elif error.error_name in ("provider.no-route", "provider.unknown", "provider.invalid-request"):
+            summary = (
+                "OpenCode could not use the configured provider/model. In the trusted TUI, check `/connect` and "
+                "select an available model with `/models`; verify `OPENCODE_MODEL` matches that model."
+            )
+        elif error.error_name == "provider.internal":
+            summary = (
+                "OpenCode's provider returned an internal error. In the trusted TUI, check `/connect` and confirm "
+                "the configured `OPENCODE_MODEL` is available in `/models`; also check provider service health."
+            )
         elif status == 429:
             summary = "OpenCode reported a provider rate/quota limit. Ask the operator to check provider limits."
         elif status is not None and status >= 500:
@@ -1036,6 +1118,25 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                 else f"Request {reference} reached the configured {limit}; OpenCode confirmed it stopped."
             )
             request_store.update(reference, state="delivering", detail=terminal_state)
+        elif (
+            stored is not None
+            and stored["state"] == "uncertain"
+            and stored.get("detail") == "submission_ack_unconfirmed"
+        ):
+            recovery = _queue_recovery_monitor(stored, "submission_ack_unconfirmed")
+            recovery_text = f"OpenCode's submission acknowledgement was unclear. {recovery}"
+            if not _append_request_status(chat_id, reference, recovery_text):
+                send(chat_id, recovery_text)
+            return
+        elif (
+            stored is not None
+            and stored["state"] == "cancellation_requested"
+            and stored.get("detail") == "user_cancelled_unconfirmed"
+        ):
+            recovery = _queue_recovery_monitor(stored, "user_cancelled_unconfirmed")
+            if not _append_request_status(chat_id, reference, recovery):
+                send(chat_id, recovery)
+            return
         elif stored is not None and stored["state"] == "uncertain":
             terminal_state = "uncertain"
             error_text = _opencode_failure_text(error, reference)
@@ -1230,7 +1331,10 @@ def _recover_pending_requests(sessions):
                 completed_at=time.time(),
             )
             continue
-        recovery_detail = request.get("detail") if state == "cancellation_requested" else None
+        recovery_detail = request.get("detail") if (
+            state == "cancellation_requested"
+            or request.get("detail") == "submission_ack_unconfirmed"
+        ) else None
         request_store.update(reference, state="recovering", detail=recovery_detail)
         if not _REQUEST_SLOTS.acquire(blocking=False):
             request_store.update(reference, state="uncertain", detail="recovery_queue_full")
@@ -1304,8 +1408,23 @@ def _handle_callback_update(update):
         return
     if parts[0] == "abort" and len(parts) == 2:
         _answer_callback_query(callback_id, "Requesting abort.")
-        response = cancel_request_response(chat_id, reference)
-        _record_control_result(chat_id, reference, response)
+        try:
+            response = cancel_request_response(chat_id, reference)
+            _record_control_result(chat_id, reference, response)
+        except Exception as error:
+            print(
+                f"request_control_failed command=abort ref={reference} error_type={type(error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                _append_request_status(chat_id, reference, "Cancellation could not be confirmed. Use /status.")
+            except Exception as status_error:
+                print(
+                    f"request_control_status_failed ref={reference} error_type={type(status_error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         return
     if parts[0] == "p" and len(parts) in (4, 5):
         letter, action = parts[2], parts[3]

@@ -6,7 +6,6 @@ import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,12 +13,10 @@ from datetime import datetime, timezone
 from .. import bridge_runtime, http_api, request_store, session_state
 from ..bridge_config import (
     MODEL,
-    OC,
     OPENCODE_EVENT_TIMEOUT_SECONDS,
     OPENCODE_PROGRESS_INTERVAL_SECONDS,
     OPENCODE_REQUEST_MAX_DURATION_SECONDS,
     OPENCODE_STATUS_TIMEOUT_SECONDS,
-    SYSTEM,
 )
 from . import api as opencode_api
 from . import cost_reporting
@@ -114,9 +111,10 @@ def _model_options(body):
     provider, separator, model = configured_model.partition("/")
     if not separator:
         return
-    body["model"] = {"providerID": provider, "modelID": model}
+    model_ref = {"providerID": provider, "id": model}
     if variant_separator and variant:
-        body["variant"] = variant
+        model_ref["variant"] = variant
+    body["model"] = model_ref
 
 
 def _new_telegram_session_title():
@@ -128,14 +126,10 @@ def answer(chat_id, prompt, sessions):
     key = str(chat_id)
     session_id = sessions.get(key)
     if not session_id:
-        session = http_api.http(OC + "/session", {"title": _session_title()})
+        session = opencode_api.create_session(_session_title())
         session_id = session["id"]
         sessions[key] = session_id
         session_state.save_sessions(sessions)
-
-    request_body = {"system": SYSTEM, "parts": [{"type": "text", "text": prompt}]}
-    _model_options(request_body)
-    message_url = f"{OC}/session/{urllib.parse.quote(session_id)}/message"
 
     previous_ids = None
     try:
@@ -143,19 +137,24 @@ def answer(chat_id, prompt, sessions):
     except Exception as error:
         print(f"OpenCode history read failed ({type(error).__name__}).", file=sys.stderr, flush=True)
 
-    response = http_api.http(message_url, request_body)
-    new_messages = []
-    if previous_ids is not None:
-        try:
-            new_messages = _new_assistant_messages(opencode_api.session_tree_messages(session_id), previous_ids)
-        except Exception as error:
-            print(f"OpenCode history read failed ({type(error).__name__}).", file=sys.stderr, flush=True)
-
-    _record_exchange_diagnostics(new_messages, response)
-    text = opencode_api.text_from_response(response)
-    if previous_ids is None:
-        return text + "\n\nCost: unavailable"
-    return text + cost_reporting.format_exchange_footer([entry["message"] for entry in new_messages])
+    request_body = {"text": prompt}
+    _model_options(request_body)
+    prompt_message_id = f"msg_{uuid.uuid4().hex}"
+    opencode_api.submit_async(session_id, prompt_message_id, request_body, OPENCODE_STATUS_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + OPENCODE_REQUEST_MAX_DURATION_SECONDS
+    while time.monotonic() < deadline:
+        statuses = opencode_api.session_status(OPENCODE_STATUS_TIMEOUT_SECONDS)
+        messages = opencode_api.session_tree_messages(session_id)
+        root_messages = [entry["message"] for entry in messages if entry.get("session_id") == session_id]
+        correlated = opencode_api.assistant_messages_for_prompt(root_messages, prompt_message_id)
+        if (
+            correlated
+            and _assistant_response_complete(correlated[-1])
+            and not _session_is_busy(statuses.get(session_id))
+        ):
+            return _format_async_result(session_id, correlated, previous_ids, "synchronous")
+        time.sleep(1)
+    raise OpenCodeRequestTimeout("OpenCode request timed out")
 
 
 def _assistant_response_complete(message):
@@ -173,12 +172,57 @@ def _assistant_response_complete(message):
 
 def _session_is_busy(status):
     if isinstance(status, str):
-        return status in ("busy", "retry")
-    return isinstance(status, dict) and status.get("type") in ("busy", "retry")
+        return status in ("busy", "retry", "running")
+    return isinstance(status, dict) and status.get("type") in ("busy", "retry", "running")
 
 
-def _event_details(event):
+def _event_details(event, tool_metadata=None):
     if not isinstance(event, dict):
+        return None
+    data = event.get("data")
+    if isinstance(data, dict):
+        event_type = event.get("type")
+        session_id = data.get("sessionID")
+        message_id = data.get("assistantMessageID")
+        if event_type in ("session.reasoning.started", "session.reasoning.delta", "session.reasoning.ended"):
+            return session_id, message_id, "reasoning", None, None, False, False
+        if event_type == "session.tool.input.started":
+            name = data.get("name")
+            tool_id = data.get("id")
+            if isinstance(tool_metadata, dict) and isinstance(tool_id, str):
+                tool_metadata[(session_id, tool_id)] = (name, False, False)
+            return session_id, message_id, "tool", name, "running", False, False
+        if event_type in ("session.tool.input.ended", "session.tool.called"):
+            tool_id = data.get("id")
+            name, is_test, is_gh = (tool_metadata or {}).get((session_id, tool_id), (None, False, False))
+            raw_input = data.get("text")
+            if isinstance(raw_input, str):
+                try:
+                    tool_input = json.loads(raw_input)
+                except json.JSONDecodeError:
+                    tool_input = {}
+            else:
+                tool_input = data.get("input", {})
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            metadata = tooling.event_tool_metadata({
+                "type": "tool",
+                "tool": name,
+                "state": {"status": "running", "input": tool_input},
+            })
+            is_test, is_gh = metadata[2], metadata[3]
+            if isinstance(tool_metadata, dict) and isinstance(tool_id, str):
+                tool_metadata[(session_id, tool_id)] = (name, is_test, is_gh)
+            return session_id, message_id, "tool", name, "running", is_test, is_gh
+        if event_type in ("session.tool.progress", "session.tool.success", "session.tool.failed"):
+            tool_id = data.get("id")
+            name, is_test, is_gh = (tool_metadata or {}).get((session_id, tool_id), (None, False, False))
+            tool_status = "completed" if event_type == "session.tool.success" else (
+                "error" if event_type == "session.tool.failed" else "running"
+            )
+            if event_type in ("session.tool.success", "session.tool.failed") and isinstance(tool_metadata, dict):
+                tool_metadata.pop((session_id, tool_id), None)
+            return session_id, message_id, "tool", name, tool_status, is_test, is_gh
         return None
     properties = event.get("properties")
     if not isinstance(properties, dict):
@@ -250,12 +294,13 @@ def _permissions_in_session_tree(root_session_id, requests, related_sessions, un
 
 def _watch_events(session_id, reference, events, stop):
     error_reported = False
+    tool_metadata = {}
     while not stop.is_set():
         try:
             for event in opencode_api.iter_events():
                 if stop.is_set():
                     return
-                details = _event_details(event)
+                details = _event_details(event, tool_metadata)
                 if details is None:
                     continue
                 (
@@ -308,6 +353,13 @@ def _retryable_status_error(error):
         isinstance(error, http_api.OpenCodeHTTPError)
         and (error.status in (408, 429) or error.status >= 500)
     )
+
+
+def _submission_outcome_uncertain(error):
+    """Treat explicit client rejections as failures, but reconcile ambiguous outcomes safely."""
+    if isinstance(error, http_api.OpenCodeHTTPError):
+        return error.status in (408, 409, 429) or error.status >= 500
+    return True
 
 
 def _assistant_activity_signature(messages):
@@ -487,7 +539,10 @@ class _AsyncRequestMonitor:
             return
         self.last_permission_poll_at = now
         try:
-            requests = opencode_api.pending_permissions(timeout=OPENCODE_STATUS_TIMEOUT_SECONDS)
+            requests = opencode_api.pending_permissions(
+                self.session_id,
+                timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+            )
         except Exception as error:
             if not self.reported_permission_error:
                 print(
@@ -636,12 +691,6 @@ class _AsyncRequestMonitor:
                 _tool_names(snapshot.correlated_messages),
                 _tool_call_count(snapshot.correlated_messages),
             )
-        request_store.update(
-            self.reference,
-            state="failed",
-            detail="submission_unconfirmed",
-            completed_at=time.time(),
-        )
         raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
 
     def _reconcile_missing_prompt(self, snapshot):
@@ -780,7 +829,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
         session_id = sessions.get(chat_key)
     if not session_id:
         set_phase("session_create")
-        session = http_api.http(OC + "/session", {"title": _session_title()})
+        session = opencode_api.create_session(_session_title())
         session_id = session["id"]
         with _SESSIONS_LOCK:
             sessions[chat_key] = session_id
@@ -797,7 +846,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
             flush=True,
         )
 
-    request_body = {"system": SYSTEM, "parts": [{"type": "text", "text": prompt}]}
+    request_body = {"text": prompt}
     _model_options(request_body)
     prompt_message_id = f"msg_{uuid.uuid4().hex}"
     started_at = time.time()
@@ -825,10 +874,15 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
             OPENCODE_STATUS_TIMEOUT_SECONDS,
         )
         request_store.update_if_state(reference, ("submitting",), state="running", detail=None)
-    except Exception:
+    except Exception as error:
         current = request_store.get(reference)
-        if current is None or current["state"] != "cancellation_requested":
-            request_store.update(reference, state="uncertain", detail="submission_unconfirmed")
+        if _submission_outcome_uncertain(error):
+            if current is not None and current["state"] == "cancellation_requested":
+                request_store.update(reference, state="cancellation_requested", detail="user_cancelled_unconfirmed")
+            else:
+                request_store.update(reference, state="uncertain", detail="submission_ack_unconfirmed")
+            set_phase("recovery_check")
+            return resume_async_request(request_store.get(reference), set_phase, progress)
         raise
 
     correlated = _monitor_async_request(
@@ -850,12 +904,6 @@ def resume_async_request(request, set_phase, progress):
     reference = request["reference"]
     started_at = request.get("started_at") or request["created_at"]
     if not session_id or not prompt_message_id:
-        request_store.update(
-            reference,
-            state="failed",
-            detail="submission_unconfirmed",
-            completed_at=time.time(),
-        )
         raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
 
     set_phase("recovery_check")
@@ -880,11 +928,21 @@ def resume_async_request(request, set_phase, progress):
         for message in messages
     )
     busy = statuses is None or _session_is_busy(statuses.get(session_id))
-    if not prompt_found and not busy:
-        request_store.update(reference, state="failed", detail="submission_unconfirmed", completed_at=time.time())
+    reconciliable_submission = request.get("detail") in (
+        "submission_ack_unconfirmed",
+        "user_cancelled_unconfirmed",
+    )
+    if not prompt_found and not busy and not reconciliable_submission:
         raise OpenCodeSubmissionUnconfirmed("OpenCode submission could not be confirmed")
 
-    if not (request["state"] == "recovering" and request.get("detail") == "user_cancelled"):
+    if not (
+        request["state"] in ("recovering", "uncertain", "cancellation_requested")
+        and request.get("detail") in (
+            "user_cancelled",
+            "user_cancelled_unconfirmed",
+            "submission_ack_unconfirmed",
+        )
+    ):
         request_store.update(reference, state="running", detail=None)
     correlated = _monitor_async_request(
         session_id,
