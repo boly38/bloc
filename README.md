@@ -7,6 +7,21 @@ connects [OpenCode](https://opencode.ai/) to an allowlisted Telegram chat. Deplo
 Compose or Coolify, keep OpenCode's API private, and manage long-running conversations from your
 phone.
 
+<details><summary>Screenshots</summary>
+
+As soon as you send your prompt, it’s acknowledged and a static card takes over: it tracks the work live, shows the current action (e.g. Tool shell complete) and estimates the cost of your request as it runs.
+
+<img width="474" height="911" alt="image" src="https://github.com/user-attachments/assets/36029584-183d-4039-a50c-4c64aea06908" />
+
+Once the request is finished, the card updates to show the total cost and the number of tools used: no surprises, full transparency.
+
+<img width="470" height="911" alt="image" src="https://github.com/user-attachments/assets/c06810d6-7d73-41be-adab-baf78027c5b3" />
+
+
+
+</details>
+
+
 ## Features
 
 - Keep one persistent OpenCode session per Telegram chat for ongoing conversations.
