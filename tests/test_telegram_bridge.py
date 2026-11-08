@@ -64,6 +64,9 @@ class TelegramBridgeTests(unittest.TestCase):
         permission_patcher = patch.object(opencode_api, "pending_permissions", return_value=[])
         permission_patcher.start()
         self.addCleanup(permission_patcher.stop)
+        question_patcher = patch.object(opencode_api, "pending_questions", return_value=[])
+        question_patcher.start()
+        self.addCleanup(question_patcher.stop)
 
     def test_http_timeout_defaults_are_separate_for_each_client(self):
         for url, expected in (

@@ -31,6 +31,10 @@ The Telegram commands are:
   agent may continue without it; otherwise it should explain that the action was denied. The active
   request card shows the available letter and clickable buttons; no permission is approved
   automatically.
+- `/answer <question-number> <choice-number(s) or text>` answers an OpenCode question.
+  Use comma-separated choice numbers for a multiple-choice answer, or provide free-form text when
+  the question allows it (up to 500 characters). `/reject <question-number>` rejects the containing
+  question request explicitly.
 
 An unknown slash command returns an error directing you to `/help`; it is not sent to the
 model. Normal messages are still sent to OpenCode. `/health` and `/cost` do not send a
@@ -51,18 +55,26 @@ provider service errors.
 
 The initial Telegram acknowledgement remains as a request card. It has status and abort
 buttons while the request is active. `/status` appends a timestamped entry to that card, and
-permission decisions appear there with letter aliases and action buttons. The card shows
-deterministic analysis/tool/test stages, observed partial cost, and time since OpenCode's last
-activity separately from the API heartbeat.
+permission decisions and interactive questions appear there with letter aliases and action
+buttons. The card shows deterministic analysis/tool/test stages, observed partial cost, and time
+since OpenCode's last activity separately from the API heartbeat.
 
 When the request ends, the card is replaced with a terminal summary containing status, cost,
 duration, request reference, distinct tool count, and total tool-call count. The model's final answer is sent as a
 separate Telegram message and lists tool names only, not arguments or output.
 
-OpenCode permission requests for the active request's session tree are forwarded to the
-request card. When several are pending, use the displayed letter in `/allow A`,
-`/allowAll A`, or `/deny A`. Interactive questions are not yet forwarded to Telegram; answer
-them in the remote TUI or use `/abort` to stop the active request.
+OpenCode permission requests and interactive questions for the active request's session tree are
+forwarded to the request card, including the form-based question API used by OpenCode v2. When
+several are pending, use the displayed letter for
+`/allow A`, `/allowAll A`, or `/deny A` permission decisions, and `/answer 1 2` or `/reject 1`
+for questions. Questions and choices use separate numbers in the request card. The card presents
+one question at a time and advances after each answer. Single-choice options can be selected with
+buttons; each recorded answer is also shown in its own chat message. For multiple-choice questions,
+select each option and tap **Done**. Custom answers are
+instructions, not buttons; use `/answer 1 le jambon` to answer the first question with free-form
+text. Custom text is limited to 500 characters. The bridge submits the complete form to OpenCode
+once all of its questions have answers.
+The bridge keeps the request active until OpenCode confirms the response or confirms cancellation.
 
 Only one request at a time is admitted per chat. A new prompt while one is active is refused
 with the active request's reference. Use the card buttons or `/status` and `/abort` to manage it. References do
@@ -97,7 +109,8 @@ background poller handles Telegram I/O; blocked HTTP calls do not delay process 
 Request metadata is persisted in `/data/requests.sqlite3` in the Telegram volume, but prompts
 and generated responses are not copied into that database. On restart, submitted requests
 are correlated with OpenCode history and monitored without resubmission. Requests that had
-not reached OpenCode are marked interrupted rather than replayed. Replies may be delayed or
+not reached OpenCode are marked interrupted rather than replayed. Pending questions are fetched
+again from OpenCode; prompt text and partial Telegram selections are not persisted. Replies may be delayed or
 their delivery may be uncertain if shutdown occurs while Telegram is updating the
 acknowledgement. Use `/status <reference>` before retrying. The Compose 30-second grace period
 is a safety limit, not a mandatory wait.

@@ -176,6 +176,7 @@ class RequestFeedbackTests(unittest.TestCase):
         self.permissions = self.stack.enter_context(
             patch.object(opencode_api, "pending_permissions", return_value=[])
         )
+        self.stack.enter_context(patch.object(opencode_api, "pending_questions", return_value=[]))
         self.stack.enter_context(patch.object(bridge, "_watch_events"))
         self.probe = self.stack.enter_context(patch.object(opper_health, "health_status"))
         self.status = self.stack.enter_context(patch.object(opencode_api, "session_status", return_value={}))

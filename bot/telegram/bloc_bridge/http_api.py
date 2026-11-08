@@ -38,6 +38,10 @@ class TelegramFormattingError(RuntimeError):
     """Raised when Telegram rejects message entity or HTML formatting."""
 
 
+class TelegramMessageNotModified(RuntimeError):
+    """Raised when Telegram receives an edit that would not change the message."""
+
+
 class OpenCodeHTTPError(RuntimeError):
     """An OpenCode HTTP error with a safe status code for diagnostics."""
 
@@ -201,6 +205,13 @@ def _handle_telegram_error(url, status, details) -> NoReturn:
             )
         ):
             raise TelegramFormattingError("Telegram rejected message formatting") from None
+    if status == 400 and method == "editMessageText":
+        try:
+            description = json.loads(details).get("description", "").lower()
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            description = ""
+        if "message is not modified" in description:
+            raise TelegramMessageNotModified("Telegram message is already up to date") from None
     # Telegram URLs contain the bot token; never include them in logs.
     raise RuntimeError(f"Telegram API HTTP {status} ({method})") from None
 
