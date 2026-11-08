@@ -16,6 +16,8 @@ Docker runs `python -m bloc_bridge`. Its Dockerfile copies the entire package.
 - `telegram/markdown_renderer.py`: Markdown-to-HTML conversion and bounded message chunks.
 - `telegram/request_presentation.py`: persistent-in-chat request card, status history, and
   permission action buttons.
+- `telegram/question_control.py`: question command parsing, ownership revalidation, and OpenCode
+  question/form replies. Keep Telegram routing and request lifecycle coordination in `bridge.py`.
 - `telegram/format_test.py`: static formatting fixture; never calls the model.
 - `opencode/api.py`: OpenCode API helpers and prompt/assistant correlation.
 - `opencode/monitor_policy.py`: deterministic completion, cancellation, timeout, and recovery decisions.
@@ -56,9 +58,9 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
   and remind users that `/status` and `/abort` target the active request by default.
 - Show the age of the last correlated OpenCode activity separately from successful API polling;
   API reachability alone does not prove agent progress.
-- Surface permission requests for the active request's session tree and require an explicit
-  `/allow <letter>`, `/allowAll <letter>`, or `/deny <letter>` decision; approval is one-time by
-  default. Never auto-approve. Interactive questions are not currently bridged to Telegram.
+- Surface permission requests and interactive questions only for the active request's session tree.
+  Require explicit permission decisions and explicit answers or rejection for questions; never
+  auto-approve or infer an answer. Keep question text and answers out of persistence and logs.
 - At exchange completion, report a deduplicated list of tool names and tool-call count, including
   recognized CLI names such as `gh`; never include command arguments or tool output.
 - Report only OpenCode usage already observed for the active exchange, marked as partial; do not

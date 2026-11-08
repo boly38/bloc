@@ -31,6 +31,9 @@ class TelegramRequestTests(unittest.TestCase):
         self.permission_patch = patch.object(opencode_api, "pending_permissions", return_value=[])
         self.permission_patch.start()
         self.addCleanup(self.permission_patch.stop)
+        self.question_patch = patch.object(opencode_api, "pending_questions", return_value=[])
+        self.question_patch.start()
+        self.addCleanup(self.question_patch.stop)
 
     def test_create_is_idempotent_for_a_telegram_update(self):
         request, created = request_store.create("A" * 16, 123, 101)

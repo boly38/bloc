@@ -249,6 +249,155 @@ def pending_permissions(session_id=None, timeout=None):
     return permissions
 
 
+def _normalize_question_options(questions):
+    normalized = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        item = dict(question)
+        options = item.get("options")
+        item["options"] = [
+            {
+                "label": option["label"],
+                "value": option.get("value", option["label"]),
+                **({"description": option["description"]} if isinstance(option.get("description"), str) else {}),
+            }
+            for option in options
+            if isinstance(option, dict) and isinstance(option.get("label"), str)
+        ] if isinstance(options, list) else []
+        normalized.append(item)
+    return normalized
+
+
+def _question_form(form, session_id):
+    """Normalize an OpenCode v2 question form to the bridge's question-card model."""
+    if not isinstance(form, dict) or not isinstance(form.get("id"), str):
+        return None
+    metadata = form.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("kind") != "question":
+        return None
+    fields = form.get("fields")
+    if not isinstance(fields, list):
+        return None
+    questions = []
+    for index, field in enumerate(fields):
+        if not isinstance(field, dict):
+            field = {}
+        key = field.get("key")
+        title = field.get("title")
+        description = field.get("description")
+        header = title if isinstance(title, str) else form.get("title", "Question")
+        question = description if isinstance(description, str) else title or "Question"
+        if (
+            not isinstance(key, str)
+            or field.get("type") not in ("string", "multiselect")
+        ):
+            questions.append({
+                "key": key if isinstance(key, str) else f"unsupported{index}",
+                "header": header,
+                "question": question,
+                "options": [],
+                "multiple": False,
+                "custom": False,
+                "unsupported": True,
+            })
+            continue
+        raw_options = field.get("options")
+        options = [
+            {
+                "label": option.get("label", option.get("value")),
+                "value": option.get("value", option.get("label")),
+                **({"description": option["description"]} if isinstance(option.get("description"), str) else {}),
+            }
+            for option in raw_options
+            if isinstance(option, dict)
+            and isinstance(option.get("value", option.get("label")), str)
+        ] if isinstance(raw_options, list) else []
+        options = [option for option in options if isinstance(option.get("label"), str)]
+        questions.append({
+            "key": key,
+            "header": header,
+            "question": question,
+            "options": options,
+            "multiple": field.get("type") == "multiselect",
+            "custom": field.get("custom", False) is True,
+        })
+    if not questions:
+        return None
+    return {
+        "id": form["id"],
+        "sessionID": session_id,
+        "questions": questions,
+        "form": True,
+    }
+
+
+def _pending_question_forms(session_id, timeout):
+    if not isinstance(session_id, str) or not session_id:
+        return []
+    forms = []
+    for current_id in session_tree_session_ids(session_id, timeout=timeout):
+        response = http(_session_url(current_id, "/form"), timeout=timeout)
+        entries = _data(response, list, "session form list")
+        forms.extend(
+            question
+            for entry in entries
+            if (question := _question_form(entry, current_id)) is not None
+        )
+    return forms
+
+
+def pending_questions(session_id=None, timeout=None):
+    """Return pending questions, adapting v2 question forms to the legacy question model."""
+    try:
+        response = http(f"{OC}/api/question", timeout=timeout)
+    except http_api.OpenCodeHTTPError as error:
+        if error.status != 404:
+            raise
+        return _pending_question_forms(session_id, timeout)
+    if isinstance(response, list):
+        questions = response
+    elif isinstance(response, dict) and isinstance(response.get("data"), list):
+        questions = response["data"]
+    else:
+        raise RuntimeError("OpenCode returned an invalid question request list")
+    return [
+        {**question, "questions": _normalize_question_options(question.get("questions", [])), "form": False}
+        for question in questions
+        if isinstance(question, dict)
+    ]
+
+
+def respond_to_question(request_id, answers=None, reject=False, timeout=None):
+    """Reply to or reject one pending question without exposing its ID to Telegram."""
+    encoded_id = urllib.parse.quote(request_id, safe="")
+    endpoint = f"{OC}/api/question/{encoded_id}"
+    if reject:
+        result = http(f"{endpoint}/reject", timeout=timeout, method="POST")
+    else:
+        if not isinstance(answers, list) or not all(
+            isinstance(answer, list) and all(isinstance(item, str) for item in answer)
+            for answer in answers
+        ):
+            raise ValueError("Question answers must be lists of strings")
+        result = http(f"{endpoint}/reply", {"answers": answers}, timeout=timeout, method="POST")
+    return result is True or (isinstance(result, dict) and result.get("data") is True)
+
+
+def respond_to_question_form(session_id, form_id, answer=None, reject=False, timeout=None):
+    """Reply to or cancel a pending OpenCode v2 question form."""
+    encoded_session_id = urllib.parse.quote(session_id, safe="")
+    encoded_form_id = urllib.parse.quote(form_id, safe="")
+    endpoint = f"{OC}/api/session/{encoded_session_id}/form/{encoded_form_id}"
+    if reject:
+        result = http(endpoint, timeout=timeout, method="DELETE")
+    else:
+        if not isinstance(answer, dict):
+            raise ValueError("Question form answers must be a mapping")
+        result = http(f"{endpoint}/reply", {"answer": answer}, timeout=timeout, method="POST")
+    return result is None or result is True or (isinstance(result, dict) and result.get("data") is True)
+
+
 def respond_to_permission(session_id, permission_id, response, timeout=None, message=None):
     """Answer one pending permission request without exposing its IDs to Telegram."""
     if response not in ("once", "always", "reject"):

@@ -7,7 +7,7 @@ import threading
 import time
 import urllib.error
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .. import bridge_runtime, http_api, request_store, session_state
@@ -256,6 +256,15 @@ def _permission_signature(permissions):
     return tuple(sorted(entries, key=lambda entry: entry[0]))
 
 
+def _question_signature(questions):
+    entries = [
+        (question["id"], question.get("sessionID"))
+        for question in questions
+        if isinstance(question, dict) and isinstance(question.get("id"), str)
+    ]
+    return tuple(sorted(entries, key=lambda entry: entry[0]))
+
+
 def _permission_belongs_to_session_tree(session_id, root_session_id, known_session_ids):
     """Check bounded session ancestry so child-agent prompts stay with their request."""
     current_session_id = session_id
@@ -281,6 +290,27 @@ def _permissions_in_session_tree(root_session_id, requests, related_sessions, un
     matches = []
     for request in requests:
         if not isinstance(request, dict):
+            continue
+        session_id = request.get("sessionID")
+        if not isinstance(session_id, str) or session_id in unrelated_sessions:
+            continue
+        if _permission_belongs_to_session_tree(session_id, root_session_id, related_sessions):
+            matches.append(request)
+        else:
+            unrelated_sessions.add(session_id)
+    return sorted(matches, key=lambda request: request.get("id", ""))
+
+
+def _questions_in_session_tree(root_session_id, requests, related_sessions, unrelated_sessions):
+    """Keep only question prompts owned by this request's bounded session tree."""
+    matches = []
+    for request in requests:
+        if (
+            not isinstance(request, dict)
+            or not isinstance(request.get("id"), str)
+            or not isinstance(request.get("questions"), list)
+            or not request["questions"]
+        ):
             continue
         session_id = request.get("sessionID")
         if not isinstance(session_id, str) or session_id in unrelated_sessions:
@@ -416,6 +446,7 @@ class _MonitorSnapshot:
     prompt_found: bool
     correlated_messages: list[dict]
     pending_permissions: list[dict]
+    pending_questions: list[dict] = field(default_factory=list)
 
 
 class _AsyncRequestMonitor:
@@ -451,14 +482,20 @@ class _AsyncRequestMonitor:
         self.last_opencode_activity_at = self.monitor_started_at
         self.last_api_success_at = self.monitor_started_at
         self.last_activity_signature = None
-        self.last_snapshot = _MonitorSnapshot(True, False, [], [])
+        self.last_snapshot = _MonitorSnapshot(True, False, [], [], [])
         self.pending_permissions = []
         self.related_permission_sessions = {session_id}
         self.unrelated_permission_sessions = set()
         self.last_permission_poll_at = self.monitor_started_at - _PERMISSION_POLL_INTERVAL_SECONDS
         self.reported_permission_signature = ()
+        self.reported_question_signature = ()
         self.reported_permission_error = False
         self.reported_permission_session_error = False
+        self.pending_questions = []
+        self.related_question_sessions = {session_id}
+        self.unrelated_question_sessions = set()
+        self.last_question_poll_at = self.monitor_started_at - _PERMISSION_POLL_INTERVAL_SECONDS
+        self.reported_question_error = False
 
     def run(self, set_phase, progress):
         """Poll until completion or an OpenCode stop is confirmed."""
@@ -528,7 +565,14 @@ class _AsyncRequestMonitor:
         if activity_signature != self.last_activity_signature:
             self.last_activity_signature = activity_signature
             self.last_opencode_activity_at = now
-        snapshot = _MonitorSnapshot(busy, prompt_found, correlated, list(self.pending_permissions))
+        self._poll_pending_questions()
+        snapshot = _MonitorSnapshot(
+            busy,
+            prompt_found,
+            correlated,
+            list(self.pending_permissions),
+            list(self.pending_questions),
+        )
         self.last_snapshot = snapshot
         return snapshot
 
@@ -583,6 +627,44 @@ class _AsyncRequestMonitor:
         if presentation is not None:
             presentation.sync_permissions(self.pending_permissions)
 
+    def _poll_pending_questions(self):
+        """Refresh question prompts and retain only those owned by this request."""
+        now = time.monotonic()
+        if now - self.last_question_poll_at < _PERMISSION_POLL_INTERVAL_SECONDS:
+            return
+        self.last_question_poll_at = now
+        previous = self.pending_questions
+        try:
+            requests = opencode_api.pending_questions(
+                self.session_id,
+                timeout=OPENCODE_STATUS_TIMEOUT_SECONDS,
+            )
+            self.pending_questions = _questions_in_session_tree(
+                self.session_id,
+                requests,
+                self.related_question_sessions,
+                self.unrelated_question_sessions,
+            )
+            self.reported_question_error = False
+        except Exception as error:
+            if not self.reported_question_error:
+                detail = _safe_error_detail(error)
+                print(
+                    f"opencode_question_poll_failed ref={self.reference} "
+                    f"error_type={type(error).__name__} detail={detail}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.reported_question_error = True
+            return
+        if _question_signature(previous) != _question_signature(self.pending_questions):
+            self.last_opencode_activity_at = time.monotonic()
+        if previous and not self.pending_questions:
+            self.current_stage = "Question resolved; OpenCode is resuming"
+        presentation = _request_presentation(self.reference)
+        if presentation is not None:
+            presentation.sync_questions(self.pending_questions)
+
     def _handle_read_error(self, error):
         """Log polling failures safely and mark unconfirmed stop states."""
         if not self.reported_read_error:
@@ -615,6 +697,23 @@ class _AsyncRequestMonitor:
             for message in snapshot.correlated_messages:
                 opencode_api.raise_response_error(message)
         except opencode_api.OpenCodeResponseError as error:
+            request = request_store.get(self.reference) if self.reference else None
+            if (
+                request is not None
+                and request.get("detail") == "question_rejected"
+                and error.error_name.lower() in {
+                    "aborted",
+                    "cancelled",
+                    "canceled",
+                    "formcancellederror",
+                    "questionrejectederror",
+                }
+            ):
+                raise OpenCodeRequestStopped(
+                    "question_rejected",
+                    _tool_names(snapshot.correlated_messages),
+                    _tool_call_count(snapshot.correlated_messages),
+                ) from error
             error.tool_names = _tool_names(snapshot.correlated_messages)
             error.tool_call_count = _tool_call_count(snapshot.correlated_messages)
             raise
@@ -656,7 +755,10 @@ class _AsyncRequestMonitor:
             snapshot.correlated_messages
             and _assistant_response_complete(snapshot.correlated_messages[-1])
         )
-        return self.policy.request_is_complete(response_complete, snapshot.busy)
+        return not snapshot.pending_questions and self.policy.request_is_complete(
+            response_complete,
+            snapshot.busy,
+        )
 
     def _request_abort(self, snapshot):
         """Abort only after the submitted prompt is visible in the busy session."""
@@ -729,6 +831,8 @@ class _AsyncRequestMonitor:
         correlated = snapshot.correlated_messages
         now = time.monotonic()
         permission_signature = _permission_signature(snapshot.pending_permissions)
+        question_signature = _question_signature(snapshot.pending_questions)
+        question_pending = question_signature != self.reported_question_signature
         observed_cost = cost_reporting.format_observed_cost(correlated)
         stage_pending = self.current_stage is not None and self.current_stage != self.reported_stage
         cost_pending = observed_cost is not None and observed_cost != self.reported_cost
@@ -739,8 +843,9 @@ class _AsyncRequestMonitor:
             self.reported_stage is None
             and self.reported_cost is None
             and not self.reported_permission_signature
+            and not self.reported_question_signature
         )
-        change_due = (stage_pending or cost_pending or permission_pending) and (
+        change_due = (stage_pending or cost_pending or permission_pending or question_pending) and (
             first_update or interval_elapsed >= _PROGRESS_EVENT_MIN_INTERVAL_SECONDS
         )
         response_finishing = api_responding and (
@@ -754,7 +859,11 @@ class _AsyncRequestMonitor:
         elapsed = int(now - self.monitor_started_at)
         activity_age = int(now - self.last_opencode_activity_at)
         api_age = int(now - self.last_api_success_at)
-        if snapshot.pending_permissions:
+        if snapshot.pending_questions:
+            count = len(snapshot.pending_questions)
+            question_label = "question" if count == 1 else "questions"
+            text = f"OpenCode is waiting for your answer to {count} {question_label} ({elapsed}s elapsed)."
+        elif snapshot.pending_permissions:
             count = len(snapshot.pending_permissions)
             permission_label = "permission" if count == 1 else "permissions"
             text = f"OpenCode is waiting for {count} {permission_label} ({elapsed}s elapsed)."
@@ -778,6 +887,7 @@ class _AsyncRequestMonitor:
         if observed_cost is not None:
             self.reported_cost = observed_cost
         self.reported_permission_signature = permission_signature
+        self.reported_question_signature = question_signature
         self.last_progress_at = time.monotonic()
 
 
@@ -941,6 +1051,7 @@ def resume_async_request(request, set_phase, progress):
             "user_cancelled",
             "user_cancelled_unconfirmed",
             "submission_ack_unconfirmed",
+            "question_rejected",
         )
     ):
         request_store.update(reference, state="running", detail=None)

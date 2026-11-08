@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from . import bridge_runtime, http_api, opper_health, request_store, session_state
 from .opencode import cost_reporting, api as opencode_api, exchange, tooling
 from .telegram import markdown_renderer, polling as telegram_polling
+from .telegram.question_control import QuestionControl
 from .telegram.request_presentation import RequestPresentation
 from .bridge_config import (
     ALLOWED,
@@ -115,6 +116,14 @@ def _edit_request_presentation(presentation):
         )
 
 
+def _edit_active_request_presentation(presentation):
+    with presentation.lock:
+        if presentation.final_text is not None:
+            return False
+        _edit_request_presentation(presentation)
+        return True
+
+
 def _schedule_request_status_expiry(presentation):
     with presentation.lock:
         if presentation.status_expiry_timer is not None:
@@ -160,8 +169,7 @@ def _append_request_status(chat_id, reference, status_text):
     if presentation is None:
         return False
     presentation.append_status(status_text)
-    _edit_request_presentation(presentation)
-    return True
+    return _edit_active_request_presentation(presentation)
 
 
 def _finish_request_presentation(request, summary):
@@ -194,6 +202,7 @@ _event_details = exchange._event_details
 _event_progress_stage = exchange._event_progress_stage
 _session_is_busy = exchange._session_is_busy
 _permissions_in_session_tree = exchange._permissions_in_session_tree
+_questions_in_session_tree = exchange._questions_in_session_tree
 _watch_events = exchange._watch_events
 _tool_names = tooling.tool_names
 _tool_call_count = tooling.tool_call_count
@@ -393,6 +402,76 @@ def _respond_to_permission(chat_id, reference, letter, decision, expected_permis
     else:
         response_text = f"Permission {letter} allowed once. OpenCode can continue."
     return response_text
+
+
+_QUESTION_CONTROL = None
+
+
+def _question_control():
+    """Create the question workflow once while resolving bridge callbacks lazily."""
+    global _QUESTION_CONTROL
+    if _QUESTION_CONTROL is None:
+        _QUESTION_CONTROL = QuestionControl(
+            request_store=request_store,
+            opencode_api=opencode_api,
+            questions_in_session_tree=(
+                lambda root, requests, related, unrelated: _questions_in_session_tree(
+                    root,
+                    requests,
+                    related,
+                    unrelated,
+                )
+            ),
+            presentation_for_request=_request_presentation_for_request,
+            edit_active_presentation=_edit_active_request_presentation,
+            send=lambda chat_id, text: send(chat_id, text),
+            status_timeout=lambda: OPENCODE_STATUS_TIMEOUT_SECONDS,
+        )
+    return _QUESTION_CONTROL
+
+
+def question_reply_response(chat_id, prompt, command):
+    return _question_control().reply_from_command(chat_id, prompt, command)
+
+
+def _respond_to_question(
+    chat_id,
+    reference,
+    letter,
+    answers=None,
+    reject=False,
+    expected_question_id=None,
+    expected_question_token=None,
+):
+    return _question_control().respond(
+        chat_id,
+        reference,
+        letter,
+        answers=answers,
+        reject=reject,
+        expected_question_id=expected_question_id,
+        expected_question_token=expected_question_token,
+    )
+
+
+def _update_question_selection(
+    chat_id,
+    reference,
+    letter,
+    question_index,
+    option_index=None,
+    complete=False,
+    expected_question_token=None,
+):
+    return _question_control().update_selection(
+        chat_id,
+        reference,
+        letter,
+        question_index,
+        option_index=option_index,
+        complete=complete,
+        expected_question_token=expected_question_token,
+    )
 
 
 def _request_status_text(state):
@@ -738,6 +817,8 @@ def authorized_response(chat_id, prompt, sessions):
         return cancel_request_response(chat_id, reference)
     if command in ("/allow", "/allowall", "/deny"):
         return permission_reply_response(chat_id, prompt, command)
+    if command in ("/answer", "/reject"):
+        return question_reply_response(chat_id, prompt, command)
     if command is not None:
         return "Unknown command. Use /help to list the available commands."
     return answer(chat_id, prompt, sessions)
@@ -768,6 +849,11 @@ def help_response():
             "/allow [letter] — approve that permission once (default when one is pending)",
             "/allowAll <letter> — remember an eligible permission rule",
             "/deny [letter] — reject that permission",
+            (
+                "/answer <question-number> <choice-number(s) or text> — answer a question "
+                "(free-form text is limited to 500 characters)"
+            ),
+            "/reject <question-number> — reject the question request containing that question",
         )
     )
 
@@ -855,6 +941,8 @@ def edit_reply(chat_id, message_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     try:
         http_api.telegram("editMessageText", payload)
+    except http_api.TelegramMessageNotModified:
+        return
     except http_api.TelegramFormattingError:
         fallback = {"chat_id": chat_id, "message_id": message_id, "text": first.plain}
         if reply_markup is not None:
@@ -1075,7 +1163,14 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
         )
     except Exception as error:
         failed_phase = state["phase"]
-        _log_request_error(reference, update_id, state["phase"], started, error)
+        if isinstance(error, OpenCodeRequestStopped) and error.state == "question_rejected":
+            print(
+                f"request_stopped ref={reference} update_id={update_id} reason=question_rejected",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            _log_request_error(reference, update_id, state["phase"], started, error)
         stored = request_store.get(reference)
         if failed_phase.startswith("telegram_"):
             if stored is not None and stored["state"] == "delivering":
@@ -1103,20 +1198,24 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
             request_store.update(reference, state="delivering", detail=terminal_state)
         elif isinstance(error, OpenCodeRequestStopped):
             terminal_state = "cancelled" if error.state == "user_cancelled" else "timed_out"
-            limit_seconds = OPENCODE_REQUEST_MAX_DURATION_SECONDS
-            if limit_seconds % 86400 == 0:
-                limit = f"{limit_seconds // 86400}-day limit"
-            elif limit_seconds % 3600 == 0:
-                limit = f"{limit_seconds // 3600}-hour limit"
-            elif limit_seconds % 60 == 0:
-                limit = f"{limit_seconds // 60}-minute limit"
+            if error.state == "question_rejected":
+                terminal_state = "cancelled"
+                error_text = f"The question was rejected. OpenCode stopped request {reference}."
+            elif terminal_state == "cancelled":
+                error_text = f"Request {reference} was cancelled and OpenCode confirmed it stopped."
             else:
-                limit = f"{limit_seconds}-second limit"
-            error_text = (
-                f"Request {reference} was cancelled and OpenCode confirmed it stopped."
-                if terminal_state == "cancelled"
-                else f"Request {reference} reached the configured {limit}; OpenCode confirmed it stopped."
-            )
+                limit_seconds = OPENCODE_REQUEST_MAX_DURATION_SECONDS
+                if limit_seconds % 86400 == 0:
+                    limit = f"{limit_seconds // 86400}-day limit"
+                elif limit_seconds % 3600 == 0:
+                    limit = f"{limit_seconds // 3600}-hour limit"
+                elif limit_seconds % 60 == 0:
+                    limit = f"{limit_seconds // 60}-minute limit"
+                else:
+                    limit = f"{limit_seconds}-second limit"
+                error_text = (
+                    f"Request {reference} reached the configured {limit}; OpenCode confirmed it stopped."
+                )
             request_store.update(reference, state="delivering", detail=terminal_state)
         elif (
             stored is not None
@@ -1333,7 +1432,7 @@ def _recover_pending_requests(sessions):
             continue
         recovery_detail = request.get("detail") if (
             state == "cancellation_requested"
-            or request.get("detail") == "submission_ack_unconfirmed"
+            or request.get("detail") in ("submission_ack_unconfirmed", "question_rejected")
         ) else None
         request_store.update(reference, state="recovering", detail=recovery_detail)
         if not _REQUEST_SLOTS.acquire(blocking=False):
@@ -1426,6 +1525,53 @@ def _handle_callback_update(update):
                     flush=True,
                 )
         return
+    if parts[0] in ("q", "qd") and len(parts) in (5, 6):
+        letter = parts[2]
+        if not re.fullmatch(r"[A-Z]", letter) or not parts[3].isdecimal():
+            _answer_callback_query(callback_id, "This question action is invalid.")
+            return
+        question_index = int(parts[3])
+        option_index = None
+        token = parts[-1]
+        if not re.fullmatch(r"[A-Fa-f0-9]{8}", token):
+            _answer_callback_query(callback_id, "This question action is invalid.")
+            return
+        if parts[0] == "q":
+            if len(parts) != 6 or not parts[4].isdecimal():
+                _answer_callback_query(callback_id, "This question action is invalid.")
+                return
+            option_index = int(parts[4])
+        elif len(parts) != 5:
+            _answer_callback_query(callback_id, "This question action is invalid.")
+            return
+        _answer_callback_query(callback_id, "Checking the question.")
+        response = _update_question_selection(
+            chat_id,
+            reference,
+            letter,
+            question_index,
+            option_index=option_index,
+            complete=parts[0] == "qd",
+            expected_question_token=token,
+        )
+        _record_control_result(chat_id, reference, response)
+        return
+    if (
+        parts[0] == "qr"
+        and len(parts) == 4
+        and re.fullmatch(r"[A-Z]", parts[2])
+        and re.fullmatch(r"[A-Fa-f0-9]{8}", parts[3])
+    ):
+        _answer_callback_query(callback_id, "Rejecting the question.")
+        response = _respond_to_question(
+            chat_id,
+            reference,
+            parts[2],
+            reject=True,
+            expected_question_token=parts[3],
+        )
+        _record_control_result(chat_id, reference, response)
+        return
     if parts[0] == "p" and len(parts) in (4, 5):
         letter, action = parts[2], parts[3]
         decisions = {"o": "once", "a": "always", "d": "reject"}
@@ -1451,7 +1597,15 @@ def _handle_callback_update(update):
 def handle_update(update, sessions):
     """Validate an incoming Telegram update before handing it to the request flow."""
     if isinstance(update, dict) and isinstance(update.get("callback_query"), dict):
-        _handle_callback_update(update)
+        try:
+            _handle_callback_update(update)
+        except Exception as error:
+            print(
+                f"telegram_callback_failed update_id={update.get('update_id', 'unknown')} "
+                f"error_type={type(error).__name__} detail={_safe_error_detail(error)}",
+                file=sys.stderr,
+                flush=True,
+            )
         return
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
@@ -1463,7 +1617,16 @@ def handle_update(update, sessions):
         return
     update_id = update.get("update_id", "unknown")
     command = _command_name(prompt)
-    if command in ("/status", "/cancel", "/abort", "/allow", "/allowall", "/deny"):
+    if command in (
+        "/status",
+        "/cancel",
+        "/abort",
+        "/allow",
+        "/allowall",
+        "/deny",
+        "/answer",
+        "/reject",
+    ):
         if not request_store.claim_update(update_id):
             return
         try:
@@ -1483,7 +1646,11 @@ def handle_update(update, sessions):
                 else:
                     _record_control_result(chat_id, target["reference"], response)
             else:
-                response = permission_reply_response(chat_id, prompt, command)
+                response = (
+                    permission_reply_response(chat_id, prompt, command)
+                    if command in ("/allow", "/allowall", "/deny")
+                    else question_reply_response(chat_id, prompt, command)
+                )
                 active = request_store.active_for_chat(chat_id)
                 if len(active) == 1:
                     _record_control_result(chat_id, active[0]["reference"], response)
@@ -1492,8 +1659,9 @@ def handle_update(update, sessions):
         except ValueError as error:
             send(chat_id, str(error))
         except Exception as error:
+            detail = _safe_error_detail(error)
             print(
-                f"request_control_failed command={command[1:]} error_type={type(error).__name__}",
+                f"request_control_failed command={command[1:]} error_type={type(error).__name__} detail={detail}",
                 file=sys.stderr,
                 flush=True,
             )
