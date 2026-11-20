@@ -21,6 +21,7 @@ TELEGRAM_HTTP_TIMEOUT_SECONDS = 70
 TELEGRAM_LONG_POLL_TIMEOUT_SECONDS = 50
 
 SESSIONS_PATH = "/data/sessions.json"
+CHAT_PREFERENCES_PATH = "/data/chat-preferences.json"
 REQUESTS_PATH = "/data/requests.sqlite3"
 POLLING_LOCK_PATH = "/data/telegram-polling.lock"
 COST_DIAGNOSTICS_ENABLED = os.getenv("TELEGRAM_COST_DIAGNOSTICS", "false").strip().lower() == "true"
