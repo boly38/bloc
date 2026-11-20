@@ -21,6 +21,9 @@ The Telegram commands are:
   Costs are based on usage reported by OpenCode, not an estimate from provider prices, and
   are not account-wide totals. Replies include a cost line when OpenCode provides usage
   data.
+- `/intermediates on|off` enables or disables delivery of intermediate user-facing assistant
+  replies for subsequent requests in this chat. It is disabled by default; changing the setting
+  does not affect a request that is already active.
 - `/status [reference]` shows the active request, or the state of a request with the given
   reference. A reference can only be inspected from the chat that owns it.
 - `/abort` asks OpenCode to stop the active request; it is an alias for `/cancel`.
@@ -62,6 +65,11 @@ since OpenCode's last activity separately from the API heartbeat.
 When the request ends, the card is replaced with a terminal summary containing status, cost,
 duration, request reference, distinct tool count, and total tool-call count. The model's final answer is sent as a
 separate Telegram message and lists tool names only, not arguments or output.
+
+When intermediate replies are enabled, completed assistant text messages before the final answer
+are sent as separate Telegram messages in order. Reasoning and tool content are never forwarded.
+If the bridge resumes a request after restarting, it does not replay intermediate messages already
+present in OpenCode history; newly observed messages can still be forwarded.
 
 OpenCode permission requests and interactive questions for the active request's session tree are
 forwarded to the request card, including the form-based question API used by OpenCode v2. When

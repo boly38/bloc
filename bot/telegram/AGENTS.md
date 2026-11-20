@@ -25,8 +25,10 @@ Docker runs `python -m bloc_bridge`. Its Dockerfile copies the entire package.
 - `bridge_runtime.py`: daemon workers, shutdown context, and cooperative cancellation.
 - `http_api.py`: shared HTTP transport, Telegram error classification, and polling lock.
 - `opper_health.py`: isolated, optional, unauthenticated Opper reachability check for `/health` only.
-- `bridge_config.py` and `session_state.py`: environment settings and persisted chat sessions.
+- `bridge_config.py`, `session_state.py`, and `chat_preferences.py`: environment settings,
+  persisted chat sessions, and per-chat bridge preferences.
 - `request_store.py`: durable request metadata and Telegram-update deduplication.
+- `opencode/intermediate_replies.py`: ordered selection and deduplication of intermediate assistant text.
 
 For an overview, see [message flow](../../docs/diagrams/bloc_bridge-overview.puml).
 For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchanges.puml).
@@ -49,10 +51,15 @@ For details, see [exchanges and shutdown](../../docs/diagrams/bloc_bridge-exchan
   persist mappings with atomic file replacement.
 - Slash commands never submit a model prompt. `/new`, `/health`, and `/cost` can call
   OpenCode APIs; `/start`, `/help`, and unknown commands are handled locally.
+- `/intermediates on|off` is handled locally, defaults to off, and only changes subsequent
+  requests. Persist the preference per chat and snapshot it in request metadata for recovery.
 - `/health` contacts Opper only when `TELEGRAM_HEALTH_OPPER_ENABLED=true`; this is a
   bridge-side reachability check, not proof of authentication or working inference.
 - Correlate assistant responses to the generated prompt message ID. SSE is optional
   progress information, not proof of completion; status and history determine completion.
+- Forward only completed text from correlated assistant messages before the final message;
+  never forward reasoning, tool inputs, or tool outputs. On recovery, skip messages already
+  present in history rather than replaying them.
 - Keep progress updates deterministic and sanitized: report analysis/tool/test stages and safe
   tool names, never raw reasoning text, tool inputs, or tool output. Include the request reference
   and remind users that `/status` and `/abort` target the active request by default.

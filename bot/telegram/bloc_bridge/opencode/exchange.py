@@ -22,6 +22,7 @@ from . import api as opencode_api
 from . import cost_reporting
 from . import monitor_policy
 from . import tooling
+from .intermediate_replies import IntermediateReplyTracker
 
 
 _SESSIONS_LOCK = threading.RLock()
@@ -452,11 +453,21 @@ class _MonitorSnapshot:
 class _AsyncRequestMonitor:
     """Own the state and lifecycle for monitoring one submitted OpenCode prompt."""
 
-    def __init__(self, session_id, prompt_message_id, reference, started_at):
+    def __init__(
+        self,
+        session_id,
+        prompt_message_id,
+        reference,
+        started_at,
+        intermediate_reply=None,
+        skip_existing_intermediates=False,
+    ):
         self.session_id = session_id
         self.prompt_message_id = prompt_message_id
         self.reference = reference
         self.started_at = started_at
+        self.intermediate_reply = intermediate_reply
+        self.intermediate_replies = IntermediateReplyTracker(skip_existing_intermediates)
         self.events_to_stop = threading.Event()
         self.events = queue.Queue(maxsize=128)
         self.event_thread = threading.Thread(
@@ -515,7 +526,9 @@ class _AsyncRequestMonitor:
 
                 self._raise_correlated_response_error(snapshot)
                 self._update_progress_stage(snapshot.correlated_messages)
-                if self._is_request_complete(snapshot):
+                complete = self._is_request_complete(snapshot)
+                self._forward_intermediate_replies(snapshot.correlated_messages)
+                if complete:
                     return snapshot.correlated_messages
 
                 self._request_abort(snapshot)
@@ -526,6 +539,21 @@ class _AsyncRequestMonitor:
                 bridge_runtime.wait(1)
         finally:
             self.events_to_stop.set()
+
+    def _forward_intermediate_replies(self, messages):
+        """Deliver newly observed text from earlier messages in the assistant chain."""
+        if self.intermediate_reply is None:
+            return
+        for text in self.intermediate_replies.collect(messages):
+            try:
+                self.intermediate_reply(text)
+            except Exception as error:
+                print(
+                    f"intermediate_reply_delivery_failed ref={self.reference} "
+                    f"error_type={type(error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def _update_stop_reason(self):
         """Apply user cancellation or the request deadline to monitor state."""
@@ -891,9 +919,25 @@ class _AsyncRequestMonitor:
         self.last_progress_at = time.monotonic()
 
 
-def _monitor_async_request(session_id, prompt_message_id, reference, set_phase, progress, started_at):
+def _monitor_async_request(
+    session_id,
+    prompt_message_id,
+    reference,
+    set_phase,
+    progress,
+    started_at,
+    intermediate_reply=None,
+    skip_existing_intermediates=False,
+):
     """Monitor one submitted prompt until it completes or OpenCode confirms it stopped."""
-    monitor = _AsyncRequestMonitor(session_id, prompt_message_id, reference, started_at)
+    monitor = _AsyncRequestMonitor(
+        session_id,
+        prompt_message_id,
+        reference,
+        started_at,
+        intermediate_reply,
+        skip_existing_intermediates,
+    )
     return monitor.run(set_phase, progress)
 
 
@@ -931,7 +975,7 @@ def _format_async_result(session_id, correlated, previous_ids, reference):
     )
 
 
-def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
+def answer_async(chat_id, prompt, sessions, reference, set_phase, progress, intermediate_reply=None):
     """Submit a prompt asynchronously and collect its correlated result."""
     chat_key = str(chat_id)
     set_phase("session_lookup")
@@ -992,7 +1036,12 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
             else:
                 request_store.update(reference, state="uncertain", detail="submission_ack_unconfirmed")
             set_phase("recovery_check")
-            return resume_async_request(request_store.get(reference), set_phase, progress)
+            return resume_async_request(
+                request_store.get(reference),
+                set_phase,
+                progress,
+                intermediate_reply=intermediate_reply,
+            )
         raise
 
     correlated = _monitor_async_request(
@@ -1002,12 +1051,13 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress):
         set_phase,
         progress,
         started_at,
+        intermediate_reply,
     )
     set_phase("history_after")
     return _format_async_result(session_id, correlated, previous_ids, reference)
 
 
-def resume_async_request(request, set_phase, progress):
+def resume_async_request(request, set_phase, progress, intermediate_reply=None):
     """Resume monitoring a submitted OpenCode prompt without resubmitting it."""
     session_id = request.get("session_id")
     prompt_message_id = request.get("prompt_message_id")
@@ -1062,6 +1112,8 @@ def resume_async_request(request, set_phase, progress):
         set_phase,
         progress,
         started_at,
+        intermediate_reply,
+        True,
     )
     set_phase("history_after")
     return _format_async_result(session_id, correlated, None, reference)

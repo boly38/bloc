@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import bridge_runtime, http_api, opper_health, request_store, session_state
+from . import bridge_runtime, chat_preferences, http_api, opper_health, request_store, session_state
 from .opencode import cost_reporting, api as opencode_api, exchange, tooling
 from .telegram import markdown_renderer, polling as telegram_polling
 from .telegram.question_control import QuestionControl
@@ -801,6 +801,8 @@ def authorized_response(chat_id, prompt, sessions):
         if not session_id:
             return "No OpenCode session or cost data yet."
         return cost_reporting.cost_report(session_id)
+    if command == "/intermediates":
+        return intermediates_command_response(chat_id, prompt)
     if command == "/status":
         try:
             reference = _control_reference(prompt, command)
@@ -854,6 +856,7 @@ def help_response():
                 "(free-form text is limited to 500 characters)"
             ),
             "/reject <question-number> — reject the question request containing that question",
+            "/intermediates on|off — enable or disable intermediate replies for new requests",
         )
     )
 
@@ -924,6 +927,17 @@ def send(chat_id, text, reply_markup=None):
                 fallback["reply_markup"] = reply_markup
             result = http_api.telegram("sendMessage", fallback)
     return result
+
+
+def intermediates_command_response(chat_id, prompt):
+    """Set the per-chat intermediate-reply preference for subsequent requests."""
+    words = prompt.split()
+    if len(words) != 2 or words[1].lower() not in ("on", "off"):
+        return "Usage: /intermediates on|off"
+    enabled = words[1].lower() == "on"
+    chat_preferences.set_intermediates_enabled(chat_id, enabled)
+    state = "enabled" if enabled else "disabled"
+    return f"Intermediate replies {state} for new requests."
 
 
 def edit_reply(chat_id, message_id, text, reply_markup=None):
@@ -1119,16 +1133,30 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
         finally:
             set_phase("response_wait")
 
+    def intermediate_reply(text):
+        set_phase("telegram_intermediate_send")
+        try:
+            send(chat_id, f"{text}\n\nRef: {reference}")
+        except Exception as error:
+            _log_request_error(reference, update_id, state["phase"], started, error)
+        finally:
+            set_phase("response_wait")
+
     try:
         with lock:
             bridge_runtime.check_shutdown()
             stored = request_store.get(reference)
             if stored is not None and stored["state"] == "cancelled":
                 return
+            exchange_options = (
+                {"intermediate_reply": intermediate_reply}
+                if stored is not None and bool(stored.get("intermediates_enabled"))
+                else {}
+            )
             command = _command_name(prompt) if prompt is not None else None
             if resume:
                 set_phase("recovery_check")
-                response = resume_async_request(stored, set_phase, progress)
+                response = resume_async_request(stored, set_phase, progress, **exchange_options)
             elif command is not None:
                 if command == "/new":
                     set_phase("session_create")
@@ -1139,7 +1167,15 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                 response = authorized_response(chat_id, prompt, sessions)
             else:
                 set_phase("opencode_request")
-                response = answer_async(chat_id, prompt, sessions, reference, set_phase, progress)
+                response = answer_async(
+                    chat_id,
+                    prompt,
+                    sessions,
+                    reference,
+                    set_phase,
+                    progress,
+                    **exchange_options,
+                )
             request_store.update(reference, state="delivering", detail="completed")
             set_phase("telegram_final_send")
             send(chat_id, response)
@@ -1626,11 +1662,14 @@ def handle_update(update, sessions):
         "/deny",
         "/answer",
         "/reject",
+        "/intermediates",
     ):
         if not request_store.claim_update(update_id):
             return
         try:
-            if command == "/status":
+            if command == "/intermediates":
+                send(chat_id, intermediates_command_response(chat_id, prompt))
+            elif command == "/status":
                 reference = _control_reference(prompt, command)
                 _show_request_status(chat_id, reference)
             elif command in ("/cancel", "/abort"):
@@ -1702,7 +1741,12 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
         return
 
     # Record the update before Telegram I/O so redelivery cannot enqueue it twice.
-    _, created = request_store.create(reference, chat_id, update_id)
+    _, created = request_store.create(
+        reference,
+        chat_id,
+        update_id,
+        intermediates_enabled=chat_preferences.intermediates_enabled(chat_id),
+    )
     if not created:
         return
     started = time.monotonic()

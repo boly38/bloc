@@ -999,7 +999,7 @@ class TelegramBridgeTests(unittest.TestCase):
         with patch.object(bridge, "answer") as answer:
             response = bridge.authorized_response(123, "/help", {})
 
-        for command in ("/start", "/help", "/new", "/health", "/cost"):
+        for command in ("/start", "/help", "/new", "/health", "/cost", "/intermediates"):
             with self.subTest(command=command):
                 self.assertIn(command, response)
         answer.assert_not_called()

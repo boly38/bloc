@@ -107,6 +107,7 @@ def initialize():
                 acknowledgement_id INTEGER,
                 session_id TEXT,
                 prompt_message_id TEXT,
+                intermediates_enabled INTEGER NOT NULL DEFAULT 0,
                 detail TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -115,6 +116,13 @@ def initialize():
             )
             """
         )
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        if "intermediates_enabled" not in columns:
+            connection.execute(
+                "ALTER TABLE requests ADD COLUMN intermediates_enabled INTEGER NOT NULL DEFAULT 0"
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS requests_chat_state ON requests(chat_id, state, created_at)"
         )
@@ -123,7 +131,14 @@ def initialize():
         )
 
 
-def create(reference, chat_id, update_id, state="acknowledging", detail=None):
+def create(
+    reference,
+    chat_id,
+    update_id,
+    state="acknowledging",
+    detail=None,
+    intermediates_enabled=False,
+):
     """Create one request for a Telegram update; return its row and whether it was new."""
     if state not in ALLOWED_TRANSITIONS:
         raise InvalidTransition(f"unknown initial state {state}")
@@ -133,10 +148,19 @@ def create(reference, chat_id, update_id, state="acknowledging", detail=None):
         cursor = connection.execute(
             """
             INSERT OR IGNORE INTO requests
-                (reference, chat_id, update_id, state, detail, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (reference, chat_id, update_id, state, detail, intermediates_enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (reference, str(chat_id), str(update_id), state, detail, now, now),
+            (
+                reference,
+                str(chat_id),
+                str(update_id),
+                state,
+                detail,
+                int(intermediates_enabled),
+                now,
+                now,
+            ),
         )
         row = connection.execute(
             "SELECT * FROM requests WHERE update_id = ?", (str(update_id),)
@@ -186,6 +210,7 @@ def update(reference, **fields):
         "acknowledgement_id",
         "session_id",
         "prompt_message_id",
+        "intermediates_enabled",
         "detail",
         "started_at",
         "completed_at",
@@ -217,6 +242,7 @@ def transition(reference, new_state, **fields):
         "acknowledgement_id",
         "session_id",
         "prompt_message_id",
+        "intermediates_enabled",
         "detail",
         "started_at",
         "completed_at",
@@ -252,6 +278,7 @@ def update_if_state(reference, expected_states, **fields):
         "acknowledgement_id",
         "session_id",
         "prompt_message_id",
+        "intermediates_enabled",
         "detail",
         "started_at",
         "completed_at",
