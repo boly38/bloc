@@ -801,8 +801,6 @@ def authorized_response(chat_id, prompt, sessions):
         if not session_id:
             return "No OpenCode session or cost data yet."
         return cost_reporting.cost_report(session_id)
-    if command == "/intermediates":
-        return intermediates_command_response(chat_id, prompt)
     if command == "/status":
         try:
             reference = _control_reference(prompt, command)
@@ -929,8 +927,8 @@ def send(chat_id, text, reply_markup=None):
     return result
 
 
-def intermediates_command_response(chat_id, prompt):
-    """Set the per-chat intermediate-reply preference for subsequent requests."""
+def handle_intermediates_command(chat_id, prompt):
+    """Apply the per-chat preference command and return its confirmation or usage."""
     words = prompt.split()
     if len(words) != 2 or words[1].lower() not in ("on", "off"):
         return "Usage: /intermediates on|off"
@@ -1668,7 +1666,7 @@ def handle_update(update, sessions):
             return
         try:
             if command == "/intermediates":
-                send(chat_id, intermediates_command_response(chat_id, prompt))
+                send(chat_id, handle_intermediates_command(chat_id, prompt))
             elif command == "/status":
                 reference = _control_reference(prompt, command)
                 _show_request_status(chat_id, reference)
