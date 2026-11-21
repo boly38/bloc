@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,10 +17,19 @@ with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_ALLOW
     from bloc_bridge.opencode.intermediate_replies import IntermediateReplyTracker
 
 
-def assistant(message_id, text):
+def assistant(message_id, text, parent_id=None, *, completed_at=1, finish=None, extra_parts=()):
+    info = {
+        "id": message_id,
+        "role": "assistant",
+        "time": {"completed": completed_at},
+    }
+    if parent_id is not None:
+        info["parentID"] = parent_id
+    if finish is not None:
+        info["finish"] = finish
     return {
-        "info": {"id": message_id, "role": "assistant"},
-        "parts": [{"type": "text", "text": text}],
+        "info": info,
+        "parts": [*extra_parts, {"type": "text", "text": text}],
     }
 
 
@@ -36,14 +46,14 @@ class IntermediateReplyTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.collect([first, second, final]), [])
 
     def test_ignores_reasoning_and_tool_parts(self):
-        first = {
-            "info": {"id": "assistant-1", "role": "assistant"},
-            "parts": [
+        first = assistant(
+            "assistant-1",
+            "Visible update",
+            extra_parts=[
                 {"type": "reasoning", "text": "private reasoning"},
                 {"type": "tool", "tool": "bash", "state": {"output": "private tool output"}},
-                {"type": "text", "text": "Visible update"},
             ],
-        }
+        )
         final = assistant("assistant-final", "Final answer")
 
         self.assertEqual(IntermediateReplyTracker().collect([first, final]), ["Visible update"])
@@ -235,38 +245,14 @@ class TelegramIntermediatePreferenceTests(unittest.TestCase):
         reference = "D" * 16
         request_store.create(reference, 123, 105, state="queued", intermediates_enabled=True)
         prompt = {"info": {"id": "msg_prompt", "role": "user"}}
-        first = {
-            "info": {
-                "id": "assistant-1",
-                "parentID": "msg_prompt",
-                "role": "assistant",
-                "time": {"completed": 1},
-            },
-            "parts": [{"type": "text", "text": "First update"}],
-        }
-        second = {
-            "info": {
-                "id": "assistant-2",
-                "parentID": "assistant-1",
-                "role": "assistant",
-                "time": {"completed": 2},
-            },
-            "parts": [
-                {"type": "reasoning", "text": "Private reasoning"},
-                {"type": "text", "text": "Second update"},
-            ],
-        }
-        final = {
-            "info": {
-                "id": "assistant-final",
-                "parentID": "assistant-2",
-                "role": "assistant",
-                "time": {"completed": 3},
-                "finish": "stop",
-            },
-            "parts": [{"type": "text", "text": "Final answer"}],
-        }
+        first = assistant("assistant-1", "First update", "msg_prompt", completed_at=1)
+        second = assistant("assistant-2", "Second update", "assistant-1", completed_at=2)
+        final = assistant("assistant-final", "Final answer", "assistant-2", completed_at=3, finish="stop")
         history = [prompt, first, second, final]
+        session_tree = [
+            {"session_id": "session-1", "message": message}
+            for message in (first, second, final)
+        ]
         intermediates = []
         status_samples = [
             {"session-1": {"type": "busy"}},
@@ -287,33 +273,27 @@ class TelegramIntermediatePreferenceTests(unittest.TestCase):
         def session_messages(_session_id, timeout=None):
             return message_samples.pop(0) if message_samples else history
 
-        with patch.object(
-            bridge.uuid,
-            "uuid4",
-            return_value=SimpleNamespace(hex="prompt"),
-        ):
-            with patch.object(opencode_api, "session_tree_messages", side_effect=[[], [
-                {"session_id": "session-1", "message": message}
-                for message in (first, second, final)
-            ]]):
-                with patch.object(opencode_api, "submit_async"):
-                    with patch.object(opencode_api, "session_status", side_effect=session_status):
-                        with patch.object(
-                            opencode_api,
-                            "session_messages",
-                            side_effect=session_messages,
-                        ):
-                            with patch.object(bridge, "_watch_events", return_value=None):
-                                with patch.object(bridge.bridge_runtime, "wait"):
-                                    result = bridge.answer_async(
-                                        123,
-                                        "prompt text",
-                                        {"123": "session-1"},
-                                        reference,
-                                        lambda _phase: None,
-                                        lambda _text: None,
-                                        intermediate_reply=intermediates.append,
-                                    )
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt"))
+            )
+            stack.enter_context(
+                patch.object(opencode_api, "session_tree_messages", side_effect=[[], session_tree])
+            )
+            stack.enter_context(patch.object(opencode_api, "submit_async"))
+            stack.enter_context(patch.object(opencode_api, "session_status", side_effect=session_status))
+            stack.enter_context(patch.object(opencode_api, "session_messages", side_effect=session_messages))
+            stack.enter_context(patch.object(bridge, "_watch_events", return_value=None))
+            stack.enter_context(patch.object(bridge.bridge_runtime, "wait"))
+            result = bridge.answer_async(
+                123,
+                "prompt text",
+                {"123": "session-1"},
+                reference,
+                lambda _phase: None,
+                lambda _text: None,
+                intermediate_reply=intermediates.append,
+            )
 
         self.assertIn("Final answer", result)
         self.assertEqual(intermediates, ["First update", "Second update"])
