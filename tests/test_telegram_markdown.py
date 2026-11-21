@@ -50,6 +50,22 @@ class TelegramMarkdownTests(unittest.TestCase):
             "Heading\n\nbold, italic, removed, code\n\n• one\n• two\n\n│ quoted",
         )
 
+    def test_intermediate_messages_have_a_prefix_and_italic_style_except_for_code(self):
+        message = markdown_renderer.render_intermediate(
+            "An update with **emphasis**\n\n```python\nprint('hello')\n```"
+        )[0]
+
+        self.assertTrue(message.html.startswith("💬 <i>"))
+        self.assertIn("<i>An update with <b>emphasis</b>\n\n</i>", message.html)
+        self.assertIn(
+            "<pre><code class=\"language-python\">print('hello')</code></pre>",
+            message.html,
+        )
+        self.assertEqual(message.plain, "💬 An update with emphasis\n\nprint('hello')")
+        parser = _TagBalanceParser()
+        parser.feed(message.html)
+        self.assertEqual(parser.stack, [])
+
     def test_html_like_text_and_markdown_escapes_are_safe(self):
         message = markdown_renderer.render_markdown(
             r"<script>alert('x')</script> & \*literal\* "

@@ -8,6 +8,7 @@ import re
 MAX_MESSAGE_UNITS = 4000
 _LANGUAGE = re.compile(r"^[A-Za-z0-9_+#.-]{1,32}$")
 _LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
+_CODE_HTML = re.compile(r"(<pre\b[^>]*>.*?</pre>|<code\b[^>]*>.*?</code>)", re.DOTALL)
 _ESCAPABLE = set("\\`*_{}[]()#+-.!|>~&<>")
 
 
@@ -297,3 +298,17 @@ def render_markdown(markdown, max_units=MAX_MESSAGE_UNITS):
     if max_units < 2:
         raise ValueError("max_units must be at least 2 UTF-16 code units")
     return _chunk_events(_markdown_events(markdown), max_units)
+
+
+def render_intermediate(markdown, max_units=MAX_MESSAGE_UNITS):
+    """Render an intermediate reply with a distinct prefix and italic styling."""
+    rendered = render_markdown(markdown, max_units)
+    messages = []
+    for message in rendered:
+        parts = _CODE_HTML.split(message.html)
+        styled = "".join(
+            part if not part or _CODE_HTML.fullmatch(part) else f"<i>{part}</i>"
+            for part in parts
+        )
+        messages.append(RenderedMessage(f"💬 {styled}", f"💬 {message.plain}"))
+    return messages

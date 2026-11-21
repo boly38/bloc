@@ -911,9 +911,14 @@ def health_response(chat_id, sessions):
     return "\n".join(lines)
 
 
-def send(chat_id, text, reply_markup=None):
+def send(chat_id, text, reply_markup=None, *, intermediate=False):
     result = None
-    for message in markdown_renderer.render_markdown(text):
+    render = (
+        markdown_renderer.render_intermediate
+        if intermediate
+        else markdown_renderer.render_markdown
+    )
+    for message in render(text):
         payload = {"chat_id": chat_id, "text": message.html, "parse_mode": "HTML"}
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
@@ -1134,7 +1139,7 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
     def intermediate_reply(text):
         set_phase("telegram_intermediate_send")
         try:
-            send(chat_id, f"{text}\n\nRef: {reference}")
+            send(chat_id, text, intermediate=True)
         except Exception as error:
             _log_request_error(reference, update_id, state["phase"], started, error)
         finally:
