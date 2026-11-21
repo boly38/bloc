@@ -67,7 +67,9 @@ duration, request reference, distinct tool count, and total tool-call count. The
 separate Telegram message and lists tool names only, not arguments or output.
 
 When intermediate replies are enabled, completed assistant text messages before the final answer
-are sent as separate Telegram messages in order. Reasoning and tool content are never forwarded.
+are sent as separate Telegram messages in order, prefixed with 💬 and italicized to distinguish
+them from the final reply. Reasoning and tool content are never forwarded. The intermediate
+messages omit the request reference, which remains available on the request card and final reply.
 If the bridge resumes a request after restarting, it does not replay intermediate messages already
 present in OpenCode history; newly observed messages can still be forwarded.
 

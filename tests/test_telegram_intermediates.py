@@ -219,7 +219,8 @@ class TelegramIntermediatePreferenceTests(unittest.TestCase):
         self.assertEqual(send.call_count, 2)
         self.assertIn("Intermediate answer", send.call_args_list[0].args[1])
         self.assertIn("Final answer", send.call_args_list[1].args[1])
-        self.assertIn(request["reference"], send.call_args_list[0].args[1])
+        self.assertNotIn(request["reference"], send.call_args_list[0].args[1])
+        self.assertTrue(send.call_args_list[0].kwargs["intermediate"])
         self.assertEqual(request_store.get(request["reference"])["state"], "completed")
 
     def test_intermediate_delivery_failure_does_not_fail_final_answer(self):
