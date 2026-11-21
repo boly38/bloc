@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_ALLOW
     from bloc_bridge.opencode.intermediate_replies import IntermediateReplyTracker
 
 
-def assistant(message_id, text, parent_id=None, *, completed_at=1, finish=None, extra_parts=()):
+def assistant_message(message_id, text, parent_id=None, *, completed_at=1, finish=None, extra_parts=()):
     info = {
         "id": message_id,
         "role": "assistant",
@@ -35,9 +36,9 @@ def assistant(message_id, text, parent_id=None, *, completed_at=1, finish=None, 
 
 class IntermediateReplyTrackerTests(unittest.TestCase):
     def test_sends_prior_correlated_text_once_and_holds_back_the_latest_message(self):
-        first = assistant("assistant-1", "First update")
-        second = assistant("assistant-2", "Second update")
-        final = assistant("assistant-final", "Final answer")
+        first = assistant_message("assistant-1", "First update")
+        second = assistant_message("assistant-2", "Second update")
+        final = assistant_message("assistant-final", "Final answer")
         tracker = IntermediateReplyTracker()
 
         self.assertEqual(tracker.collect([first]), [])
@@ -46,7 +47,7 @@ class IntermediateReplyTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.collect([first, second, final]), [])
 
     def test_ignores_reasoning_and_tool_parts(self):
-        first = assistant(
+        first = assistant_message(
             "assistant-1",
             "Visible update",
             extra_parts=[
@@ -54,14 +55,14 @@ class IntermediateReplyTrackerTests(unittest.TestCase):
                 {"type": "tool", "tool": "bash", "state": {"output": "private tool output"}},
             ],
         )
-        final = assistant("assistant-final", "Final answer")
+        final = assistant_message("assistant-final", "Final answer")
 
         self.assertEqual(IntermediateReplyTracker().collect([first, final]), ["Visible update"])
 
     def test_recovery_skips_existing_messages_then_tracks_new_messages(self):
-        previous = assistant("assistant-before-restart", "Do not replay")
-        after_restart = assistant("assistant-after-restart", "New update")
-        final = assistant("assistant-final", "Final answer")
+        previous = assistant_message("assistant-before-restart", "Do not replay")
+        after_restart = assistant_message("assistant-after-restart", "New update")
+        final = assistant_message("assistant-final", "Final answer")
         tracker = IntermediateReplyTracker(skip_existing=True)
 
         self.assertEqual(tracker.collect([previous]), [])
@@ -103,6 +104,10 @@ class TelegramIntermediatePreferenceTests(unittest.TestCase):
 
         self.assertTrue(chat_preferences.intermediates_enabled(123))
         self.assertFalse(chat_preferences.intermediates_enabled(456))
+        self.assertEqual(
+            stat.S_IMODE(os.stat(chat_preferences.CHAT_PREFERENCES_PATH).st_mode),
+            0o600,
+        )
 
     def test_request_database_migrates_existing_rows_with_intermediates_disabled(self):
         legacy_path = os.path.join(self.directory.name, "legacy.sqlite3")
@@ -245,9 +250,15 @@ class TelegramIntermediatePreferenceTests(unittest.TestCase):
         reference = "D" * 16
         request_store.create(reference, 123, 105, state="queued", intermediates_enabled=True)
         prompt = {"info": {"id": "msg_prompt", "role": "user"}}
-        first = assistant("assistant-1", "First update", "msg_prompt", completed_at=1)
-        second = assistant("assistant-2", "Second update", "assistant-1", completed_at=2)
-        final = assistant("assistant-final", "Final answer", "assistant-2", completed_at=3, finish="stop")
+        first = assistant_message("assistant-1", "First update", "msg_prompt", completed_at=1)
+        second = assistant_message("assistant-2", "Second update", "assistant-1", completed_at=2)
+        final = assistant_message(
+            "assistant-final",
+            "Final answer",
+            "assistant-2",
+            completed_at=3,
+            finish="stop",
+        )
         history = [prompt, first, second, final]
         session_tree = [
             {"session_id": "session-1", "message": message}

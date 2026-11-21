@@ -42,7 +42,12 @@ def set_intermediates_enabled(chat_id, enabled):
         directory = os.path.dirname(CHAT_PREFERENCES_PATH)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with open(temporary_path, "w", encoding="utf-8") as file:
+        descriptor = os.open(
+            temporary_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            os.fchmod(file.fileno(), 0o600)
             json.dump(preferences, file)
-        os.chmod(temporary_path, 0o600)
         os.replace(temporary_path, CHAT_PREFERENCES_PATH)
