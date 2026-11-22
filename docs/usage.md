@@ -67,9 +67,9 @@ The initial Telegram acknowledgement remains as a request card. It has status an
 buttons while the request is active. `/status` appends a timestamped entry to that card, and
 permission decisions and interactive questions appear there with letter aliases and action
 buttons. The card shows deterministic analysis/tool/test stages, observed partial cost, and time
-since OpenCode's last activity separately from the API heartbeat. It shows effective provider,
-model, and variant from correlated OpenCode response metadata when available; missing metadata is
-reported rather than inferred from configuration.
+since OpenCode's last activity separately from the API heartbeat. It shows effective provider and
+model from correlated OpenCode response metadata when available; missing metadata is reported
+rather than inferred from configuration.
 
 When the request ends, the card is replaced with a terminal summary containing status, cost,
 duration, request reference, distinct tool count, and total tool-call count. The model's final answer is sent as a

@@ -269,7 +269,7 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertNotIn("Provider:", text)
         self.assertNotIn("Model:", text)
 
-    def test_request_card_renders_effective_model_and_variant_from_metadata(self):
+    def test_request_card_renders_effective_model_with_reference_on_one_italic_line(self):
         presentation = RequestPresentation(123, 456, "REF12345")
         self.assertTrue(
             presentation.set_effective_models(
@@ -278,30 +278,36 @@ class TelegramBridgeTests(unittest.TestCase):
         )
 
         active_text, _ = presentation.edit_payload()
-        self.assertIn("**Model used**", active_text)
-        self.assertIn("- `github-copilot/gpt-6-luna` (variant: `medium`)", active_text)
+        self.assertEqual(active_text.splitlines()[0], "*Model: github-copilot/gpt-6-luna · Ref: REF12345*")
+        self.assertNotIn("variant", active_text.lower())
+        self.assertEqual(
+            bridge.markdown_renderer.render_markdown(active_text)[0].html.splitlines()[0],
+            "<i>Model: github-copilot/gpt-6-luna · Ref: REF12345</i>",
+        )
 
         presentation.finish("Ref: REF12345\nStatus: completed")
         final_text, _ = presentation.edit_payload()
-        self.assertIn("**Model used**", final_text)
+        self.assertEqual(final_text.splitlines()[0], "*Model: github-copilot/gpt-6-luna · Ref: REF12345*")
         self.assertIn("Status: completed", final_text)
 
-    def test_request_card_lists_distinct_models_and_marks_missing_variants(self):
+    def test_request_card_lists_distinct_models_without_variants(self):
         presentation = RequestPresentation(123, 456, "REF12345")
         presentation.set_effective_models(
             [
                 {"providerID": "opper", "modelID": "flint-40b-free"},
                 {"providerID": "opper", "modelID": "flint-40b-free"},
                 {"providerID": "github-copilot", "modelID": "gpt-6-luna", "variant": "medium"},
+                {"providerID": "github-copilot", "modelID": "gpt-6-luna", "variant": "high"},
             ]
         )
 
         text, _ = presentation.edit_payload()
 
-        self.assertIn("**Models used**", text)
-        self.assertEqual(text.count("`opper/flint-40b-free`"), 1)
-        self.assertIn("`opper/flint-40b-free` (variant: not reported)", text)
-        self.assertIn("`github-copilot/gpt-6-luna` (variant: `medium`)", text)
+        self.assertEqual(
+            text.splitlines()[0],
+            "*Models: opper/flint-40b-free, github-copilot/gpt-6-luna · Ref: REF12345*",
+        )
+        self.assertNotIn("variant", text.lower())
 
     def test_request_card_reports_when_effective_model_metadata_is_unavailable(self):
         presentation = RequestPresentation(123, 456, "REF12345")
@@ -309,7 +315,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
         text, _ = presentation.edit_payload()
 
-        self.assertIn("**Effective model:** not reported", text)
+        self.assertEqual(text.splitlines()[0], "*Effective model: not reported · Ref: REF12345*")
 
     def test_exchange_extracts_distinct_models_from_assistant_metadata(self):
         messages = [
@@ -332,7 +338,6 @@ class TelegramBridgeTests(unittest.TestCase):
                     "role": "assistant",
                     "providerID": "github-copilot",
                     "modelID": "gpt-6-luna",
-                    "variant": "medium",
                 }
             },
             {
@@ -347,8 +352,8 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(
             bridge.exchange._observed_models(messages),
             [
-                {"providerID": "opper", "modelID": "flint-40b-free", "variant": None},
-                {"providerID": "github-copilot", "modelID": "gpt-6-luna", "variant": "medium"},
+                {"providerID": "opper", "modelID": "flint-40b-free"},
+                {"providerID": "github-copilot", "modelID": "gpt-6-luna"},
             ],
         )
 
@@ -1279,6 +1284,11 @@ class TelegramBridgeTests(unittest.TestCase):
                         "id": "msg_assistant",
                         "type": "assistant",
                         "content": [{"type": "text", "text": "hello back"}],
+                        "model": {
+                            "id": "gpt-5.6-luna",
+                            "providerID": "opper",
+                            "variant": "medium",
+                        },
                         "cost": 0.25,
                         "time": {"created": 2, "completed": 3},
                     },
@@ -1292,6 +1302,9 @@ class TelegramBridgeTests(unittest.TestCase):
 
         self.assertEqual(messages[0]["info"]["role"], "user")
         self.assertEqual(messages[1]["info"]["parentID"], "msg_prompt")
+        self.assertEqual(messages[1]["info"]["providerID"], "opper")
+        self.assertEqual(messages[1]["info"]["modelID"], "gpt-5.6-luna")
+        self.assertEqual(messages[1]["info"]["variant"], "medium")
         self.assertEqual(messages[1]["parts"], [{"type": "text", "text": "hello back"}])
         self.assertEqual(messages[2]["info"]["role"], None)
         self.assertEqual(request.call_count, 2)

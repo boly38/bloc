@@ -127,6 +127,8 @@ def _normalize_message(message):
     if not isinstance(message, dict) or not isinstance(message.get("type"), str):
         return None
     role = {"user": "user", "assistant": "assistant"}.get(message["type"])
+    model = message.get("model")
+    model = model if isinstance(model, dict) else {}
     info = {
         "id": message.get("id"),
         "role": role,
@@ -136,6 +138,9 @@ def _normalize_message(message):
         "agent": message.get("agent"),
         "finish": message.get("finish"),
         "error": message.get("error"),
+        "providerID": message.get("providerID", model.get("providerID")),
+        "modelID": message.get("modelID", model.get("id")),
+        "variant": message.get("variant", model.get("variant")),
     }
     parts = []
     content = message.get("content")

@@ -12,7 +12,6 @@ _SENSITIVE_VALUE = re.compile(
     r"(?i)\b(token|password|secret|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,;]+)"
 )
 _MODEL_COMPONENT = re.compile(r"^[A-Za-z0-9@._:+/-]{1,120}$")
-_MODEL_VARIANT = re.compile(r"^[A-Za-z0-9@._:+-]{1,40}$")
 _MAX_MESSAGE_LENGTH = 3600
 _MAX_INLINE_OPTIONS = 6
 _STATUS_CHECK_TTL_SECONDS = 180
@@ -83,7 +82,6 @@ class RequestPresentation:
                     continue
                 provider = model.get("providerID")
                 model_id = model.get("modelID")
-                variant = model.get("variant")
                 if (
                     not isinstance(provider, str)
                     or not _MODEL_COMPONENT.fullmatch(provider)
@@ -91,9 +89,7 @@ class RequestPresentation:
                     or not _MODEL_COMPONENT.fullmatch(model_id)
                 ):
                     continue
-                if not isinstance(variant, str) or not _MODEL_VARIANT.fullmatch(variant):
-                    variant = None
-                item = (provider, model_id, variant)
+                item = (provider, model_id)
                 if item not in seen:
                     seen.add(item)
                     normalized.append(item)
@@ -454,25 +450,23 @@ class RequestPresentation:
     def edit_payload(self):
         with self.lock:
             text = self.final_text or self._render_active()
-            model_lines = self._effective_model_lines()
-            if model_lines:
-                lines = text.splitlines()
-                insert_at = 1 if lines and lines[0].startswith("Ref: ") else 0
-                lines[insert_at:insert_at] = ["", *model_lines]
-                text = "\n".join(lines)
+            lines = text.splitlines()
+            if lines and lines[0].startswith("Ref: "):
+                reference = lines[0].removeprefix("Ref: ")
+                model_summary = self._effective_model_summary()
+                if model_summary is not None:
+                    lines[0] = f"*{model_summary} · Ref: {reference}*"
+                    text = "\n".join(lines)
             return self._truncate(text), self._keyboard()
 
-    def _effective_model_lines(self):
+    def _effective_model_summary(self):
         if self.effective_models:
-            heading = "**Models used**" if len(self.effective_models) > 1 else "**Model used**"
-            lines = [heading]
-            for provider, model, variant in self.effective_models:
-                variant_text = f"`{variant}`" if variant is not None else "not reported"
-                lines.append(f"- `{provider}/{model}` (variant: {variant_text})")
-            return lines
+            label = "Models" if len(self.effective_models) > 1 else "Model"
+            models = ", ".join(f"{provider}/{model}" for provider, model in self.effective_models)
+            return f"{label}: {models}"
         if self.effective_model_complete:
-            return ["**Effective model:** not reported"]
-        return []
+            return "Effective model: not reported"
+        return None
 
     def _permission_signature(self):
         signature = []

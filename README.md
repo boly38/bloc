@@ -31,7 +31,7 @@ Once the request is finished, the card updates to show the total cost and the nu
 - Review tool permission requests in Telegram and explicitly allow or deny them; permissions are
   never approved automatically.
 - Use Opper AI by default or connect another provider supported by OpenCode through the TUI.
-- Show provider, model, and variant reported by OpenCode on Telegram request cards.
+- Show the effective provider and model reported by OpenCode on Telegram request cards.
 - Deploy with Docker Compose or Coolify, and access the same server through the local TUI without
   publishing the OpenCode API port.
 

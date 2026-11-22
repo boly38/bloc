@@ -2,6 +2,7 @@
 
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ _PROGRESS_AGE_DISPLAY_THRESHOLD_SECONDS = 5
 _PERMISSION_POLL_INTERVAL_SECONDS = 5
 _PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS = 3
 _PERMISSION_ANCESTRY_MAX_DEPTH = 8
+
 class OpenCodeRequestTimeout(TimeoutError):
     """The overall time allowed for one OpenCode exchange elapsed."""
 
@@ -89,13 +91,8 @@ def _observed_models(messages):
         model_id = info.get("modelID")
         if not isinstance(provider, str) or not provider or not isinstance(model_id, str) or not model_id:
             continue
-        variant = info.get("variant")
-        model = {
-            "providerID": provider,
-            "modelID": model_id,
-            "variant": variant if isinstance(variant, str) else None,
-        }
-        key = (model["providerID"], model["modelID"], model["variant"])
+        model = {"providerID": provider, "modelID": model_id}
+        key = (provider, model_id)
         if key not in seen:
             seen.add(key)
             models.append(model)
@@ -551,7 +548,7 @@ class _AsyncRequestMonitor:
 
                 observed_models = _observed_models(snapshot.correlated_messages)
                 model_signature = tuple(
-                    (model["providerID"], model["modelID"], model["variant"])
+                    (model["providerID"], model["modelID"])
                     for model in observed_models
                 )
                 if model_update is not None and model_signature != reported_models:
