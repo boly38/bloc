@@ -504,7 +504,7 @@ class RequestPresentation:
         ]
         tool_lines = [line for line in progress_lines if line.startswith("Tools used:")]
         action_lines = [
-            line
+            f"🔄 {line}" if line else line
             for line in progress_lines
             if line not in cost_lines and line not in tool_lines
         ]
@@ -539,10 +539,10 @@ class RequestPresentation:
             if len(self.permissions) > 5 or self.omitted_permissions:
                 lines.append("Use the remote TUI to inspect additional permission requests.")
         if self.questions:
-            lines.extend(("", "OpenCode is waiting for your answers:"))
+            lines.append("")
             current = self.current_question()
             if current is None:
-                lines.append("Submitting your answers to OpenCode…")
+                lines.append("🔄 Submitting your answers to OpenCode…")
             else:
                 request = current["request"]
                 request_id = request.get("id")
@@ -552,7 +552,7 @@ class RequestPresentation:
                 header = prompt.get("header")
                 question = prompt.get("question")
                 lines.append(
-                    f"Question {question_number} · "
+                    f"❓ Question {question_number} · "
                     f"{header if isinstance(header, str) else 'Question'}"
                 )
                 if isinstance(question, str):
@@ -571,10 +571,10 @@ class RequestPresentation:
                         continue
                     option_number = option_index + 1
                     value = option.get("value", option["label"])
-                    marker = "[x]" if value in selected else "[ ]"
+                    marker = "✓ " if value in selected else ""
                     description = option.get("description")
                     detail = f" — {description}" if isinstance(description, str) and description else ""
-                    lines.append(f"  Option {option_number}: {marker} {option['label']}{detail}")
+                    lines.append(f"- Option {option_number}: {marker}{option['label']}{detail}")
                 if prompt.get("multiple") is True:
                     lines.append("Select one or more options, then tap Done before moving to the next question.")
                 if prompt.get("custom", True) is True:

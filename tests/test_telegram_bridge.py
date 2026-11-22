@@ -255,7 +255,7 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertEqual(lines[0], "📥 Ref: REF12345")
         self.assertEqual(lines[1], "Cost observed so far: $0.125000 (partial)")
         self.assertEqual(lines[2], "Tools used: read, bash")
-        self.assertEqual(lines[3], "Working on the request.")
+        self.assertEqual(lines[3], "🔄 Working on the request.")
         self.assertNotIn("/cancel", text)
         self.assertNotIn("/abort", text)
         self.assertEqual([button["text"] for button in keyboard["inline_keyboard"][0]], ["Status", "Abort"])

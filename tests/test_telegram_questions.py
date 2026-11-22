@@ -268,13 +268,20 @@ class TelegramQuestionTests(unittest.TestCase):
     def test_request_card_shows_question_options_without_internal_ids(self):
         request = self.make_request()
         presentation = bridge._request_presentation_for_request(request)
+        presentation.set_progress("OpenCode is waiting for your answer to 1 question (5s elapsed).")
         presentation.sync_questions([self.question()])
 
         text, keyboard = presentation.edit_payload()
 
         self.assertIn("Which color should be used?", text)
-        self.assertIn("Question 1 · Color", text)
-        self.assertIn("Option 1: [ ] Blue — A cool color", text)
+        self.assertIn(
+            "🔄 OpenCode is waiting for your answer to 1 question (5s elapsed).\n\n❓ Question 1 · Color",
+            text,
+        )
+        self.assertIn("- Option 1: Blue — A cool color", text)
+        self.assertIn("- Option 2: Green", text)
+        self.assertNotIn("[ ]", text)
+        self.assertNotIn("[x]", text)
         self.assertIn("/answer 1", text)
         self.assertIn("/reject 1", text)
         self.assertNotIn("private-question-id", text)
@@ -356,6 +363,11 @@ class TelegramQuestionTests(unittest.TestCase):
                 with patch.object(bridge, "edit_reply"):
                     result = bridge._update_question_selection(123, request["reference"], "A", 0, 0)
                     self.assertIn("Tap Done", result)
+                    text, _ = presentation.edit_payload()
+                    self.assertIn("- Option 1: ✓ Search", text)
+                    self.assertIn("- Option 2: Read", text)
+                    self.assertNotIn("[x]", text)
+                    self.assertNotIn("[ ]", text)
                     respond.assert_not_called()
                     bridge._update_question_selection(123, request["reference"], "A", 0, 1)
                     bridge._update_question_selection(
