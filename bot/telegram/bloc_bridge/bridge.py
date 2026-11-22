@@ -1041,7 +1041,12 @@ def _opencode_failure_text(error, reference):
         summary = "OpenCode timed out."
     elif isinstance(error, opencode_api.OpenCodeResponseError):
         status = error.status_code
-        if error.error_name in ("ProviderAuthError", "provider.auth") or status in (401, 403):
+        if error.error_name == "Aborted":
+            summary = (
+                "OpenCode reported that the request was aborted. An interrupted command may not resume automatically. "
+                "Check /status and any existing effects before asking to continue in the same session."
+            )
+        elif error.error_name in ("ProviderAuthError", "provider.auth") or status in (401, 403):
             summary = (
                 "OpenCode could not authenticate to the configured provider. In the trusted TUI, run `/connect` "
                 "and check that its credentials are valid; verify the model with `/models`."
