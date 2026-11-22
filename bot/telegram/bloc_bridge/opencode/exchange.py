@@ -33,6 +33,17 @@ _PERMISSION_POLL_INTERVAL_SECONDS = 5
 _PERMISSION_SESSION_LOOKUP_TIMEOUT_SECONDS = 3
 _PERMISSION_ANCESTRY_MAX_DEPTH = 8
 
+
+@dataclass(frozen=True)
+class ExchangeResult:
+    """Keep assistant text separate from bridge-owned exchange metadata."""
+
+    text: str
+    cost: str
+    tool_names: tuple[str, ...]
+    tool_call_count: int
+
+
 class OpenCodeRequestTimeout(TimeoutError):
     """The overall time allowed for one OpenCode exchange elapsed."""
 
@@ -114,7 +125,6 @@ def _new_assistant_messages(messages, previous_ids):
 
 _tool_names = tooling.tool_names
 _tool_call_count = tooling.tool_call_count
-_format_tool_usage = tooling.format_tool_usage
 
 
 def _record_exchange_diagnostics(messages, response):
@@ -174,7 +184,7 @@ def answer(chat_id, prompt, sessions):
             and _assistant_response_complete(correlated[-1])
             and not _session_is_busy(statuses.get(session_id))
         ):
-            return _format_async_result(session_id, correlated, previous_ids, "synchronous")
+            return _format_async_result(session_id, correlated, previous_ids, "synchronous").text
         time.sleep(1)
     raise OpenCodeRequestTimeout("OpenCode request timed out")
 
@@ -1003,9 +1013,11 @@ def _format_async_result(session_id, correlated, previous_ids, reference):
         if previous_ids is None
         else cost_reporting.format_exchange_footer([entry["message"] for entry in new_messages])
     )
-    return (
-        f"{text}{cost_footer}\n\n{_format_tool_usage(_tool_names(new_messages))}"
-        f"\nTool calls: {_tool_call_count(new_messages)}"
+    return ExchangeResult(
+        text=text,
+        cost=cost_footer.removeprefix("\n\nCost: "),
+        tool_names=tuple(_tool_names(new_messages)),
+        tool_call_count=_tool_call_count(new_messages),
     )
 
 

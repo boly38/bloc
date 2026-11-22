@@ -511,46 +511,11 @@ def _format_elapsed(seconds):
     return " ".join(parts)
 
 
-def _response_tools(response):
-    for line in reversed(response.splitlines()):
-        if line.startswith("Tools used:"):
-            names = line.split(":", 1)[1].strip()
-            return [] if names == "none" else [name.strip() for name in names.split(",") if name.strip()]
-    return None
-
-
 def _response_cost(response):
     for line in reversed(response.splitlines()):
         if line.startswith("Cost:"):
             return line.split(":", 1)[1].strip()
     return "unavailable"
-
-
-def _response_tool_call_count(response):
-    for line in reversed(response.splitlines()):
-        if line.startswith("Tool calls:"):
-            count = line.split(":", 1)[1].strip()
-            return count if count.isdecimal() else "unknown"
-    return "unknown"
-
-
-def _format_final_response(response, duration):
-    lines = response.splitlines()
-    footer_found = False
-    while lines and (not lines[-1].strip() or lines[-1].startswith(("Cost:", "Tools used:", "Tool calls:"))):
-        footer_found = footer_found or lines[-1].startswith(("Cost:", "Tools used:", "Tool calls:"))
-        lines.pop()
-    body = "\n".join(lines).strip() if footer_found else response.strip()
-    metrics = []
-    tool_names = _response_tools(response)
-    if tool_names:
-        tool_count = _response_tool_call_count(response)
-        calls = f" ({tool_count})" if tool_count != "unknown" else ""
-        metrics.append(f"🛠️ {', '.join(tool_names)}{calls}")
-    metrics.extend(("✅ completed", f"⏳ {_format_elapsed(duration)}", f"💵 {_response_cost(response)}"))
-    if body:
-        body = f"🤖 {body}"
-    return f"{body}\n\n{' · '.join(metrics)}" if body else " · ".join(metrics)
 
 
 def _request_record(reference, chat_id, acknowledgement_id):
@@ -563,14 +528,14 @@ def _request_record(reference, chat_id, acknowledgement_id):
 
 
 def _terminal_request_summary(request, state, response=None, error=None):
-    if response is not None:
+    if isinstance(response, exchange.ExchangeResult):
+        cost_label = f"Final cost: {response.cost}"
+        tool_names = response.tool_names
+        tool_call_count = response.tool_call_count
+    elif response is not None:
         cost_label = f"Final cost: {_response_cost(response)}"
-        tool_names = _response_tools(response)
-        if tool_names is None:
-            tool_names = []
-        tool_call_count = _response_tool_call_count(response)
-        if tool_call_count == "unknown":
-            tool_call_count = 0
+        tool_names = []
+        tool_call_count = 0
     else:
         presentation = _request_presentation(request["reference"])
         observed_cost = presentation.observed_cost if presentation is not None else None
@@ -583,11 +548,11 @@ def _terminal_request_summary(request, state, response=None, error=None):
             tool_call_count = getattr(error, "tool_call_count", "unknown")
     tool_line = None
     if tool_names:
-        calls = f"; {tool_call_count} calls" if tool_call_count != "unknown" else ""
+        calls = f" · total ({tool_call_count})" if tool_call_count != "unknown" else ""
         tool_line = f"🛠️ {', '.join(tool_names)}{calls}"
     elapsed = time.time() - request.get("created_at", time.time())
     status_icon = "✅" if state == "completed" else "⚠️"
-    lines = [f"Ref: {request['reference']}"]
+    lines = [f"🆔 `{request['reference']}`"]
     if tool_line:
         lines.append(tool_line)
     lines.append(
@@ -1218,8 +1183,8 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                     **exchange_options,
                 )
             terminal_response = response
-            if command is None:
-                response = _format_final_response(response, time.monotonic() - started)
+            if isinstance(response, exchange.ExchangeResult):
+                response = response.text
             request_store.update(reference, state="delivering", detail="completed")
             set_phase("telegram_final_send")
             send(chat_id, response)
@@ -1263,7 +1228,7 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                 _finalize_request_presentation(
                     _request_record(reference, chat_id, acknowledgement_id),
                     "delivery_unknown",
-                    response=response if "response" in locals() else None,
+                    response=terminal_response if "terminal_response" in locals() else None,
                 )
                 _forget_request_presentation(reference)
             elif stored is not None and stored["state"] in request_store.TERMINAL_STATES:

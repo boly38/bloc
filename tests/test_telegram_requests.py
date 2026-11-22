@@ -35,21 +35,43 @@ class TelegramRequestTests(unittest.TestCase):
         self.question_patch.start()
         self.addCleanup(self.question_patch.stop)
 
-    def test_final_response_compacts_cost_and_duration_without_empty_tools(self):
-        response = "Done\n\nCost: $0.250000\n\nTools used: none\nTool calls: 0"
-
-        self.assertEqual(
-            bridge._format_final_response(response, 12.8),
-            "🤖 Done\n\n✅ completed · ⏳ 12s · 💵 $0.250000",
+    def test_terminal_summary_labels_tool_call_count_as_total(self):
+        response = bridge.exchange.ExchangeResult("Done", "$0.250000", ("question", "bash"), 3)
+        summary = bridge._terminal_request_summary(
+            {"reference": "REF", "created_at": bridge.time.time()}, "completed", response=response,
         )
+        self.assertIn("🛠️ question, bash · total (3)", summary)
+        self.assertNotIn("calls", summary)
 
-    def test_final_response_lists_tools_when_used(self):
-        response = "Done\n\nCost: $0.250000\n\nTools used: bash, gh\nTool calls: 2"
+    def test_exchange_keeps_llm_footer_like_text_separate_from_metadata(self):
+        text = "Answer\n\nCost: custom text\nTools used: none\nTool calls: 0\n"
+        assistant = {
+            "info": {"id": "assistant", "role": "assistant", "cost": 0.25},
+            "parts": [{"type": "text", "text": text}],
+        }
+        with patch.object(
+            opencode_api, "session_tree_messages", return_value=[{"message": assistant}],
+        ):
+            result = bridge.exchange._format_async_result("session", [assistant], set(), "REF")
 
-        self.assertEqual(
-            bridge._format_final_response(response, 12.8),
-            "🤖 Done\n\n🛠️ bash, gh (2) · ✅ completed · ⏳ 12s · 💵 $0.250000",
-        )
+        self.assertEqual(result.text, opencode_api.text_from_response(assistant))
+        self.assertIn("Cost: custom text", result.text)
+        self.assertEqual(result.cost, "$0.250000")
+        self.assertEqual(result.tool_names, ())
+        self.assertEqual(result.tool_call_count, 0)
+
+    def test_delivery_failure_keeps_usage_in_request_card_not_llm_text(self):
+        request, _ = request_store.create("6" * 16, 123, 113, state="queued")
+        response = bridge.exchange.ExchangeResult("Original answer", "$0.250000", ("question",), 1)
+        with patch.object(bridge, "answer_async", return_value=response):
+            with patch.object(bridge, "send", side_effect=TimeoutError):
+                with patch.object(bridge, "edit_reply") as edit:
+                    bridge._request_worker(123, "Prompt", {}, 113, request["reference"], 511)
+
+        self.assertEqual(request_store.get(request["reference"])["state"], "delivery_unknown")
+        self.assertIn("💵 $0.250000", edit.call_args.args[2])
+        self.assertIn("🛠️ question · total (1)", edit.call_args.args[2])
+        self.assertNotIn(response.text, edit.call_args.args[2])
 
     def test_create_is_idempotent_for_a_telegram_update(self):
         request, created = request_store.create("A" * 16, 123, 101)
@@ -746,7 +768,7 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertIn("💵 unavailable", edit.call_args.args[2])
         self.assertEqual(
             send.call_args.args[1],
-            "🤖 Recovered result\n\n✅ completed · ⏳ 0s · 💵 unavailable",
+            "Recovered result",
         )
         self.assertEqual(request_store.get(request["reference"])["state"], "completed")
         submit.assert_not_called()
@@ -784,7 +806,7 @@ class TelegramRequestTests(unittest.TestCase):
                                 lambda _text: None,
                             )
 
-        self.assertIn("Finished after bridge restart", result)
+        self.assertIn("Finished after bridge restart", result.text)
         submit.assert_not_called()
 
     def test_recovered_aborted_response_reports_interruption_without_resubmitting(self):
@@ -829,7 +851,8 @@ class TelegramRequestTests(unittest.TestCase):
     def test_final_cost_reply_keeps_reference_after_acknowledgement_edit(self):
         request, _ = request_store.create("5" * 16, 123, 112, state="queued")
         request_store.update(request["reference"], acknowledgement_id=510)
-        with patch.object(bridge, "answer_async", return_value="Done\n\nCost: $0.250000"):
+        response = bridge.exchange.ExchangeResult("Done\n\nCost: LLM content", "$0.250000", (), 0)
+        with patch.object(bridge, "answer_async", return_value=response):
             with patch.object(bridge, "edit_reply") as edit:
                 with patch.object(bridge, "send") as send:
                     bridge._request_worker(
@@ -845,10 +868,7 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertIn(request["reference"], edit.call_args.args[2])
         self.assertNotIn("🛠️", edit.call_args.args[2])
         self.assertEqual(edit.call_args.kwargs["reply_markup"], {"inline_keyboard": []})
-        self.assertRegex(
-            send.call_args.args[1],
-            r"^🤖 Done\n\n✅ completed · ⏳ \d+s · 💵 \$0\.250000$",
-        )
+        self.assertEqual(send.call_args.args[1], response.text)
 
     def test_recovery_does_not_replay_an_unconfirmed_submission(self):
         request, _ = request_store.create("4" * 16, 123, 111, state="running")
@@ -1049,7 +1069,7 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertEqual(request_store.get(request["reference"])["state"], "timed_out")
         self.assertIn("timed out and stopped", bridge.request_status_response(123, request["reference"]))
         self.assertIn("⚠️ timed out and stopped", edit.call_args.args[2])
-        self.assertIn("🛠️ bash, gh; 1 calls", edit.call_args.args[2])
+        self.assertIn("🛠️ bash, gh · total (1)", edit.call_args.args[2])
         self.assertIn("reached the configured 5-day limit", send.call_args.args[1])
         self.assertIn("Tools used: bash, gh", send.call_args.args[1])
 
