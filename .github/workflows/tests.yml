@@ -5,19 +5,36 @@ on:
 
 permissions:
   contents: read
+  checks: write
+  pull-requests: write
 
 jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+      - name: Install test reporting tools
+        run: python3 -m pip install -r requirements-ci.txt
       - name: Run unit tests
-        run: make test
+        id: unit_tests
+        run: python3 -m xmlrunner discover -s tests -v -o test-reports
+      - name: Publish test report
+        if: ${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: test-reports/TEST-*.xml
+          check_name: Python unit tests
+          annotate_only: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          comment: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          updateComment: true
+          include_time_in_summary: true
+          require_tests: true
+          fail_on_parse_error: true
       - name: Check Python syntax
         run: python3 -m compileall -q bot/telegram/bloc_bridge scripts/telegram_chat_id.py
       - name: Validate Compose in both launch modes
