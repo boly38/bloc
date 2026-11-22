@@ -55,9 +55,9 @@ These steps apply to local BLOC. For Coolify or another remote deployment, see
    ```
 
 Telegram requests use `OPENCODE_MODEL`, even if you select a different model in the TUI. Request
-cards report the provider, model, and variant from OpenCode response metadata when available. If
-OpenCode does not report the effective model or variant, the card says so rather than assuming the
-configured values were used.
+cards report the provider and model from OpenCode response metadata when available. If OpenCode
+does not report the effective model, the card says so rather than assuming the configured value
+was used.
 
 Provider credentials added through `/connect` are kept in the persistent `opencode-data` volume,
 not in `.env`. A restart keeps them; `make clean` deletes the volume and requires connecting

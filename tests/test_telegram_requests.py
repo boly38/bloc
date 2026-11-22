@@ -923,7 +923,6 @@ class TelegramRequestTests(unittest.TestCase):
                 "role": "assistant",
                 "providerID": "opper",
                 "modelID": "flint-40b-free",
-                "variant": "free",
             }
         }
         snapshot = bridge.exchange._MonitorSnapshot(False, True, [message], [], [])
@@ -952,8 +951,8 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertEqual(
             updates,
             [
-                ([{"providerID": "opper", "modelID": "flint-40b-free", "variant": "free"}], False),
-                ([{"providerID": "opper", "modelID": "flint-40b-free", "variant": "free"}], True),
+                ([{"providerID": "opper", "modelID": "flint-40b-free"}], False),
+                ([{"providerID": "opper", "modelID": "flint-40b-free"}], True),
             ],
         )
 
