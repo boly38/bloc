@@ -455,8 +455,10 @@ class RequestPresentation:
                 reference = lines[0].removeprefix("Ref: ")
                 model_summary = self._effective_model_summary()
                 if model_summary is not None:
-                    lines[0] = f"*{model_summary} · Ref: {reference}*"
-                    text = "\n".join(lines)
+                    lines[0] = f"📥 *{model_summary} · Ref: {reference}*"
+                else:
+                    lines[0] = f"📥 Ref: {reference}"
+                text = "\n".join(lines)
             return self._truncate(text), self._keyboard()
 
     def _effective_model_summary(self):
