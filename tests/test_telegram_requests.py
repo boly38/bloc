@@ -89,19 +89,17 @@ class TelegramRequestTests(unittest.TestCase):
         send.assert_called_once()
         submit.assert_called_once()
 
-    def test_request_acknowledgement_shows_the_configured_model(self):
+    def test_request_acknowledgement_does_not_claim_configured_model_is_effective(self):
         update = {"update_id": 1031, "message": {"chat": {"id": 123}, "text": "Use Copilot"}}
-        model_reference = "github-copilot/gpt-6-luna#medium"
-        with patch.object(bridge, "MODEL", model_reference):
-            with patch.object(bridge, "send", return_value={"message_id": 504}) as send:
-                with patch.object(bridge._REQUEST_EXECUTOR, "submit") as submit:
-                    with patch.object(bridge._REQUEST_SLOTS, "acquire", return_value=True):
-                        bridge.handle_update(update, {})
+        with patch.object(bridge, "send", return_value={"message_id": 504}) as send:
+            with patch.object(bridge._REQUEST_EXECUTOR, "submit") as submit:
+                with patch.object(bridge._REQUEST_SLOTS, "acquire", return_value=True):
+                    bridge.handle_update(update, {})
 
         acknowledgement = send.call_args.args[1]
-        self.assertIn("Provider: `github-copilot`", acknowledgement)
-        self.assertIn("Model: `gpt-6-luna`", acknowledgement)
-        self.assertIn("Variant: `medium`", acknowledgement)
+        self.assertNotIn("Provider:", acknowledgement)
+        self.assertNotIn("Model:", acknowledgement)
+        self.assertNotIn("Variant:", acknowledgement)
         request = request_store.get_by_update_id(1031)
         bridge._forget_request_presentation(request["reference"])
         submit.assert_called_once()
@@ -607,7 +605,7 @@ class TelegramRequestTests(unittest.TestCase):
         request, _ = request_store.create("C" * 16, 123, 1066, state="queued")
         request_store.update(request["reference"], acknowledgement_id=519)
 
-        def ambiguous_submission(*_args):
+        def ambiguous_submission(*_args, **_kwargs):
             request_store.update(
                 request["reference"],
                 state="submitting",
@@ -915,6 +913,49 @@ class TelegramRequestTests(unittest.TestCase):
 
         self.assertEqual(stopped.exception.state, "user_cancelled")
         abort.assert_called_once()
+
+    def test_monitor_reports_models_from_correlated_assistant_messages(self):
+        request, _ = request_store.create("4" * 16, 123, 111, state="running")
+        message = {
+            "info": {
+                "id": "assistant-response",
+                "parentID": "msg_prompt",
+                "role": "assistant",
+                "providerID": "opper",
+                "modelID": "flint-40b-free",
+                "variant": "free",
+            }
+        }
+        snapshot = bridge.exchange._MonitorSnapshot(False, True, [message], [], [])
+        updates = []
+
+        with patch.object(bridge, "_watch_events"):
+            monitor = bridge._AsyncRequestMonitor(
+                "private-session-id",
+                "msg_prompt",
+                request["reference"],
+                bridge.time.time(),
+            )
+        with patch.object(monitor.event_thread, "start"):
+            with patch.object(monitor, "_read_snapshot", return_value=snapshot):
+                with patch.object(monitor, "_raise_correlated_response_error"):
+                    with patch.object(monitor, "_update_progress_stage"):
+                        with patch.object(monitor, "_is_request_complete", return_value=True):
+                            with patch.object(monitor, "_forward_intermediate_replies"):
+                                result = monitor.run(
+                                    lambda _phase: None,
+                                    lambda _text: None,
+                                    lambda models, complete: updates.append((models, complete)),
+                                )
+
+        self.assertEqual(result, [message])
+        self.assertEqual(
+            updates,
+            [
+                ([{"providerID": "opper", "modelID": "flint-40b-free", "variant": "free"}], False),
+                ([{"providerID": "opper", "modelID": "flint-40b-free", "variant": "free"}], True),
+            ],
+        )
 
     def test_monitor_reports_timeout_when_open_code_records_abort_as_assistant_error(self):
         request, _ = request_store.create("2" * 16, 123, 109, state="running")

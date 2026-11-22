@@ -499,7 +499,7 @@ class RequestFeedbackTests(unittest.TestCase):
         self.assertIn("OPENCODE_MODEL", internal_provider)
 
     def test_successful_progress_edit_restores_opencode_phase(self):
-        def exchange(_chat, _prompt, _sessions, _ref, _phase, progress):
+        def exchange(_chat, _prompt, _sessions, _ref, _phase, progress, **_kwargs):
             progress("Still waiting")
             raise bridge.OpenCodeRequestTimeout()
 

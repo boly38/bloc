@@ -260,46 +260,97 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertNotIn("/abort", text)
         self.assertEqual([button["text"] for button in keyboard["inline_keyboard"][0]], ["Status", "Abort"])
 
-    def test_request_card_shows_provider_model_and_variant_until_completion(self):
-        presentation = RequestPresentation(
-            123,
-            456,
-            "REF12345",
-            "github-copilot/gpt-6-luna#medium",
-        )
-
-        active_text, _ = presentation.edit_payload()
-        self.assertEqual(
-            active_text.splitlines()[:4],
-            [
-                "Ref: REF12345",
-                "Provider: `github-copilot`",
-                "Model: `gpt-6-luna`",
-                "Variant: `medium`",
-            ],
-        )
-
-        presentation.finish("Ref: REF12345\nStatus: completed")
-        final_text, _ = presentation.edit_payload()
-        self.assertEqual(
-            final_text.splitlines(),
-            [
-                "Ref: REF12345",
-                "Provider: `github-copilot`",
-                "Model: `gpt-6-luna`",
-                "Variant: `medium`",
-                "Status: completed",
-            ],
-        )
-
-    def test_request_card_labels_an_omitted_variant_as_default(self):
-        presentation = RequestPresentation(123, 456, "REF12345", "opper/gpt-5.6-luna")
+    def test_request_card_omits_requested_model_until_effective_model_is_reported(self):
+        presentation = RequestPresentation(123, 456, "REF12345")
 
         text, _ = presentation.edit_payload()
 
-        self.assertIn("Provider: `opper`", text)
-        self.assertIn("Model: `gpt-5.6-luna`", text)
-        self.assertIn("Variant: `default`", text)
+        self.assertEqual(text.splitlines()[0], "Ref: REF12345")
+        self.assertNotIn("Provider:", text)
+        self.assertNotIn("Model:", text)
+
+    def test_request_card_renders_effective_model_and_variant_from_metadata(self):
+        presentation = RequestPresentation(123, 456, "REF12345")
+        self.assertTrue(
+            presentation.set_effective_models(
+                [{"providerID": "github-copilot", "modelID": "gpt-6-luna", "variant": "medium"}]
+            )
+        )
+
+        active_text, _ = presentation.edit_payload()
+        self.assertIn("**Model used**", active_text)
+        self.assertIn("- `github-copilot/gpt-6-luna` (variant: `medium`)", active_text)
+
+        presentation.finish("Ref: REF12345\nStatus: completed")
+        final_text, _ = presentation.edit_payload()
+        self.assertIn("**Model used**", final_text)
+        self.assertIn("Status: completed", final_text)
+
+    def test_request_card_lists_distinct_models_and_marks_missing_variants(self):
+        presentation = RequestPresentation(123, 456, "REF12345")
+        presentation.set_effective_models(
+            [
+                {"providerID": "opper", "modelID": "flint-40b-free"},
+                {"providerID": "opper", "modelID": "flint-40b-free"},
+                {"providerID": "github-copilot", "modelID": "gpt-6-luna", "variant": "medium"},
+            ]
+        )
+
+        text, _ = presentation.edit_payload()
+
+        self.assertIn("**Models used**", text)
+        self.assertEqual(text.count("`opper/flint-40b-free`"), 1)
+        self.assertIn("`opper/flint-40b-free` (variant: not reported)", text)
+        self.assertIn("`github-copilot/gpt-6-luna` (variant: `medium`)", text)
+
+    def test_request_card_reports_when_effective_model_metadata_is_unavailable(self):
+        presentation = RequestPresentation(123, 456, "REF12345")
+        presentation.set_effective_models([], complete=True)
+
+        text, _ = presentation.edit_payload()
+
+        self.assertIn("**Effective model:** not reported", text)
+
+    def test_exchange_extracts_distinct_models_from_assistant_metadata(self):
+        messages = [
+            {
+                "info": {
+                    "role": "assistant",
+                    "providerID": "opper",
+                    "modelID": "flint-40b-free",
+                }
+            },
+            {
+                "info": {
+                    "role": "assistant",
+                    "providerID": "opper",
+                    "modelID": "flint-40b-free",
+                }
+            },
+            {
+                "info": {
+                    "role": "assistant",
+                    "providerID": "github-copilot",
+                    "modelID": "gpt-6-luna",
+                    "variant": "medium",
+                }
+            },
+            {
+                "info": {
+                    "role": "user",
+                    "providerID": "ignored",
+                    "modelID": "ignored",
+                }
+            },
+        ]
+
+        self.assertEqual(
+            bridge.exchange._observed_models(messages),
+            [
+                {"providerID": "opper", "modelID": "flint-40b-free", "variant": None},
+                {"providerID": "github-copilot", "modelID": "gpt-6-luna", "variant": "medium"},
+            ],
+        )
 
     def test_telegram_requests_do_not_add_basic_authentication(self):
         with patch("urllib.request.urlopen", return_value=FakeResponse(b"{}")) as urlopen:

@@ -36,35 +36,17 @@ def _safe_scope(value):
     return value[:117] + "..." if len(value) > 120 else value or "scope details unavailable"
 
 
-def _model_details(model_reference):
-    if not isinstance(model_reference, str):
-        return ()
-    model_reference, variant_separator, variant = model_reference.strip().partition("#")
-    provider, separator, model = model_reference.partition("/")
-    if not separator or not _MODEL_COMPONENT.fullmatch(provider) or not _MODEL_COMPONENT.fullmatch(model):
-        return ()
-    if variant_separator:
-        if not _MODEL_VARIANT.fullmatch(variant):
-            return ()
-    else:
-        variant = "default"
-    return (
-        f"Provider: `{provider}`",
-        f"Model: `{model}`",
-        f"Variant: `{variant}`",
-    )
-
-
 class RequestPresentation:
     """Keep one editable request message with status history and permission actions."""
 
-    def __init__(self, chat_id, message_id, reference, model_reference=None):
+    def __init__(self, chat_id, message_id, reference):
         self.chat_id = chat_id
         self.message_id = message_id
         self.reference = reference
-        self.model_details = _model_details(model_reference)
         self.lock = threading.RLock()
         self.progress = "Request received."
+        self.effective_models = ()
+        self.effective_model_complete = False
         self.status_entries = []
         self.status_expiry_timer = None
         self.permissions = []
@@ -91,6 +73,39 @@ class RequestPresentation:
             for line in text.splitlines():
                 if line.startswith("Cost observed so far:"):
                     self.observed_cost = line.removeprefix("Cost observed so far:").strip()
+
+    def set_effective_models(self, models, complete=False):
+        normalized = []
+        seen = set()
+        if isinstance(models, (list, tuple)):
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                provider = model.get("providerID")
+                model_id = model.get("modelID")
+                variant = model.get("variant")
+                if (
+                    not isinstance(provider, str)
+                    or not _MODEL_COMPONENT.fullmatch(provider)
+                    or not isinstance(model_id, str)
+                    or not _MODEL_COMPONENT.fullmatch(model_id)
+                ):
+                    continue
+                if not isinstance(variant, str) or not _MODEL_VARIANT.fullmatch(variant):
+                    variant = None
+                item = (provider, model_id, variant)
+                if item not in seen:
+                    seen.add(item)
+                    normalized.append(item)
+
+        with self.lock:
+            if self.final_text is not None:
+                return False
+            updated = tuple(normalized), bool(complete)
+            if updated == (self.effective_models, self.effective_model_complete):
+                return False
+            self.effective_models, self.effective_model_complete = updated
+            return True
 
     def append_status(self, text):
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
@@ -439,12 +454,25 @@ class RequestPresentation:
     def edit_payload(self):
         with self.lock:
             text = self.final_text or self._render_active()
-            if self.model_details:
+            model_lines = self._effective_model_lines()
+            if model_lines:
                 lines = text.splitlines()
                 insert_at = 1 if lines and lines[0].startswith("Ref: ") else 0
-                lines[insert_at:insert_at] = self.model_details
+                lines[insert_at:insert_at] = ["", *model_lines]
                 text = "\n".join(lines)
             return self._truncate(text), self._keyboard()
+
+    def _effective_model_lines(self):
+        if self.effective_models:
+            heading = "**Models used**" if len(self.effective_models) > 1 else "**Model used**"
+            lines = [heading]
+            for provider, model, variant in self.effective_models:
+                variant_text = f"`{variant}`" if variant is not None else "not reported"
+                lines.append(f"- `{provider}/{model}` (variant: {variant_text})")
+            return lines
+        if self.effective_model_complete:
+            return ["**Effective model:** not reported"]
+        return []
 
     def _permission_signature(self):
         signature = []
