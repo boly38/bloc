@@ -2,10 +2,15 @@
 
 ## Telegram
 
+If you have not set up a Telegram bot yet, follow the
+[Quickstart](quickstart.md#configure-and-start) to create and configure one.
+
 Send a message in a chat listed in `TELEGRAM_ALLOWED_CHAT_IDS`. The bridge keeps one
 OpenCode session per chat, so later messages continue that chat's conversation. OpenCode
 stores sessions centrally; selecting a Telegram session in the TUI shares its history.
 Use a separate session for independent work.
+
+### Commands
 
 The Telegram commands are:
 
@@ -43,6 +48,8 @@ An unknown slash command returns an error directing you to `/help`; it is not se
 model. Normal messages are still sent to OpenCode. `/health` and `/cost` do not send a
 prompt to the model.
 
+### Request progress and controls
+
 While a normal request is running, the acknowledgement is updated with deterministic
 analysis/tool/test stages, or a waiting message approximately every 30 seconds when no
 progress is available. It also shows time since the last correlated OpenCode activity
@@ -66,12 +73,21 @@ When the request ends, the card is replaced with a terminal summary containing s
 duration, request reference, distinct tool count, and total tool-call count. The model's final answer is sent as a
 separate Telegram message and lists tool names only, not arguments or output.
 
+Only one request at a time is admitted per chat. A new prompt while one is active is refused
+with the active request's reference. Use the card buttons or `/status` and `/abort` to manage it.
+References do not expose OpenCode session IDs or prompt content. The final reply retains its
+reference so the request can still be inspected afterward.
+
+### Intermediate replies
+
 When intermediate replies are enabled, completed assistant text messages before the final answer
 are sent as separate Telegram messages in order, prefixed with 💬 and italicized to distinguish
 them from the final reply. Reasoning and tool content are never forwarded. The intermediate
 messages omit the request reference, which remains available on the request card and final reply.
 If the bridge resumes a request after restarting, it does not replay intermediate messages already
 present in OpenCode history; newly observed messages can still be forwarded.
+
+### Permissions and questions
 
 OpenCode permission requests and interactive questions for the active request's session tree are
 forwarded to the request card, including the form-based question API used by OpenCode v2. When
@@ -86,10 +102,7 @@ text. Custom text is limited to 500 characters. The bridge submits the complete 
 once all of its questions have answers.
 The bridge keeps the request active until OpenCode confirms the response or confirms cancellation.
 
-Only one request at a time is admitted per chat. A new prompt while one is active is refused
-with the active request's reference. Use the card buttons or `/status` and `/abort` to manage it. References do
-not expose OpenCode session IDs or prompt content.
-The final reply retains its reference so the request can still be inspected afterward.
+### Message formatting
 
 Telegram replies support this Markdown subset:
 
@@ -105,14 +118,32 @@ constructs are sent as readable text; if Telegram rejects formatted text, it is 
 without formatting. To check rendering without an OpenCode request, use
 `make format-test CHAT_ID=<allowed-chat-id>` while the Telegram service is running.
 
-## Local OpenCode TUI
+## OpenCode TUI
+
+### Local access
 
 On the Docker host, run `make tui` after starting the deployment. It connects to the
 existing server and uses the same workspace, credentials, and sessions. Docker access is
 required; the command does not publish an API port. Closing the TUI does not stop the
 services. See [Security](security.md).
 
+### Remote access
+
+From a trusted workstation with SSH and Docker access to the remote host, list its running
+containers, then attach to the OpenCode container:
+
+```sh
+make remote-tui HOST=<ssh-host>
+make remote-tui HOST=<ssh-host> CONTAINER_ID=<container-id>
+```
+
+Use the container ID shown by the first command. Docker access grants operator-level access;
+this workflow does not publish the OpenCode API. See the
+[remote TUI instructions](coolify_deploy.md#remote-tui) for details.
+
 ## Persistent data
+
+### Shutdown and saved state
 
 `make stop` sends SIGTERM to the bridge. Its main thread stays responsive while a single
 background poller handles Telegram I/O; blocked HTTP calls do not delay process exit.
@@ -126,9 +157,36 @@ acknowledgement. Use `/status <reference>` before retrying. The Compose 30-secon
 is a safety limit, not a mandatory wait.
 
 `make restart`, `make stop`, and `make down` preserve OpenCode data, workspace files, and
-Telegram session mappings. Restarting the services therefore continues the current session;
-use `/new` to start a fresh one without deleting the old history. Use `make backup` and
-`make restore` for volume backups and recovery. Backups go under the ignored `backups/`
+Telegram session mappings. The same session history and files remain available after restart;
+use `/new` to start a fresh session without deleting the old history.
+
+### Bridge-only restart
+
+A bridge-only restart does not necessarily stop OpenCode. The bridge resumes monitoring submitted
+requests by their session and prompt IDs, without submitting them again. If submission was
+uncertain, the bridge checks history instead of replaying the prompt. Queued requests that were
+not submitted are marked interrupted.
+
+### Full-stack restart
+
+A full-stack restart, including `make restart`, also stops OpenCode and can interrupt an active
+tool. Persisted session history and files do not preserve an interrupted process's in-memory
+state: a command interrupted partway through does not automatically resume where it stopped.
+The bridge reports structured assistant errors; an `Aborted` error is reported as an abort.
+Tool failures are not necessarily reported as a distinct Telegram error and may appear in the
+assistant's response instead.
+Recovery behavior depends on what OpenCode recorded; monitoring is not automatic continuation.
+
+### Manual continuation after a crash
+
+After a crash, check `/status` and inspect existing effects before retrying. To continue, send a
+new message in the same session, for example: "Resume the interrupted work after checking what
+was already done." This starts a new agent turn, and tools may run again. Review potential side
+effects first.
+
+### Backup and restore
+
+Use `make backup` and `make restore` for volume backups and recovery. Backups go under the ignored `backups/`
 directory by default, in a timestamped folder containing one `.tar.gz` archive per Docker
 volume.
 

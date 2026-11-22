@@ -737,6 +737,81 @@ class TelegramRequestTests(unittest.TestCase):
         self.assertEqual(request_store.get(request["reference"])["state"], "completed")
         submit.assert_not_called()
 
+    def test_recovery_monitors_busy_opencode_until_response_without_resubmitting(self):
+        request, _ = request_store.create("A" * 16, 123, 1091, state="recovering")
+        request_store.update(
+            request["reference"],
+            session_id="private-session-id",
+            prompt_message_id="msg_prompt",
+            started_at=bridge.time.time(),
+        )
+        prompt = {"info": {"id": "msg_prompt", "role": "user"}, "parts": []}
+        assistant = {
+            "info": {
+                "role": "assistant", "id": "assistant-id", "parentID": "msg_prompt",
+                "time": {"completed": 1},
+            },
+            "parts": [{"type": "text", "text": "Finished after bridge restart"}],
+        }
+        with patch.object(opencode_api, "session_status", side_effect=[
+            {"private-session-id": {"type": "busy"}},
+            {"private-session-id": {"type": "busy"}},
+            {}, {},
+        ]):
+            with patch.object(opencode_api, "session_messages", side_effect=[
+                [prompt], [prompt], [prompt, assistant], [prompt, assistant],
+            ]):
+                with patch.object(opencode_api, "submit_async") as submit:
+                    with patch.object(bridge, "_watch_events"):
+                        with patch.object(bridge.bridge_runtime, "wait"):
+                            result = bridge.resume_async_request(
+                                request_store.get(request["reference"]),
+                                lambda _phase: None,
+                                lambda _text: None,
+                            )
+
+        self.assertIn("Finished after bridge restart", result)
+        submit.assert_not_called()
+
+    def test_recovered_aborted_response_reports_interruption_without_resubmitting(self):
+        request, _ = request_store.create("B" * 16, 123, 1092, state="recovering")
+        request_store.update(
+            request["reference"],
+            session_id="private-session-id",
+            prompt_message_id="msg_prompt",
+            acknowledgement_id=509,
+            started_at=bridge.time.time(),
+        )
+        messages = [
+            {"info": {"id": "msg_prompt", "role": "user"}, "parts": []},
+            {
+                "info": {
+                    "role": "assistant", "id": "assistant-id", "parentID": "msg_prompt",
+                    "error": {"name": "Aborted", "data": {"message": "private tool output"}},
+                },
+                "parts": [],
+            },
+        ]
+        with patch.object(opencode_api, "session_status", return_value={}):
+            with patch.object(opencode_api, "session_messages", return_value=messages):
+                with patch.object(opencode_api, "submit_async") as submit:
+                    with patch.object(bridge, "_watch_events"):
+                        with patch.object(bridge, "edit_reply") as edit:
+                            with patch.object(bridge, "send") as send:
+                                bridge._request_worker(
+                                    123, None, {}, "1092", request["reference"], 509, True,
+                                )
+
+        self.assertEqual(request_store.get(request["reference"])["state"], "failed")
+        self.assertIn("Status: failed", edit.call_args.args[2])
+        text = send.call_args.args[1]
+        self.assertIn("request was aborted", text)
+        self.assertIn("may not resume automatically", text)
+        self.assertIn("existing effects", text)
+        self.assertIn("/status", text)
+        self.assertNotIn("private tool output", text)
+        submit.assert_not_called()
+
     def test_final_cost_reply_keeps_reference_after_acknowledgement_edit(self):
         request, _ = request_store.create("5" * 16, 123, 112, state="queued")
         request_store.update(request["reference"], acknowledgement_id=510)
