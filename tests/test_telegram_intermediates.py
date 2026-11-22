@@ -307,7 +307,7 @@ class TelegramIntermediatePreferenceTests(unittest.TestCase):
                 intermediate_reply=intermediates.append,
             )
 
-        self.assertIn("Final answer", result)
+        self.assertIn("Final answer", result.text)
         self.assertEqual(intermediates, ["First update", "Second update"])
 
 

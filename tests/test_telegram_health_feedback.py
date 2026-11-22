@@ -213,7 +213,7 @@ class RequestFeedbackTests(unittest.TestCase):
             [prompt, self.completed()] if self.clock >= 299 else [prompt]
         )
         result = self.answer()
-        self.assertIn("Done", result)
+        self.assertIn("Done", result.text)
         self.assertEqual(self.clock, 299)
         self.assertEqual([when for when, _ in self.progress], list(range(30, 300, 30)))
         self.assertIn("270s elapsed", self.progress[-1][1])
@@ -227,7 +227,7 @@ class RequestFeedbackTests(unittest.TestCase):
             )
             result = self.answer()
 
-        self.assertIn("Done", result)
+        self.assertIn("Done", result.text)
         self.assertEqual(self.clock, 400)
         self.abort.assert_not_called()
 
@@ -240,7 +240,7 @@ class RequestFeedbackTests(unittest.TestCase):
 
         result = self.answer()
 
-        self.assertIn("Done", result)
+        self.assertIn("Done", result.text)
         self.assertEqual(self.clock, 2)
         self.abort.assert_not_called()
 
@@ -310,7 +310,7 @@ class RequestFeedbackTests(unittest.TestCase):
 
         result = self.answer()
 
-        self.assertIn("Continuing", result)
+        self.assertIn("Continuing", result.text)
         self.assertTrue(self.progress)
         self.assertIn("Cost observed so far: $0.000123 (partial)", self.progress[0][1])
 
@@ -448,7 +448,7 @@ class RequestFeedbackTests(unittest.TestCase):
             "error": {"name": "ProviderAuthError", "data": {"message": "private"}},
         }}
         self.messages.return_value = [other, self.completed()]
-        self.assertIn("Done", self.answer())
+        self.assertIn("Done", self.answer().text)
 
     def test_response_with_partial_text_and_error_is_not_reported_as_success(self):
         message = self.completed()

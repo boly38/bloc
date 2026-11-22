@@ -69,25 +69,27 @@ permission decisions and interactive questions appear there with letter aliases 
 buttons. The card shows deterministic analysis/tool/test stages, observed partial cost, and time
 since OpenCode's last activity separately from the API heartbeat. It shows effective provider and
 model from correlated OpenCode response metadata when available; missing metadata is reported
-rather than inferred from configuration.
+rather than inferred from configuration. The first line contains 🆔 and the reference in
+monospace code formatting (plain text on formatting fallback). The model follows on its own
+italic line, prefixed with 🧠.
 
 When the request ends, the card is replaced with a compact summary: request reference, tools
-when used, then cost, status, and duration on one line. The final answer is a separate message
-with a robot marker and compact cost/duration metadata; tool names and call count appear only
-when tools were used. The final metadata line also shows completed status. Tool arguments and
-output are never included.
+when used, then cost, status, and duration on one line. Tool names appear with `total (N)`,
+the total number of tool calls across the exchange, not a count for each tool.
+The final answer is sent separately with only the LLM's text: the bridge adds no emoji,
+reference, or usage footer. Tool arguments and output are never included in the card.
 
 Only one request at a time is admitted per chat. A new prompt while one is active is refused
 with the active request's reference. Use the card buttons or `/status` and `/abort` to manage it.
-References do not expose OpenCode session IDs or prompt content. The final reply retains its
-reference so the request can still be inspected afterward.
+References do not expose OpenCode session IDs or prompt content. The card retains its reference
+so the request can still be inspected afterward.
 
 ### Intermediate replies
 
 When intermediate replies are enabled, completed assistant text messages before the final answer
 are sent as separate Telegram messages in order, prefixed with 💬 and italicized to distinguish
 them from the final reply. Reasoning and tool content are never forwarded. The intermediate
-messages omit the request reference, which remains available on the request card and final reply.
+messages omit the request reference, which remains available on the request card.
 If the bridge resumes a request after restarting, it does not replay intermediate messages already
 present in OpenCode history; newly observed messages can still be forwarded.
 

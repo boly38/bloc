@@ -451,13 +451,16 @@ class RequestPresentation:
         with self.lock:
             text = self.final_text or self._render_active()
             lines = text.splitlines()
-            if lines and lines[0].startswith("Ref: "):
-                reference = lines[0].removeprefix("Ref: ")
+            if lines and lines[0].startswith(("Ref: ", "🆔 `")):
+                reference = (
+                    lines[0].removeprefix("Ref: ")
+                    if lines[0].startswith("Ref: ")
+                    else lines[0].removeprefix("🆔 `").removesuffix("`")
+                )
+                lines[0] = f"🆔 `{reference}`"
                 model_summary = self._effective_model_summary()
                 if model_summary is not None:
-                    lines[0] = f"📥 *{model_summary} · Ref: {reference}*"
-                else:
-                    lines[0] = f"📥 Ref: {reference}"
+                    lines.insert(1, f"🧠 *{model_summary}*")
                 text = "\n".join(lines)
             return self._truncate(text), self._keyboard()
 

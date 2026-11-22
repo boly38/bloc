@@ -252,7 +252,7 @@ class TelegramBridgeTests(unittest.TestCase):
         text, keyboard = presentation.edit_payload()
         lines = text.splitlines()
 
-        self.assertEqual(lines[0], "📥 Ref: REF12345")
+        self.assertEqual(lines[0], "🆔 `REF12345`")
         self.assertEqual(lines[1], "Cost observed so far: $0.125000 (partial)")
         self.assertEqual(lines[2], "Tools used: read, bash")
         self.assertEqual(lines[3], "🔄 Working on the request.")
@@ -265,11 +265,11 @@ class TelegramBridgeTests(unittest.TestCase):
 
         text, _ = presentation.edit_payload()
 
-        self.assertEqual(text.splitlines()[0], "📥 Ref: REF12345")
+        self.assertEqual(text.splitlines()[0], "🆔 `REF12345`")
         self.assertNotIn("Provider:", text)
         self.assertNotIn("Model:", text)
 
-    def test_request_card_renders_effective_model_with_reference_on_one_italic_line(self):
+    def test_request_card_renders_code_reference_before_italic_model(self):
         presentation = RequestPresentation(123, 456, "REF12345")
         self.assertTrue(
             presentation.set_effective_models(
@@ -279,20 +279,20 @@ class TelegramBridgeTests(unittest.TestCase):
 
         active_text, _ = presentation.edit_payload()
         self.assertEqual(
-            active_text.splitlines()[0],
-            "📥 *Model: github-copilot/gpt-6-luna · Ref: REF12345*",
+            active_text.splitlines()[:2],
+            ["🆔 `REF12345`", "🧠 *Model: github-copilot/gpt-6-luna*"],
         )
         self.assertNotIn("variant", active_text.lower())
         self.assertEqual(
-            bridge.markdown_renderer.render_markdown(active_text)[0].html.splitlines()[0],
-            "📥 <i>Model: github-copilot/gpt-6-luna · Ref: REF12345</i>",
+            bridge.markdown_renderer.render_markdown(active_text)[0].html.splitlines()[:2],
+            ["🆔 <code>REF12345</code>", "🧠 <i>Model: github-copilot/gpt-6-luna</i>"],
         )
 
         presentation.finish("Ref: REF12345\nStatus: completed")
         final_text, _ = presentation.edit_payload()
         self.assertEqual(
-            final_text.splitlines()[0],
-            "📥 *Model: github-copilot/gpt-6-luna · Ref: REF12345*",
+            final_text.splitlines()[:2],
+            ["🆔 `REF12345`", "🧠 *Model: github-copilot/gpt-6-luna*"],
         )
         self.assertIn("Status: completed", final_text)
 
@@ -310,8 +310,8 @@ class TelegramBridgeTests(unittest.TestCase):
         text, _ = presentation.edit_payload()
 
         self.assertEqual(
-            text.splitlines()[0],
-            "📥 *Models: opper/flint-40b-free, github-copilot/gpt-6-luna · Ref: REF12345*",
+            text.splitlines()[1],
+            "🧠 *Models: opper/flint-40b-free, github-copilot/gpt-6-luna*",
         )
         self.assertNotIn("variant", text.lower())
 
@@ -322,8 +322,8 @@ class TelegramBridgeTests(unittest.TestCase):
         text, _ = presentation.edit_payload()
 
         self.assertEqual(
-            text.splitlines()[0],
-            "📥 *Effective model: not reported · Ref: REF12345*",
+            text.splitlines()[1],
+            "🧠 *Effective model: not reported*",
         )
 
     def test_exchange_extracts_distinct_models_from_assistant_metadata(self):
@@ -399,7 +399,7 @@ class TelegramBridgeTests(unittest.TestCase):
                                 with patch.object(session_state, "save_sessions") as save:
                                     result = bridge.answer(123, "Hi", {})
 
-        self.assertEqual(result, "Hello\n\nCost: $0.100000\n\nTools used: none\nTool calls: 0")
+        self.assertEqual(result, "Hello")
         title.assert_called_once_with()
         create.assert_called_once_with(session_title)
         submit.assert_called_once_with("session-1", "msg_prompt", {"text": "Hi"}, 10)
@@ -423,7 +423,7 @@ class TelegramBridgeTests(unittest.TestCase):
                 ):
                     with patch.object(bridge.uuid, "uuid4", return_value=SimpleNamespace(hex="prompt")):
                         result = bridge.answer(123, "Continue", sessions)
-        self.assertEqual(result, "Existing session\n\nCost: $0.250000\n\nTools used: none\nTool calls: 0")
+        self.assertEqual(result, "Existing session")
         submit.assert_called_once_with("existing-session", "msg_prompt", {"text": "Continue"}, 10)
 
     def test_send_splits_long_replies(self):
@@ -459,7 +459,7 @@ class TelegramBridgeTests(unittest.TestCase):
                     bridge.handle_update(update, {})
 
         send.assert_called_once()
-        self.assertIn("Ref:", send.call_args.args[1])
+        self.assertIn("🆔", send.call_args.args[1])
         self.assertNotIn("/status", send.call_args.args[1])
         self.assertNotIn("/abort", send.call_args.args[1])
         keyboard = send.call_args.kwargs["reply_markup"]["inline_keyboard"]
@@ -475,9 +475,9 @@ class TelegramBridgeTests(unittest.TestCase):
                 {},
                 987,
                 next(
-                    line.removeprefix("📥 Ref: ")
+                    line.removeprefix("🆔 `").removesuffix("`")
                     for line in send.call_args.args[1].splitlines()
-                    if line.startswith("📥 Ref: ")
+                    if line.startswith("🆔 `")
                 ),
                 654,
             ),
@@ -517,7 +517,7 @@ class TelegramBridgeTests(unittest.TestCase):
                                     lambda _text: None,
                                 )
 
-        self.assertEqual(result, "Done\n\nCost: $0.250000\n\nTools used: none\nTool calls: 0")
+        self.assertEqual(result, bridge.exchange.ExchangeResult("Done", "$0.250000", (), 0))
         submit.assert_called_once()
         self.assertEqual(submit.call_args.args[:3], ("session-1", prompt_id, {"text": "Hi"}))
         self.assertEqual(submit.call_args.args[3], bridge_config.OPENCODE_STATUS_TIMEOUT_SECONDS)
@@ -634,7 +634,7 @@ class TelegramBridgeTests(unittest.TestCase):
                                     progress.append,
                                 )
 
-        self.assertEqual(result, "Done\n\nCost: $0.000000\n\nTools used: none\nTool calls: 0")
+        self.assertEqual(result, bridge.exchange.ExchangeResult("Done", "$0.000000", (), 0))
         self.assertEqual(
             progress,
             [
@@ -967,8 +967,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            "Done\n\nCost: $0.500000 (build: $0.200000, helper: $0.300000)"
-            "\n\nTools used: none\nTool calls: 0",
+            "Done",
         )
         submit.assert_called_once_with("session-1", "msg_prompt", {"text": "Use a tool"}, 10)
         self.assertEqual(record.call_args_list, [call(intermediate, {"index": 1, "count": 2}), call(final, {"index": 2, "count": 2})])
