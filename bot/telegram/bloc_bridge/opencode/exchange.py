@@ -78,6 +78,30 @@ def _assistant_message_key(entry):
     return entry["session_id"], info["id"]
 
 
+def _observed_models(messages):
+    models = []
+    seen = set()
+    for message in messages:
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        provider = info.get("providerID")
+        model_id = info.get("modelID")
+        if not isinstance(provider, str) or not provider or not isinstance(model_id, str) or not model_id:
+            continue
+        variant = info.get("variant")
+        model = {
+            "providerID": provider,
+            "modelID": model_id,
+            "variant": variant if isinstance(variant, str) else None,
+        }
+        key = (model["providerID"], model["modelID"], model["variant"])
+        if key not in seen:
+            seen.add(key)
+            models.append(model)
+    return models
+
+
 def _message_ids(messages):
     """Build internal keys so only messages created by this exchange are counted."""
     return {key for entry in messages if (key := _assistant_message_key(entry)) is not None}
@@ -508,9 +532,10 @@ class _AsyncRequestMonitor:
         self.last_question_poll_at = self.monitor_started_at - _PERMISSION_POLL_INTERVAL_SECONDS
         self.reported_question_error = False
 
-    def run(self, set_phase, progress):
+    def run(self, set_phase, progress, model_update=None):
         """Poll until completion or an OpenCode stop is confirmed."""
         self.event_thread.start()
+        reported_models = None
         try:
             set_phase("response_wait")
             while True:
@@ -524,11 +549,22 @@ class _AsyncRequestMonitor:
                     bridge_runtime.wait(1)
                     continue
 
+                observed_models = _observed_models(snapshot.correlated_messages)
+                model_signature = tuple(
+                    (model["providerID"], model["modelID"], model["variant"])
+                    for model in observed_models
+                )
+                if model_update is not None and model_signature != reported_models:
+                    model_update(observed_models, False)
+                    reported_models = model_signature
+
                 self._raise_correlated_response_error(snapshot)
                 self._update_progress_stage(snapshot.correlated_messages)
                 complete = self._is_request_complete(snapshot)
                 self._forward_intermediate_replies(snapshot.correlated_messages)
                 if complete:
+                    if model_update is not None:
+                        model_update(observed_models, True)
                     return snapshot.correlated_messages
 
                 self._request_abort(snapshot)
@@ -928,6 +964,7 @@ def _monitor_async_request(
     started_at,
     intermediate_reply=None,
     skip_existing_intermediates=False,
+    model_update=None,
 ):
     """Monitor one submitted prompt until it completes or OpenCode confirms it stopped."""
     monitor = _AsyncRequestMonitor(
@@ -938,7 +975,7 @@ def _monitor_async_request(
         intermediate_reply,
         skip_existing_intermediates,
     )
-    return monitor.run(set_phase, progress)
+    return monitor.run(set_phase, progress, model_update)
 
 
 def _format_async_result(session_id, correlated, previous_ids, reference):
@@ -975,7 +1012,16 @@ def _format_async_result(session_id, correlated, previous_ids, reference):
     )
 
 
-def answer_async(chat_id, prompt, sessions, reference, set_phase, progress, intermediate_reply=None):
+def answer_async(
+    chat_id,
+    prompt,
+    sessions,
+    reference,
+    set_phase,
+    progress,
+    intermediate_reply=None,
+    model_update=None,
+):
     """Submit a prompt asynchronously and collect its correlated result."""
     chat_key = str(chat_id)
     set_phase("session_lookup")
@@ -1041,6 +1087,7 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress, inte
                 set_phase,
                 progress,
                 intermediate_reply=intermediate_reply,
+                model_update=model_update,
             )
         raise
 
@@ -1052,12 +1099,13 @@ def answer_async(chat_id, prompt, sessions, reference, set_phase, progress, inte
         progress,
         started_at,
         intermediate_reply,
+        model_update=model_update,
     )
     set_phase("history_after")
     return _format_async_result(session_id, correlated, previous_ids, reference)
 
 
-def resume_async_request(request, set_phase, progress, intermediate_reply=None):
+def resume_async_request(request, set_phase, progress, intermediate_reply=None, model_update=None):
     """Resume monitoring a submitted OpenCode prompt without resubmitting it."""
     session_id = request.get("session_id")
     prompt_message_id = request.get("prompt_message_id")
@@ -1114,6 +1162,7 @@ def resume_async_request(request, set_phase, progress, intermediate_reply=None):
         started_at,
         intermediate_reply,
         True,
+        model_update,
     )
     set_phase("history_after")
     return _format_async_result(session_id, correlated, None, reference)

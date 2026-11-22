@@ -22,7 +22,6 @@ from .telegram.request_presentation import RequestPresentation
 from .bridge_config import (
     ALLOWED,
     HEALTH_OPPER_ENABLED,
-    MODEL,
     OC,
     OPENCODE_HTTP_TIMEOUT_SECONDS,
     OPENCODE_STATUS_TIMEOUT_SECONDS,
@@ -70,7 +69,7 @@ def _request_presentation(reference, chat_id=None, acknowledgement_id=None):
                 )
         if chat_id is None or acknowledgement_id is None:
             return None
-        presentation = RequestPresentation(chat_id, acknowledgement_id, reference, MODEL)
+        presentation = RequestPresentation(chat_id, acknowledgement_id, reference)
         _REQUEST_PRESENTATIONS[reference] = presentation
         _prune_request_presentations()
         return presentation
@@ -1150,6 +1149,17 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
         finally:
             set_phase("response_wait")
 
+    def model_update(models, complete=False):
+        set_phase("telegram_progress_edit")
+        try:
+            presentation = _request_presentation(reference, chat_id, acknowledgement_id)
+            if presentation is not None and presentation.set_effective_models(models, complete):
+                _edit_request_presentation(presentation)
+        except Exception as error:
+            _log_request_error(reference, update_id, state["phase"], started, error)
+        finally:
+            set_phase("response_wait")
+
     try:
         with lock:
             bridge_runtime.check_shutdown()
@@ -1162,6 +1172,8 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                 else {}
             )
             command = _command_name(prompt) if prompt is not None else None
+            if command is None:
+                exchange_options["model_update"] = model_update
             if resume:
                 set_phase("recovery_check")
                 response = resume_async_request(stored, set_phase, progress, **exchange_options)
@@ -1758,7 +1770,7 @@ def _acknowledge_and_enqueue(chat_id, prompt, sessions, update_id):
     if not created:
         return
     started = time.monotonic()
-    presentation = RequestPresentation(chat_id, None, reference, MODEL)
+    presentation = RequestPresentation(chat_id, None, reference)
     acknowledgement_text, acknowledgement_markup = presentation.edit_payload()
     try:
         # Acknowledge before queuing so users get an immediate response.
