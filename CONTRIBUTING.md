@@ -12,7 +12,10 @@ make test
 ```
 
 The tests use Python's standard library and need no credentials, Docker, Telegram, or LLM
-access. Before submitting changes, also run:
+access. GitHub Actions uses `unittest-xml-reporting` to produce xUnit reports and publishes
+a test summary, including on failure. Pull requests from this repository also receive a
+test check and comment; forked pull requests use annotations and the job summary instead
+because their tokens are read-only. Before submitting changes, also run:
 
 ```sh
 make config

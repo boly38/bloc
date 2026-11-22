@@ -33,18 +33,30 @@ jobs:
           exit 1
       - name: Check out repository
         # https://github.com/actions/checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Set up Python
         # https://github.com/actions/setup-python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Run offline checks
-        run: |
-          make test
-          python3 -m compileall -q bot/telegram/bloc_bridge scripts/telegram_chat_id.py
+      - name: Install test reporting tools
+        run: python3 -m pip install -r requirements-ci.txt
+      - name: Run unit tests
+        id: unit_tests
+        run: python3 -m xmlrunner discover -s tests -v -o test-reports
+      - name: Publish test report
+        if: ${{ !cancelled() && (steps.unit_tests.outcome == 'success' || steps.unit_tests.outcome == 'failure') }}
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: test-reports/TEST-*.xml
+          annotate_only: true
+          include_time_in_summary: true
+          require_tests: true
+          fail_on_parse_error: true
+      - name: Check Python syntax
+        run: python3 -m compileall -q bot/telegram/bloc_bridge scripts/telegram_chat_id.py
       - name: Create next release tag
         id: version
         # https://github.com/mathieudutour/github-tag-action
