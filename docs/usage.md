@@ -97,8 +97,10 @@ OpenCode permission requests and interactive questions for the active request's 
 forwarded to the request card, including the form-based question API used by OpenCode v2. When
 several are pending, use the displayed letter for
 `/allow A`, `/allowAll A`, or `/deny A` permission decisions, and `/answer 1 2` or `/reject 1`
-for questions. Questions and choices use separate numbers in the request card. The card presents
-one question at a time and advances after each answer. Single-choice options can be selected with
+for questions. Questions and choices use separate numbers in the request card. Progress lines
+start with 🔄, and a blank line separates progress from the ❓ question heading. Options appear
+as dash-prefixed list items without checkboxes; selected options retain a ✓ marker.
+The card presents one question at a time and advances after each answer. Single-choice options can be selected with
 buttons; each recorded answer is also shown in its own chat message. For multiple-choice questions,
 select each option and tap **Done**. Custom answers are
 instructions, not buttons; use `/answer 1 le jambon` to answer the first question with free-form
