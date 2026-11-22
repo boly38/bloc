@@ -252,7 +252,7 @@ class TelegramBridgeTests(unittest.TestCase):
         text, keyboard = presentation.edit_payload()
         lines = text.splitlines()
 
-        self.assertEqual(lines[0], "Ref: REF12345")
+        self.assertEqual(lines[0], "📥 Ref: REF12345")
         self.assertEqual(lines[1], "Cost observed so far: $0.125000 (partial)")
         self.assertEqual(lines[2], "Tools used: read, bash")
         self.assertEqual(lines[3], "Working on the request.")
@@ -265,7 +265,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
         text, _ = presentation.edit_payload()
 
-        self.assertEqual(text.splitlines()[0], "Ref: REF12345")
+        self.assertEqual(text.splitlines()[0], "📥 Ref: REF12345")
         self.assertNotIn("Provider:", text)
         self.assertNotIn("Model:", text)
 
@@ -278,16 +278,22 @@ class TelegramBridgeTests(unittest.TestCase):
         )
 
         active_text, _ = presentation.edit_payload()
-        self.assertEqual(active_text.splitlines()[0], "*Model: github-copilot/gpt-6-luna · Ref: REF12345*")
+        self.assertEqual(
+            active_text.splitlines()[0],
+            "📥 *Model: github-copilot/gpt-6-luna · Ref: REF12345*",
+        )
         self.assertNotIn("variant", active_text.lower())
         self.assertEqual(
             bridge.markdown_renderer.render_markdown(active_text)[0].html.splitlines()[0],
-            "<i>Model: github-copilot/gpt-6-luna · Ref: REF12345</i>",
+            "📥 <i>Model: github-copilot/gpt-6-luna · Ref: REF12345</i>",
         )
 
         presentation.finish("Ref: REF12345\nStatus: completed")
         final_text, _ = presentation.edit_payload()
-        self.assertEqual(final_text.splitlines()[0], "*Model: github-copilot/gpt-6-luna · Ref: REF12345*")
+        self.assertEqual(
+            final_text.splitlines()[0],
+            "📥 *Model: github-copilot/gpt-6-luna · Ref: REF12345*",
+        )
         self.assertIn("Status: completed", final_text)
 
     def test_request_card_lists_distinct_models_without_variants(self):
@@ -305,7 +311,7 @@ class TelegramBridgeTests(unittest.TestCase):
 
         self.assertEqual(
             text.splitlines()[0],
-            "*Models: opper/flint-40b-free, github-copilot/gpt-6-luna · Ref: REF12345*",
+            "📥 *Models: opper/flint-40b-free, github-copilot/gpt-6-luna · Ref: REF12345*",
         )
         self.assertNotIn("variant", text.lower())
 
@@ -315,7 +321,10 @@ class TelegramBridgeTests(unittest.TestCase):
 
         text, _ = presentation.edit_payload()
 
-        self.assertEqual(text.splitlines()[0], "*Effective model: not reported · Ref: REF12345*")
+        self.assertEqual(
+            text.splitlines()[0],
+            "📥 *Effective model: not reported · Ref: REF12345*",
+        )
 
     def test_exchange_extracts_distinct_models_from_assistant_metadata(self):
         messages = [
@@ -466,9 +475,9 @@ class TelegramBridgeTests(unittest.TestCase):
                 {},
                 987,
                 next(
-                    line.removeprefix("Ref: ")
+                    line.removeprefix("📥 Ref: ")
                     for line in send.call_args.args[1].splitlines()
-                    if line.startswith("Ref: ")
+                    if line.startswith("📥 Ref: ")
                 ),
                 654,
             ),
@@ -718,7 +727,7 @@ class TelegramBridgeTests(unittest.TestCase):
             send.call_args.args[1],
         )
         self.assertIn("REF12345", send.call_args.args[1])
-        self.assertIn("Status: failed", edit.call_args.args[2])
+        self.assertIn("⚠️ failed", edit.call_args.args[2])
         self.assertIn("phase=opencode_request", output.getvalue())
         self.assertIn("timeout_s=432000", output.getvalue())
         self.assertNotIn("private prompt", output.getvalue())
@@ -734,7 +743,7 @@ class TelegramBridgeTests(unittest.TestCase):
         self.assertIn("OpenCode request failed", send.call_args.args[1])
         self.assertNotIn("remote TUI", send.call_args.args[1])
         self.assertIn("REF98765", send.call_args.args[1])
-        self.assertIn("Status: failed", edit.call_args.args[2])
+        self.assertIn("⚠️ failed", edit.call_args.args[2])
         self.assertNotIn("private prompt text", output.getvalue())
         self.assertIn("detail=redacted", output.getvalue())
 

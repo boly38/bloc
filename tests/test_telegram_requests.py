@@ -35,6 +35,22 @@ class TelegramRequestTests(unittest.TestCase):
         self.question_patch.start()
         self.addCleanup(self.question_patch.stop)
 
+    def test_final_response_compacts_cost_and_duration_without_empty_tools(self):
+        response = "Done\n\nCost: $0.250000\n\nTools used: none\nTool calls: 0"
+
+        self.assertEqual(
+            bridge._format_final_response(response, 12.8),
+            "🤖 Done\n\n✅ completed · ⏳ 12s · 💵 $0.250000",
+        )
+
+    def test_final_response_lists_tools_when_used(self):
+        response = "Done\n\nCost: $0.250000\n\nTools used: bash, gh\nTool calls: 2"
+
+        self.assertEqual(
+            bridge._format_final_response(response, 12.8),
+            "🤖 Done\n\n🛠️ bash, gh (2) · ✅ completed · ⏳ 12s · 💵 $0.250000",
+        )
+
     def test_create_is_idempotent_for_a_telegram_update(self):
         request, created = request_store.create("A" * 16, 123, 101)
         duplicate, duplicate_created = request_store.create("B" * 16, 123, 101)
@@ -726,11 +742,11 @@ class TelegramRequestTests(unittest.TestCase):
                                             True,
                                         )
 
-        self.assertIn("Status: completed", edit.call_args.args[2])
-        self.assertIn("Final cost: unavailable", edit.call_args.args[2])
+        self.assertIn("✅ completed", edit.call_args.args[2])
+        self.assertIn("💵 unavailable", edit.call_args.args[2])
         self.assertEqual(
             send.call_args.args[1],
-            "Recovered result\n\nCost: unavailable\n\nTools used: none\nTool calls: 0",
+            "🤖 Recovered result\n\n✅ completed · ⏳ 0s · 💵 unavailable",
         )
         self.assertEqual(request_store.get(request["reference"])["state"], "completed")
         submit.assert_not_called()
@@ -801,7 +817,7 @@ class TelegramRequestTests(unittest.TestCase):
                                 )
 
         self.assertEqual(request_store.get(request["reference"])["state"], "failed")
-        self.assertIn("Status: failed", edit.call_args.args[2])
+        self.assertIn("⚠️ failed", edit.call_args.args[2])
         text = send.call_args.args[1]
         self.assertIn("request was aborted", text)
         self.assertIn("may not resume automatically", text)
@@ -825,11 +841,14 @@ class TelegramRequestTests(unittest.TestCase):
                         510,
                     )
 
-        self.assertIn("Final cost: $0.250000", edit.call_args.args[2])
+        self.assertIn("💵 $0.250000", edit.call_args.args[2])
         self.assertIn(request["reference"], edit.call_args.args[2])
-        self.assertIn("Tools used: none; 0 calls", edit.call_args.args[2])
+        self.assertNotIn("🛠️", edit.call_args.args[2])
         self.assertEqual(edit.call_args.kwargs["reply_markup"], {"inline_keyboard": []})
-        self.assertEqual(send.call_args.args[1], "Done\n\nCost: $0.250000")
+        self.assertRegex(
+            send.call_args.args[1],
+            r"^🤖 Done\n\n✅ completed · ⏳ \d+s · 💵 \$0\.250000$",
+        )
 
     def test_recovery_does_not_replay_an_unconfirmed_submission(self):
         request, _ = request_store.create("4" * 16, 123, 111, state="running")
@@ -877,7 +896,7 @@ class TelegramRequestTests(unittest.TestCase):
 
         self.assertEqual(request_store.get(request["reference"])["state"], "failed")
         self.assertIn("did not confirm request", send.call_args.args[1])
-        self.assertIn("Status: failed", edit.call_args.args[2])
+        self.assertIn("⚠️ failed", edit.call_args.args[2])
         submit.assert_not_called()
 
     def test_monitor_confirms_user_cancellation_after_open_code_becomes_idle(self):
@@ -1029,8 +1048,8 @@ class TelegramRequestTests(unittest.TestCase):
 
         self.assertEqual(request_store.get(request["reference"])["state"], "timed_out")
         self.assertIn("timed out and stopped", bridge.request_status_response(123, request["reference"]))
-        self.assertIn("Status: timed out and stopped", edit.call_args.args[2])
-        self.assertIn("Tools used: bash, gh; 1 calls", edit.call_args.args[2])
+        self.assertIn("⚠️ timed out and stopped", edit.call_args.args[2])
+        self.assertIn("🛠️ bash, gh; 1 calls", edit.call_args.args[2])
         self.assertIn("reached the configured 5-day limit", send.call_args.args[1])
         self.assertIn("Tools used: bash, gh", send.call_args.args[1])
 

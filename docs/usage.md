@@ -71,9 +71,11 @@ since OpenCode's last activity separately from the API heartbeat. It shows effec
 model from correlated OpenCode response metadata when available; missing metadata is reported
 rather than inferred from configuration.
 
-When the request ends, the card is replaced with a terminal summary containing status, cost,
-duration, request reference, distinct tool count, and total tool-call count. The model's final answer is sent as a
-separate Telegram message and lists tool names only, not arguments or output.
+When the request ends, the card is replaced with a compact summary: request reference, tools
+when used, then cost, status, and duration on one line. The final answer is a separate message
+with a robot marker and compact cost/duration metadata; tool names and call count appear only
+when tools were used. The final metadata line also shows completed status. Tool arguments and
+output are never included.
 
 Only one request at a time is admitted per chat. A new prompt while one is active is refused
 with the active request's reference. Use the card buttons or `/status` and `/abort` to manage it.

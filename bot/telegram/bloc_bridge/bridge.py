@@ -534,6 +534,25 @@ def _response_tool_call_count(response):
     return "unknown"
 
 
+def _format_final_response(response, duration):
+    lines = response.splitlines()
+    footer_found = False
+    while lines and (not lines[-1].strip() or lines[-1].startswith(("Cost:", "Tools used:", "Tool calls:"))):
+        footer_found = footer_found or lines[-1].startswith(("Cost:", "Tools used:", "Tool calls:"))
+        lines.pop()
+    body = "\n".join(lines).strip() if footer_found else response.strip()
+    metrics = []
+    tool_names = _response_tools(response)
+    if tool_names:
+        tool_count = _response_tool_call_count(response)
+        calls = f" ({tool_count})" if tool_count != "unknown" else ""
+        metrics.append(f"🛠️ {', '.join(tool_names)}{calls}")
+    metrics.extend(("✅ completed", f"⏳ {_format_elapsed(duration)}", f"💵 {_response_cost(response)}"))
+    if body:
+        body = f"🤖 {body}"
+    return f"{body}\n\n{' · '.join(metrics)}" if body else " · ".join(metrics)
+
+
 def _request_record(reference, chat_id, acknowledgement_id):
     return request_store.get(reference) or {
         "reference": reference,
@@ -562,19 +581,21 @@ def _terminal_request_summary(request, state, response=None, error=None):
         else:
             tool_names = getattr(error, "tool_names", None)
             tool_call_count = getattr(error, "tool_call_count", "unknown")
-    tool_summary = ", ".join(tool_names) if tool_names is not None and tool_names else "none"
-    if tool_names is None:
-        tool_summary = "unknown"
+    tool_line = None
+    if tool_names:
+        calls = f"; {tool_call_count} calls" if tool_call_count != "unknown" else ""
+        tool_line = f"🛠️ {', '.join(tool_names)}{calls}"
     elapsed = time.time() - request.get("created_at", time.time())
-    return "\n".join(
-        (
-            f"Ref: {request['reference']}",
-            cost_label,
-            f"Tools used: {tool_summary}; {tool_call_count} calls",
-            f"Status: {_request_status_text(state)}",
-            f"Duration: {_format_elapsed(elapsed)}",
-        )
+    status_icon = "✅" if state == "completed" else "⚠️"
+    lines = [f"Ref: {request['reference']}"]
+    if tool_line:
+        lines.append(tool_line)
+    lines.append(
+        f"💵 {cost_label.removeprefix('Final cost: ').removeprefix('Observed cost: ')}"
+        f" · {status_icon} {_request_status_text(state)}"
+        f" · ⏳ {_format_elapsed(elapsed)}"
     )
+    return "\n".join(lines)
 
 
 def _finalize_request_presentation(request, state, response=None, error=None):
@@ -1196,13 +1217,16 @@ def _request_worker(chat_id, prompt, sessions, update_id, reference, acknowledge
                     progress,
                     **exchange_options,
                 )
+            terminal_response = response
+            if command is None:
+                response = _format_final_response(response, time.monotonic() - started)
             request_store.update(reference, state="delivering", detail="completed")
             set_phase("telegram_final_send")
             send(chat_id, response)
             request_store.update(reference, state="completed", detail=None, completed_at=time.time())
             completed = _request_record(reference, chat_id, acknowledgement_id)
             set_phase("telegram_terminal_summary_edit")
-            _finalize_request_presentation(completed, "completed", response=response)
+            _finalize_request_presentation(completed, "completed", response=terminal_response)
             _forget_request_presentation(reference)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         print(
