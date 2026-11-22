@@ -56,7 +56,6 @@ class QuestionControl:
         question_request,
         answers=None,
         reject=False,
-        waiting_for_more=False,
         question_indices=None,
     ):
         """Append question context and its answer to Telegram without logging content."""
@@ -74,25 +73,17 @@ class QuestionControl:
                     if not presentation.question_was_announced(request_id, index)
                 ]
             )
-        lines = [
-            "OpenCode question rejected:" if reject else (
-                "Answer recorded; OpenCode is waiting for the remaining answers:"
-                if waiting_for_more
-                else "Answer submitted to OpenCode:"
-            )
-        ]
+        lines = []
         for index in question_indices:
             if not 0 <= index < len(prompts) or not isinstance(prompts[index], dict):
                 continue
             prompt = prompts[index]
-            question_number = presentation.question_number(request_id, index)
             header = prompt.get("header")
             question_text = prompt.get("question")
-            lines.append(f"Question {question_number} · {header or 'Question'}")
-            if isinstance(question_text, str) and question_text:
-                lines.append(question_text)
+            question = question_text if isinstance(question_text, str) and question_text else header or "Question"
+            lines.append(f"❓ {question}")
             if reject:
-                lines.append("Answer: rejected")
+                lines.append("➡️ rejected")
                 continue
             values = answers[index] if isinstance(answers, list) and index < len(answers) else []
             options = prompt.get("options")
@@ -108,8 +99,8 @@ class QuestionControl:
                     value,
                 )
                 labels.append(str(label))
-            lines.append(f"Answer: {', '.join(labels) if labels else 'No answer'}")
-        if len(lines) == 1:
+            lines.append(f"➡️ {', '.join(labels) if labels else 'No answer'}")
+        if not lines:
             return False
         if not reject:
             for index in question_indices:
@@ -218,7 +209,6 @@ class QuestionControl:
                 presentation,
                 question_request,
                 answers=partial_answers,
-                waiting_for_more=True,
                 question_indices=[question_index],
             )
             return f"Answer recorded for question {question_number}. Continue with the next question."
@@ -423,7 +413,6 @@ class QuestionControl:
                     presentation,
                     question,
                     answers=partial_answers,
-                    waiting_for_more=True,
                     question_indices=[question_index],
                 )
                 return f"Answer recorded for question {question_number}. Continue with the next question."

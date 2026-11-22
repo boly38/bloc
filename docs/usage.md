@@ -103,7 +103,8 @@ for questions. Questions and choices use separate numbers in the request card. P
 start with 🔄, and a blank line separates progress from the ❓ question heading. Options appear
 as dash-prefixed list items without checkboxes; selected options retain a ✓ marker.
 The card presents one question at a time and advances after each answer. Single-choice options can be selected with
-buttons; each recorded answer is also shown in its own chat message. For multiple-choice questions,
+buttons; each recorded answer is also shown in its own chat message with only
+`❓ <question>` and `➡️ <answer>`, without a submission heading. For multiple-choice questions,
 select each option and tap **Done**. Custom answers are
 instructions, not buttons; use `/answer 1 le jambon` to answer the first question with free-form
 text. Custom text is limited to 500 characters. The bridge submits the complete form to OpenCode

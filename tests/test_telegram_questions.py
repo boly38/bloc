@@ -336,8 +336,7 @@ class TelegramQuestionTests(unittest.TestCase):
         )
         self.assertEqual(request_store.get(request["reference"])["state"], "running")
         self.send_mock.assert_called_once()
-        self.assertIn("Question 1 · Color", self.send_mock.call_args.args[1])
-        self.assertIn("Answer: Blue", self.send_mock.call_args.args[1])
+        self.assertEqual(self.send_mock.call_args.args[1], "❓ Which color should be used?\n➡️ Blue")
 
     def test_multiple_choice_waits_for_done_and_custom_text_is_bounded(self):
         request = self.make_request(update_id=303)
@@ -488,9 +487,8 @@ class TelegramQuestionTests(unittest.TestCase):
         answer.assert_not_called()
         self.assertEqual(edit.call_count, 3)
         self.assertEqual(self.send_mock.call_count, 2)
-        self.assertIn("Question 1 · First", self.send_mock.call_args_list[0].args[1])
-        self.assertIn("Question 2 · Second", self.send_mock.call_args.args[1])
-        self.assertIn("Answer: le jambon", self.send_mock.call_args.args[1])
+        self.assertEqual(self.send_mock.call_args_list[0].args[1], "❓ First choice?\n➡️ first answer")
+        self.assertEqual(self.send_mock.call_args.args[1], "❓ Second choice?\n➡️ le jambon")
 
     def test_custom_answer_is_documented_without_an_inline_other_button(self):
         request = self.make_request(update_id=316)
